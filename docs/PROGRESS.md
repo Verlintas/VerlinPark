@@ -81,15 +81,20 @@ Verifier 或 Integrator。
   降级为普通 resource pause，但 consume receipt 写入失败会 fail closed 停止
   turn，避免 reserve 在无 receipt 的情况下被后续 boundary 继续使用。
 - 本轮的 terminal-state 加固：abort/no-ready batch 不再重写已有的
-  `blocked` reason（显式 session cancel 仍可把它 settle 为 cancelled）；
-  gate resolve/cancel/expiry 只在 current row 仍 blocked 且 latest block
-  event 仍指向该 gate 时才 unblock；dispatch resource guard 和
-  critical-path governor 都在 queue/lease/plan-resume events 之前检查，
-  并分别去重 decision/admission event；`Session.unlimited` 在 governor
-  中忽略保留的经济 cap，但仍保留 attention/readiness/risk/context/
-  approval/verification；program milestone 接受 Integrator 的真实
-  `merged` 状态（兼容旧 `integrated`）；auto-resolve 跳过被 revision
-  删除或已 `skipped`/`cancelled` 的 task；auto pause 现在先写
+  `blocked` reason（显式 session cancel，包括 mid-batch abort，仍可把它
+  settle 为 cancelled）；`next_attempt_at` 未到的 pending retry 保持
+  pending，不会被 no-ready batch 写成 blocked；gate resolve/cancel/expiry
+  只在 current row 仍 blocked 且 latest block event 仍指向该 gate 时才
+  unblock；dispatch resource guard 和 critical-path governor 都在
+  queue/lease/plan-resume events 之前检查（critical path 使用 effective
+  Auto budget），并分别去重 decision/admission event；`Session.unlimited`
+  在 governor 和 wall-clock preemption 中忽略保留的经济 cap，但仍保留
+  attention/readiness/risk/context/approval/verification；readiness 和
+  program evidence 只看每个 task 的最新 merge attempt，旧 failed entry
+  不会永久挡住后续成功 merge；program milestone 接受 Integrator 的真实
+  `merged` 状态（兼容旧 `integrated`），但 skipped task 会 block milestone
+  而不是完成；auto-resolve 只看最新 plan revision，并跳过
+  `skipped`/`cancelled`/`completed` task；auto pause 现在先写
   `session.auto_paused` event，再发布 paused projection，避免 drop/cancel
   时留下无 event 的 paused session。budget top-up 与
   `effect.reconcile` 仍要求对已 settled blocked 的 task 显式 retry。
@@ -132,7 +137,7 @@ Verifier 或 Integrator。
   前产生 `session.envelope.reallocated`，runtime reallocation 仍以单元/daemon
   测试为证据。
 - 测试：targeted allocation/tradeoff/rescue/envelope-persist/protocol/CLI/
-  daemon + full workspace **4,665 passed / 0 failed / 6 ignored**；Swift
+  daemon + full workspace **4,669 passed / 0 failed / 6 ignored**；Swift
   **659 passed（527 app + 132 helper）**；`cargo fmt --check`、
   `cargo clippy --workspace --all-targets -- -D warnings`、`swiftformat --lint`
   和 `xcodebuild test` 通过。临时 daemon CLI smoke 覆盖 `project-run-policy-set`

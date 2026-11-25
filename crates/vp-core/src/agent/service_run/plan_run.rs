@@ -98,9 +98,10 @@ impl AgentService {
         // The critical-path budget governor is also a dispatch gate. Evaluate
         // it before queue/lease events so a deferral is not re-emitted as a
         // full plan-resume cycle on every scheduler cooldown.
+        let budget_status = self.engine.session_budget(session_id).await?;
         let governor_budget = crate::budget_governor::GovernorBudgetView::new(
-            session.token_budget,
-            session.tokens_in.saturating_add(session.tokens_out),
+            budget_status.effective_token_budget,
+            budget_status.spent_tokens,
             self.engine
                 .budget_registry()
                 .reserved_for_session(session_id),
@@ -110,6 +111,19 @@ impl AgentService {
             .scheduler()
             .ready_tasks_governed(&session, plan_seq, &plan, 1, Some(governor_budget))
             .await?;
+        let now = time::OffsetDateTime::now_utc();
+        if selection.ready.is_empty()
+            && selection.deferred.is_empty()
+            && scheduled
+                .iter()
+                .any(|row| crate::scheduler::retry_window_open(row, now))
+        {
+            tracing::info!(
+                session_id,
+                "plan dispatch is waiting for the scheduled retry window"
+            );
+            return Ok(false);
+        }
         if selection.ready.is_empty() && !selection.deferred.is_empty() {
             if let Some(admission) = selection.governor.as_ref() {
                 self.engine

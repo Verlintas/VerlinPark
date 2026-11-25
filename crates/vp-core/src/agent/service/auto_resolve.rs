@@ -216,8 +216,11 @@ pub(in crate::agent) fn auto_resolve_task_allowed(
     if !plan.tasks.iter().any(|task| task.id == task_id) {
         return false;
     }
-    if let Some(row) = tasks.iter().find(|task| task.task_id == task_id)
-        && matches!(row.status.as_str(), "skipped" | "cancelled")
+    if let Some(row) = tasks
+        .iter()
+        .filter(|task| task.task_id == task_id)
+        .max_by_key(|task| task.plan_seq)
+        && matches!(row.status.as_str(), "skipped" | "cancelled" | "completed")
     {
         return false;
     }
@@ -272,18 +275,23 @@ mod tests {
     }
 
     #[test]
-    fn auto_resolve_skips_removed_skipped_and_cancelled_tasks() {
-        let plan = plan(&["T1", "T2", "T3"]);
+    fn auto_resolve_skips_removed_skipped_cancelled_and_completed_tasks() {
+        let plan = plan(&["T1", "T2", "T3", "T4"]);
+        let mut older_pending = row("T2", "pending");
+        older_pending.plan_seq = 0;
         let rows = vec![
             row("T1", "pending"),
+            older_pending,
             row("T2", "skipped"),
             row("T3", "cancelled"),
+            row("T4", "completed"),
         ];
         assert!(auto_resolve_task_allowed(Some(&plan), &rows, Some("T1")));
         assert!(!auto_resolve_task_allowed(Some(&plan), &rows, Some("T2")));
         assert!(!auto_resolve_task_allowed(Some(&plan), &rows, Some("T3")));
         assert!(!auto_resolve_task_allowed(Some(&plan), &rows, Some("T4")));
-        assert!(auto_resolve_task_allowed(None, &rows, Some("T3")));
+        assert!(!auto_resolve_task_allowed(Some(&plan), &rows, Some("T5")));
+        assert!(auto_resolve_task_allowed(None, &rows, Some("T4")));
         assert!(auto_resolve_task_allowed(Some(&plan), &rows, None));
     }
 }

@@ -6,13 +6,13 @@
 
 use super::*;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use vp_protocol::types::{
-    AutoBudgetCaps, AutoBudgetExtension, BudgetMode, ProjectRunPolicy, ReadinessSnapshot,
-    ResourceAttention, ResourceCount, ResourceDimension, ResourceSnapshot, ResourceSoftTargets,
-    RunContractOverride, RunContractView, SESSION_RESOURCE_DECISION_EVENT,
+    AutoBudgetCaps, AutoBudgetExtension, BudgetMode, MergeQueueEntry, ProjectRunPolicy,
+    ReadinessSnapshot, ResourceAttention, ResourceCount, ResourceDimension, ResourceSnapshot,
+    ResourceSoftTargets, RunContractOverride, RunContractView, SESSION_RESOURCE_DECISION_EVENT,
     SESSION_RUN_CONTRACT_UPDATED_EVENT, SessionBudgetStatus, SetRunContractParams,
     SetSessionBudgetParams, TopUpSessionResourcesParams,
 };
@@ -22,6 +22,26 @@ const READINESS_CACHE_MAX_ENTRIES: usize = 64;
 
 fn readiness_cache_hit(cached: &CachedReadiness, seq: u64, now: Instant) -> bool {
     cached.seq == seq && now.saturating_duration_since(cached.cached_at) <= READINESS_CACHE_TTL
+}
+
+/// Keep only the latest merge-queue attempt for each task. A failed first
+/// attempt followed by a successful retry must not keep readiness or program
+/// evidence blocked forever. Untasked rows are unique and retained.
+pub(crate) fn latest_merge_entries(queue: &[MergeQueueEntry]) -> Vec<&MergeQueueEntry> {
+    let mut latest = HashMap::<String, &MergeQueueEntry>::new();
+    for entry in queue {
+        let key = entry
+            .task_id
+            .clone()
+            .unwrap_or_else(|| format!("entry:{}", entry.id));
+        let replace = latest.get(&key).is_none_or(|current| {
+            (entry.attempt, &entry.created_at) >= (current.attempt, &current.created_at)
+        });
+        if replace {
+            latest.insert(key, entry);
+        }
+    }
+    latest.into_values().collect()
 }
 
 impl Engine {
@@ -109,6 +129,7 @@ impl Engine {
         let session = self.resource_session(session_id).await?;
         let effects = self.session_effects(session_id, None, false, 200).await?;
         let queue = self.list_merge_queue(session_id).await?;
+        let active_queue = latest_merge_entries(&queue);
         let tasks = self
             .task_queue(None, Some(session_id.to_string()))
             .await?
@@ -183,7 +204,7 @@ impl Engine {
         if let Some(reason) = effects.block_reason.clone() {
             blockers.push(reason);
         }
-        for entry in &queue {
+        for entry in &active_queue {
             if matches!(entry.status.as_str(), "conflict" | "failed" | "interrupted") {
                 blockers.push(format!(
                     "merge queue {} {}: {}",
@@ -201,12 +222,12 @@ impl Engine {
         }
         blockers.truncate(20);
 
-        let any_merged = queue.iter().any(|entry| entry.status == "merged");
-        let any_verified = queue
+        let any_merged = active_queue.iter().any(|entry| entry.status == "merged");
+        let any_verified = active_queue
             .iter()
             .any(|entry| matches!(entry.status.as_str(), "queued" | "merging" | "merged"));
         let level = if effects.blocked
-            || queue
+            || active_queue
                 .iter()
                 .any(|entry| matches!(entry.status.as_str(), "conflict" | "failed" | "interrupted"))
         {
@@ -224,16 +245,16 @@ impl Engine {
         } else {
             "none"
         };
-        let latest_commit = queue
+        let latest_commit = active_queue
             .iter()
-            .rev()
-            .find(|entry| entry.status == "merged")
+            .filter(|entry| entry.status == "merged")
+            .max_by_key(|entry| entry.created_at.as_str())
             .map(|entry| entry.commit.clone())
             .or(head);
-        let verifier = queue
+        let verifier = active_queue
             .iter()
-            .rev()
-            .find(|entry| matches!(entry.status.as_str(), "queued" | "merging" | "merged"))
+            .filter(|entry| matches!(entry.status.as_str(), "queued" | "merging" | "merged"))
+            .max_by_key(|entry| entry.created_at.as_str())
             .map(|entry| {
                 if entry.status == "merged" {
                     "approved · merged".to_string()
@@ -241,7 +262,10 @@ impl Engine {
                     "approved · queue entry".to_string()
                 }
             });
-        let merge = queue.last().map(|entry| entry.status.clone());
+        let merge = active_queue
+            .iter()
+            .max_by_key(|entry| entry.created_at.as_str())
+            .map(|entry| entry.status.clone());
         let partial_delivery = self.latest_partial_delivery(session_id).await?;
 
         let snapshot = ReadinessSnapshot {
@@ -2304,6 +2328,53 @@ mod tests {
         assert_eq!(attention.interrupts, 8);
         assert_eq!(risk, 13);
         assert_eq!(attention.by_risk.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn latest_merge_attempt_supersedes_an_earlier_failed_entry() {
+        let (_data, _repo, engine, session) = fixture().await;
+        let store = engine.store().clone();
+        let first = store
+            .enqueue_merge(
+                &session.id,
+                "agent-1",
+                "Worker",
+                Some("T1"),
+                "branch-1",
+                "commit-1",
+                "base",
+                Some("first"),
+            )
+            .unwrap();
+        store
+            .update_merge_queue_entry(&first.id, "failed", Some("first failed"))
+            .unwrap()
+            .expect("first entry");
+        let second = store
+            .enqueue_merge(
+                &session.id,
+                "agent-1",
+                "Worker",
+                Some("T1"),
+                "branch-2",
+                "commit-2",
+                "base",
+                Some("second"),
+            )
+            .unwrap();
+        store
+            .update_merge_queue_entry(&second.id, "merged", Some("second merged"))
+            .unwrap()
+            .expect("second entry");
+        let queue = engine.list_merge_queue(&session.id).await.unwrap();
+        let active = latest_merge_entries(&queue);
+        assert_eq!(active.len(), 1, "{active:?}");
+        assert_eq!(active[0].status, "merged", "{active:?}");
+        let readiness = engine.compute_session_readiness(&session.id).await.unwrap();
+        assert_ne!(
+            readiness.level, "blocked",
+            "a superseded failed attempt must not keep readiness blocked: {readiness:?}"
+        );
     }
 
     #[test]

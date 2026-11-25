@@ -494,8 +494,19 @@ impl ProgramController {
             return Ok(true);
         };
 
+        if task.status == "skipped" {
+            // Skipping is an explicit operator terminal action. It is not
+            // evidence that the milestone completed, and retrying it
+            // automatically would override the operator's decision.
+            self.release_milestone_reservation(program, &milestone.id);
+            let reason = "the linked plan task was skipped";
+            self.store
+                .fail_program_milestone(&milestone.id, reason, None)?;
+            self.store.block_program_milestone(&milestone.id, reason)?;
+            return Ok(true);
+        }
         match task.status.as_str() {
-            "completed" | "skipped" => {
+            "completed" => {
                 if session.status != "idle" {
                     if matches!(session.status.as_str(), "failed" | "cancelled") {
                         self.handle_milestone_failure(
@@ -803,11 +814,14 @@ impl ProgramController {
             // only marked completed after finish_worker accepted that outcome.
             return Ok(true);
         }
-        // The deterministic Integrator's success status is `merged`.
-        // `integrated` is retained for older imported/archive rows.
+        // The deterministic Integrator's success status is `merged`; `integrated`
+        // is retained for older imported/archive rows. Only the latest attempt
+        // for the task is authoritative, so a failed first attempt followed by a
+        // successful retry does not block the milestone forever.
         Ok(task_entries
             .iter()
-            .all(|entry| matches!(entry.status.as_str(), "merged" | "integrated")))
+            .max_by_key(|entry| (entry.attempt, entry.created_at.as_str()))
+            .is_some_and(|entry| matches!(entry.status.as_str(), "merged" | "integrated")))
     }
 
     fn milestone_result(&self, session: &Session, task: &ScheduledTask) -> Option<String> {
@@ -2084,6 +2098,47 @@ mod tests {
             milestone.status,
             ProgramMilestoneStatus::Completed,
             "a real Integrator merge must count as clean integration evidence: {milestone:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skipped_plan_task_blocks_the_milestone_instead_of_completing() {
+        let (_dir, engine, project) = setup();
+        let program = create_program(&engine, &project).await;
+        let milestone = add_milestone(&engine, &program, "Skipped work", Vec::new()).await;
+        let controller = engine.programs();
+        controller.reconcile(None).await.unwrap();
+        let milestone = engine
+            .store()
+            .get_program_milestone(&milestone.id)
+            .unwrap()
+            .unwrap();
+        let store = engine.store().clone();
+        let session = store
+            .create_session(&program.project_id, "skipped milestone")
+            .unwrap();
+        store.update_session_status(&session.id, "idle").unwrap();
+        let claimed = controller.claim_start(&milestone.id).unwrap().unwrap();
+        controller
+            .attach_session(&milestone.id, &session.id, 1)
+            .unwrap();
+        engine
+            .set_team_plan(&session.id, &milestone_plan(&program, &claimed))
+            .await
+            .unwrap();
+        engine.skip_plan_task(&session.id, "T1").await.unwrap();
+
+        controller.reconcile(None).await.unwrap();
+        controller.reconcile(None).await.unwrap();
+        let milestone = engine
+            .store()
+            .get_program_milestone(&milestone.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            milestone.status,
+            ProgramMilestoneStatus::Blocked,
+            "an explicitly skipped task must not complete the milestone: {milestone:?}"
         );
     }
 

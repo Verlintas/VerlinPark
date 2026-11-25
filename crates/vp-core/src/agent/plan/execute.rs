@@ -299,7 +299,17 @@ pub(in crate::agent) async fn execute_team_plan(
                 deferred_by_governor = true;
                 break;
             }
+            let now = time::OffsetDateTime::now_utc();
             for task in &remaining {
+                if scheduled
+                    .iter()
+                    .find(|row| row.task_id == task.id)
+                    .is_some_and(|row| crate::scheduler::retry_window_open(row, now))
+                {
+                    // Leave a scheduled retry pending; a block would clear its
+                    // next_attempt_at and bypass the configured backoff.
+                    continue;
+                }
                 let unmet = task
                     .deps
                     .iter()
@@ -1141,6 +1151,11 @@ pub(in crate::agent) async fn execute_team_plan(
             }
             let status = abort.task_status();
             let reason = abort.reason();
+            // A session-level cancellation is a terminal operator action and
+            // also settles blocked siblings. A budget/gate deferral must keep
+            // its original block reason.
+            let overwrite_blocked =
+                matches!(&abort, PlanAbort::Cancelled) && control.is_cancelled();
             // Every batch future has a real result and was processed above.
             // Only tasks with no result at all are synthesized here: the
             // non-batch remainder plus any batch task whose result did not
@@ -1158,7 +1173,7 @@ pub(in crate::agent) async fn execute_team_plan(
                     &task.id,
                     status,
                     &reason,
-                    false,
+                    overwrite_blocked,
                     &mut statuses,
                     &mut reports,
                 )
@@ -1176,7 +1191,7 @@ pub(in crate::agent) async fn execute_team_plan(
                     &task.id,
                     status,
                     &reason,
-                    false,
+                    overwrite_blocked,
                     &mut statuses,
                     &mut reports,
                 )

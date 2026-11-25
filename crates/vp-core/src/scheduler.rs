@@ -581,6 +581,24 @@ pub(crate) fn task_aging() -> Duration {
     }
 }
 
+/// A pending/interrupted row whose retry backoff has not elapsed. These rows
+/// must be left pending: settling them blocked would clear `next_attempt_at`
+/// and bypass the orchestration retry schedule.
+pub(crate) fn retry_window_open(
+    row: &vp_protocol::types::ScheduledTask,
+    now: time::OffsetDateTime,
+) -> bool {
+    matches!(row.status.as_str(), "pending" | "interrupted")
+        && row
+            .next_attempt_at
+            .as_deref()
+            .and_then(|next| {
+                time::OffsetDateTime::parse(next, &time::format_description::well_known::Rfc3339)
+                    .ok()
+            })
+            .is_some_and(|next| next > now)
+}
+
 pub(crate) fn is_retryable_status(status: &str) -> bool {
     // Only runnable states are dispatchable. `failed` becomes runnable only
     // after the orchestration controller schedules a retry (status pending +

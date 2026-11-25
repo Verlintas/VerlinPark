@@ -4567,6 +4567,101 @@ async fn critical_path_deferral_happens_before_a_plan_resume_cycle() {
     );
 }
 
+#[test]
+fn unlimited_budget_has_no_wall_clock_deadline() {
+    let budget = SessionBudget::new(
+        None,
+        0,
+        AgentCaps {
+            managers: 1,
+            workers: 1,
+            labour: 1,
+        },
+    )
+    .with_time(Some(10))
+    .with_unlimited_flag(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+    assert!(budget.wall_clock_deadline().is_none());
+}
+
+#[tokio::test]
+async fn scheduled_retry_is_not_started_or_blocked_before_its_window() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session(project.id.clone(), "retry window".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let plan: TeamPlan = serde_json::from_value(serde_json::json!({
+        "goal": "retry window",
+        "departments": [{
+            "name": "impl",
+            "manager_title": "Implementation",
+            "profile": "coding",
+            "objective": "do work"
+        }],
+        "tasks": [{
+            "id": "T1",
+            "department": "impl",
+            "title": "Work",
+            "kind": "coding",
+            "deps": [],
+            "acceptance": ["done"],
+            "write_scope": ["src/lib.rs"]
+        }]
+    }))
+    .unwrap();
+    engine.set_team_plan(&session.id, &plan).await.unwrap();
+    let store = engine.store().clone();
+    let seq = store
+        .latest_event_seq(&session.id, "team_plan.submitted")
+        .unwrap();
+    store
+        .claim_plan_tasks_with_events(&session.id, seq, &["T1".to_string()])
+        .unwrap();
+    store
+        .finish_plan_task(&session.id, seq, "T1", "failed", Some("first attempt"))
+        .unwrap();
+    store
+        .schedule_plan_task_retry_with_event(
+            &session.id,
+            seq,
+            "T1",
+            "2999-01-01T00:00:00Z",
+            "retry later",
+        )
+        .unwrap();
+
+    assert!(!service.resume_plan(&session.id).await.unwrap());
+    let queue = engine
+        .task_queue(Some(project.id.clone()), Some(session.id.clone()))
+        .await
+        .unwrap();
+    let task = queue
+        .tasks
+        .iter()
+        .find(|task| task.task_id == "T1")
+        .expect("T1");
+    assert_eq!(task.status, "pending");
+    assert_eq!(
+        task.next_attempt_at.as_deref(),
+        Some("2999-01-01T00:00:00Z")
+    );
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "agent.plan_resumed"),
+        "a future retry must not start a plan-resume cycle"
+    );
+}
+
 #[tokio::test]
 async fn task_cancel_during_verification_does_not_merge_or_complete() {
     let dir = TempDir::new().unwrap();

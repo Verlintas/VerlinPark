@@ -237,10 +237,10 @@ is quiescent.
   the normal resource pause is kept, while a failure to persist the one-shot
   consumption receipt fails closed and stops the turn. The grant releases only
   the completion reserve for its 30-minute TTL.
-- The dispatch and turn governors ignore retained token/cost/time caps when
-  `Session.unlimited` is on, while attention, readiness, risk, context,
-  approvals, and verification still gate work. This keeps the plan path
-  consistent with the prompt path.
+- The dispatch/turn governors and wall-clock preemption ignore retained
+  token/cost/time caps when `Session.unlimited` is on, while attention,
+  readiness, risk, context, approvals, and verification still gate work. This
+  keeps the plan path consistent with the prompt path.
 - `ProjectRunPolicy.auto_reallocate_envelopes` is off by default. When enabled,
   a Worker/Labour run gets a runtime-only effective task budget from unused
   token/cost capacity of already-completed tasks in the same department.
@@ -257,12 +257,15 @@ is quiescent.
   and a per-session same-daemon lock serializes event read/append. The
   allocation preview reports stored/effective budgets and uses effective values
   for estimates and critical-path weight.
-- Program milestone completion accepts the deterministic Integrator's real
-  `merged` status (legacy `integrated` rows remain accepted), so a successful
-  coding merge no longer looks like failed integration and burns the remaining
-  program allowance on bounded retries. Auto-resolution also skips a conflict
-  whose task was removed by a plan revision or explicitly skipped/cancelled;
-  an explicit operator resolve can still act on it.
+- Program milestone completion accepts the latest merge attempt's
+  deterministic Integrator `merged` status (legacy `integrated` rows remain
+  accepted) and ignores older failed attempts, so a successful retry does not
+  look like failed integration and burn the remaining program allowance.
+  An explicitly skipped milestone task blocks instead of completing.
+  Auto-resolution only considers the latest plan revision and skips a conflict
+  whose task was removed or whose latest row is
+  `skipped`/`cancelled`/`completed`; an explicit operator resolve can still
+  act on it.
 - `session.envelope.persist` / `vp envelope-persist --task <id> --yes` writes
   the latest still-valid recorded runtime overlay for one task into a normal
   plan revision. It requires a quiescent session and re-folds the event through
@@ -296,7 +299,7 @@ is quiescent.
   (unit/daemon tests cover both paths).
 - Tests: targeted allocation, trade-off, auto-rescue, envelope-persist,
   protocol, CLI, and daemon tests; full workspace
-  **4,665 passed / 0 failed / 6 ignored**;
+  **4,669 passed / 0 failed / 6 ignored**;
   Swift **659 passed (527 app + 132 helper)**; fmt, clippy,
   SwiftFormat, and `xcodebuild test` pass.
 - Live DeepSeek evidence (2026-11-25): the explicit smoke passed with
@@ -322,16 +325,19 @@ is quiescent.
   rows; failed work waits for the controller retry transition, while
   budget/gate blocks stay blocked. Abort/no-ready batches now preserve an
   existing `blocked` reason instead of rewriting it into a releasable
-  dependency block; a terminal gate resolve/cancel/expiry explicitly unblocks
-  its recorded plan task; and the dispatch resource guard runs before the
-  queue/lease/plan-resume events with a deduplicated decision event, so a
-  terminal block does not append a full resume cycle on every scheduler
-  cooldown. The same early check covers critical-path admission deferrals and
-  deduplicates identical admission events; gate release additionally requires
-  the current row to still be blocked and the latest block event to match the
-  gate, so a later dependency block is not released. Auto pause now writes
-  `session.auto_paused` before the paused status projection, so a dropped or
-  cancelled run cannot leave a paused session without its event. A second
+  dependency block, while an explicit session cancellation (including a
+  mid-batch abort) still settles it; a pending retry whose `next_attempt_at`
+  has not arrived stays pending instead of being settled blocked. A terminal
+  gate resolve/cancel/expiry explicitly unblocks its recorded plan task only
+  after the current row and latest block event still match; the dispatch
+  resource and critical-path guards run before queue/lease/plan-resume events
+  with the effective Auto budget and deduplicated decision/admission events,
+  so a terminal block does not append a full resume cycle on every scheduler
+  cooldown. Readiness and program evidence use the latest merge attempt per
+  task, so an older failed attempt does not permanently block a successful
+  retry. Auto pause now writes `session.auto_paused` before the paused status
+  projection, so a dropped or cancelled run cannot leave a paused session
+  without its event. A second
   attempt with 80k/80k budgets completed T1 and started the Verifier, but the
   session hit its 900s wall-clock budget before T2; 24 calls, 317,308 input /
   7,367 output / 87.66% cache hit, T1 completed, T2 blocked. No

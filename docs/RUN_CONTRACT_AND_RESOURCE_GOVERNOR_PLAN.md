@@ -597,10 +597,12 @@ Implemented:
   automatically.
 - Readiness-blocked remains a dispatch gate, not a turn pause (avoids
   deadlocking approval/effect flows in an active run). The R2a resource guard
-  and the critical-path admission check both run before queue/lease/
-  plan-resume events; repeated identical decision/admission events are
-  deduplicated until their inputs change, so a terminally blocked session
-  does not append a full resume cycle on every scheduler cooldown.
+  and the critical-path admission check (using the effective Auto budget) both
+  run before queue/lease/plan-resume events; repeated identical
+  decision/admission events are deduplicated until their inputs change, and a
+  pending retry whose `next_attempt_at` is still in the future is left pending
+  instead of starting a resume cycle or being settled blocked, so a terminally
+  deferred session does not append a full cycle on every scheduler cooldown.
 
 Remaining:
 

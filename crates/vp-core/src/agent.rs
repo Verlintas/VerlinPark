@@ -755,7 +755,11 @@ pub(in crate::agent) async fn arm_session_preemption(
     policy: vp_protocol::types::PreemptionPolicy,
 ) -> Result<()> {
     let status = engine.session_budget(&session.id).await?;
-    if status.mode == BudgetMode::Auto && !status.unlimited {
+    if status.unlimited {
+        // Unlimited bypasses retained time budgets; preemption must not abort
+        // the run at a cap the governor no longer enforces.
+        control.arm_preemption_deadline(None, policy);
+    } else if status.mode == BudgetMode::Auto {
         let deadline = status
             .remaining_secs
             .filter(|remaining| *remaining > 0)
@@ -2193,6 +2197,9 @@ impl SessionBudget {
     /// cumulative clock as `exceeded_reason`. `None` means no deadline (no time
     /// budget, unlimited, paused, or the cumulative allowance is spent).
     fn wall_clock_deadline(&self) -> Option<Instant> {
+        if self.is_unlimited() {
+            return None;
+        }
         let limit = self.time_limit()?;
         let clock = self.clock.lock().ok()?;
         if clock.paused_at.is_some() {
