@@ -56,10 +56,34 @@ impl Store {
             )
             .optional()?
             .unwrap_or_else(|| now.clone());
+        let additions = {
+            let mut stmt = tx.prepare(
+                "SELECT seq, payload FROM events
+                 WHERE session_id = ?1
+                   AND type IN ('team_plan.submitted', 'team_plan.revised')
+                 ORDER BY seq ASC",
+            )?;
+            let rows = stmt.query_map(params![session_id], |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
+            })?;
+            let mut additions = std::collections::HashMap::new();
+            for row in rows {
+                let (seq, payload) = row?;
+                let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload) else {
+                    continue;
+                };
+                for task_id in payload["added"].as_array().into_iter().flatten() {
+                    if let Some(task_id) = task_id.as_str() {
+                        additions.insert(task_id.to_string(), seq);
+                    }
+                }
+            }
+            additions
+        };
         let mut states = std::collections::HashMap::<String, TaskEventState>::new();
         {
             let mut stmt = tx.prepare(
-                "SELECT type, payload, created_at FROM events
+                "SELECT seq, type, payload, created_at FROM events
                  WHERE session_id = ?1 AND seq > ?2
                    AND type IN ('plan_task.started', 'plan_task.finished',
                                 'plan_task.interrupted', 'plan_task.retried',
@@ -71,17 +95,24 @@ impl Store {
             )?;
             let rows = stmt.query_map(params![session_id, plan_seq as i64], |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(0)? as u64,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })?;
             for row in rows {
-                let (kind, payload, created_at) = row?;
+                let (seq, kind, payload, created_at) = row?;
                 let payload: serde_json::Value = serde_json::from_str(&payload).unwrap_or_default();
                 let Some(task_id) = payload["task_id"].as_str() else {
                     continue;
                 };
+                if additions
+                    .get(task_id)
+                    .is_some_and(|added_seq| seq <= *added_seq)
+                {
+                    continue;
+                }
                 let state = states.entry(task_id.to_string()).or_insert(TaskEventState {
                     status: "pending".to_string(),
                     attempts: 0,

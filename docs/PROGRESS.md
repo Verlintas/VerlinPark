@@ -94,7 +94,12 @@ Verifier 或 Integrator。
   不会永久挡住后续成功 merge；program milestone 接受 Integrator 的真实
   `merged` 状态（兼容旧 `integrated`），但 skipped task 会 block milestone
   而不是完成；auto-resolve 只看最新 plan revision，并跳过
-  `skipped`/`cancelled`/`completed` task；auto pause 现在先写
+  `skipped`/`cancelled`/`completed` task；gate/task-scope budget defer 不再把
+  无关 sibling 一起 settle，session-scope budget stop 仍会；completion
+  reserve 以 effective budget 计算，Auto 交给 Auto controller；plan revision
+  删除后重新加入的 task 从新 projection 开始，不继承旧 failed/cancelled；
+  landed program session 仍可完成已验证的 milestone；cancelled intake 的
+  manual Run now 会先 reset 再 claim；auto pause 现在先写
   `session.auto_paused` event，再发布 paused projection，避免 drop/cancel
   时留下无 event 的 paused session。budget top-up 与
   `effect.reconcile` 仍要求对已 settled blocked 的 task 显式 retry。
@@ -137,7 +142,7 @@ Verifier 或 Integrator。
   前产生 `session.envelope.reallocated`，runtime reallocation 仍以单元/daemon
   测试为证据。
 - 测试：targeted allocation/tradeoff/rescue/envelope-persist/protocol/CLI/
-  daemon + full workspace **4,669 passed / 0 failed / 6 ignored**；Swift
+  daemon + full workspace **4,673 passed / 0 failed / 6 ignored**；Swift
   **659 passed（527 app + 132 helper）**；`cargo fmt --check`、
   `cargo clippy --workspace --all-targets -- -D warnings`、`swiftformat --lint`
   和 `xcodebuild test` 通过。临时 daemon CLI smoke 覆盖 `project-run-policy-set`

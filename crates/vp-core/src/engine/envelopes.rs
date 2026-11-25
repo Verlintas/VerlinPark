@@ -352,9 +352,21 @@ impl Engine {
 
         // A retry may already have overshot the stored task cap. The new cap
         // must cover observed spend, or the event would be immediately
-        // unusable and would consume sources for nothing.
-        let base_token = old_token.map(|old| old.max(target_actual_tokens));
-        let base_cost = old_cost.map(|old| old.max(target_actual_cost.max(0.0)));
+        // unusable and would consume sources for nothing. A top-up starts from
+        // the previous effective overlay, not the stored plan budget.
+        let current_effective = effective.get(task_id).copied().unwrap_or_default();
+        let old_event_token = if latest_targets.contains(task_id) {
+            current_effective.tokens
+        } else {
+            old_token
+        };
+        let old_event_cost = if latest_targets.contains(task_id) {
+            current_effective.cost_usd
+        } else {
+            old_cost
+        };
+        let base_token = old_event_token.map(|old| old.max(target_actual_tokens));
+        let base_cost = old_event_cost.map(|old| old.max(target_actual_cost.max(0.0)));
         let token_room = base_token
             .map(|base| {
                 department_tokens
@@ -429,7 +441,7 @@ impl Engine {
             let proposed = base + released_cost;
             if proposed.is_finite() { proposed } else { base }
         });
-        if new_token == old_token && new_cost == old_cost {
+        if new_token == old_event_token && new_cost == old_event_cost {
             return Ok(None);
         }
 
@@ -441,19 +453,19 @@ impl Engine {
                 "target_task_id": target.id,
                 "department": target.department,
                 "plan_fingerprint": plan_fingerprint(plan, &target.id, &source_ids),
-                "old_token_budget": old_token,
+                "old_token_budget": old_event_token,
                 "new_token_budget": new_token,
-                "old_cost_budget_usd": old_cost,
+                "old_cost_budget_usd": old_event_cost,
                 "new_cost_budget_usd": new_cost,
                 "sources": sources,
                 "released_tokens": released_tokens,
                 "released_cost_usd": released_cost,
                 "applied_tokens": new_token
-                    .zip(old_token)
+                    .zip(old_event_token)
                     .map(|(new, old)| new.saturating_sub(old))
                     .unwrap_or(0),
                 "applied_cost_usd": new_cost
-                    .zip(old_cost)
+                    .zip(old_event_cost)
                     .map(|(new, old)| (new - old).max(0.0))
                     .unwrap_or(0.0),
                 "generated_at": now_rfc3339(),
@@ -1111,6 +1123,34 @@ mod tests {
             .expect("new T3 capacity tops up the exhausted target");
         assert_eq!(
             topped_up
+                .tasks
+                .iter()
+                .find(|task| task.id == "T2")
+                .unwrap()
+                .token_budget,
+            Some(7_000)
+        );
+        let folded = engine
+            .runtime_effective_plan(&session, &plan, "T2")
+            .await
+            .unwrap()
+            .expect("the top-up event must survive a fresh fold");
+        assert_eq!(
+            folded
+                .tasks
+                .iter()
+                .find(|task| task.id == "T2")
+                .unwrap()
+                .token_budget,
+            Some(7_000)
+        );
+        let replayed = engine
+            .effective_plan_for_budget(&session, &plan, "T2")
+            .await
+            .unwrap()
+            .expect("idempotent overlay");
+        assert_eq!(
+            replayed
                 .tasks
                 .iter()
                 .find(|task| task.id == "T2")

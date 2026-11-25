@@ -2361,7 +2361,7 @@ async fn turn_boundary_resource_block_pauses_and_resumes_the_same_run() {
         })
         .await
         .unwrap();
-    let (approval, _receiver) = harness
+    let (_approval, _receiver) = harness
         .engine
         .request_approval_with_risk(
             &session.id,
@@ -2374,13 +2374,6 @@ async fn turn_boundary_resource_block_pauses_and_resumes_the_same_run() {
         )
         .await
         .unwrap();
-    assert!(
-        harness
-            .engine
-            .resolve_approval(&approval.id, true)
-            .await
-            .unwrap()
-    );
 
     harness
         .service

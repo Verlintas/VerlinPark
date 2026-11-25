@@ -253,8 +253,11 @@ The R3/R4 slice is read-only/advisory except for two explicit project opt-ins:
   whose `next_attempt_at` is still in the future untouched, and treats
   `Session.unlimited` as bypassing only retained economic caps and wall-clock
   preemption (attention, readiness, risk, context, approvals, and verification
-  remain). A terminal gate releases its plan task only when the current row is
-  still blocked and the latest block event names that gate.
+  remain). Completion reserve is measured against the effective allowance and
+  Auto leaves it to the Auto controller; a gate/task-scope budget deferral
+  settles only its task/batch. A terminal gate releases its plan task only when
+  the current row is still blocked and the latest block event names that
+  gate.
 - Both preview RPCs append no events and mutate nothing. The macOS cards load
   only when visible or explicitly refreshed and reject a response for a
   different session.

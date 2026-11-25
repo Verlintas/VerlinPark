@@ -4663,6 +4663,91 @@ async fn scheduled_retry_is_not_started_or_blocked_before_its_window() {
 }
 
 #[tokio::test]
+async fn gate_defer_does_not_block_a_dependent_sibling() {
+    let dir = TempDir::new().unwrap();
+    let gate_id = Arc::new(Mutex::new(None::<String>));
+    let provider = Arc::new(DeferredSiblingPlanProvider {
+        requests: Arc::new(Mutex::new(Vec::new())),
+        gate_id: gate_id.clone(),
+        leader_calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "dependent gate sibling".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let plan: TeamPlan = serde_json::from_value(serde_json::json!({
+        "goal": "defer one task and keep its dependent pending",
+        "departments": [{
+            "name": "impl",
+            "manager_title": "Implementation",
+            "profile": "coding",
+            "objective": "finish the dependent sibling"
+        }],
+        "tasks": [
+            {
+                "id": "T1",
+                "department": "impl",
+                "title": "Wait for the external gate",
+                "kind": "coding",
+                "deps": [],
+                "acceptance": ["gate resolved"],
+                "write_scope": ["src/t1"]
+            },
+            {
+                "id": "T2",
+                "department": "impl",
+                "title": "Depends on the gate",
+                "kind": "coding",
+                "deps": ["T1"],
+                "acceptance": ["dependent-note.txt exists"],
+                "write_scope": ["dependent-note.txt"]
+            }
+        ]
+    }))
+    .unwrap();
+    engine.set_team_plan(&session.id, &plan).await.unwrap();
+    let gate = engine
+        .open_gate(vp_protocol::types::GateOpenParams {
+            session_id: session.id.clone(),
+            task_id: Some("T1".into()),
+            kind: Some("ci".into()),
+            label: Some("dependent sibling gate".into()),
+            payload: None,
+            expires_at: None,
+            after_secs: None,
+        })
+        .await
+        .unwrap();
+    *gate_id.lock().unwrap() = Some(gate.gate.id.clone());
+    assert!(service.resume_plan(&session.id).await.unwrap());
+    let _ = wait_until_idle(&engine, &session).await;
+
+    let queue = engine
+        .task_queue(Some(session.project_id.clone()), Some(session.id.clone()))
+        .await
+        .unwrap();
+    let status = |task_id: &str| {
+        queue
+            .tasks
+            .iter()
+            .find(|task| task.task_id == task_id)
+            .map(|task| task.status.as_str())
+    };
+    assert_eq!(status("T1"), Some("blocked"));
+    assert_eq!(
+        status("T2"),
+        Some("pending"),
+        "a gate deferral must not block an unrelated/dependent sibling: {:?}",
+        queue.tasks
+    );
+}
+
+#[tokio::test]
 async fn task_cancel_during_verification_does_not_merge_or_complete() {
     let dir = TempDir::new().unwrap();
     let engine_slot = Arc::new(Mutex::new(None::<Engine>));

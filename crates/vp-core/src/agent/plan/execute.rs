@@ -1149,36 +1149,39 @@ pub(in crate::agent) async fn execute_team_plan(
                     PlanAbort::Deferred(wait) => PlanRunResult::Deferred(wait),
                 });
             }
-            let status = abort.task_status();
-            let reason = abort.reason();
-            // A session-level cancellation is a terminal operator action and
-            // also settles blocked siblings. A budget/gate deferral must keep
-            // its original block reason.
-            let overwrite_blocked =
-                matches!(&abort, PlanAbort::Cancelled) && control.is_cancelled();
-            // Every batch future has a real result and was processed above.
-            // Only tasks with no result at all are synthesized here: the
-            // non-batch remainder plus any batch task whose result did not
-            // produce a terminal state. A completed/merged sibling is never
-            // rewritten by the abort.
-            for task in remaining
-                .iter()
-                .filter(|task| !batch_ids.contains(&task.id))
-            {
-                settle_aborted_task(
-                    engine,
-                    &session.id,
-                    plan_seq,
-                    leader_spec,
-                    &task.id,
-                    status,
-                    &reason,
-                    overwrite_blocked,
-                    &mut statuses,
-                    &mut reports,
-                )
-                .await?;
+            // Only a cancellation or a session-scope budget stop makes the
+            // whole remaining plan non-runnable. A task-scope budget stop or a
+            // gate deferral affects its task/batch only; unrelated siblings
+            // must stay pending for the scheduler.
+            if abort.settles_remaining_tasks() {
+                let status = abort.task_status();
+                let reason = abort.reason();
+                // A session-level cancellation is a terminal operator action
+                // and also settles blocked siblings. A budget stop must keep
+                // any original block reason.
+                let overwrite_blocked =
+                    matches!(&abort, PlanAbort::Cancelled) && control.is_cancelled();
+                for task in remaining
+                    .iter()
+                    .filter(|task| !batch_ids.contains(&task.id))
+                {
+                    settle_aborted_task(
+                        engine,
+                        &session.id,
+                        plan_seq,
+                        leader_spec,
+                        &task.id,
+                        status,
+                        &reason,
+                        overwrite_blocked,
+                        &mut statuses,
+                        &mut reports,
+                    )
+                    .await?;
+                }
             }
+            let batch_status = abort.interrupted_batch_status();
+            let batch_reason = abort.interrupted_batch_reason();
             for task in &batch {
                 if statuses.get(&task.id).map(String::as_str) != Some("running") {
                     continue;
@@ -1189,9 +1192,9 @@ pub(in crate::agent) async fn execute_team_plan(
                     plan_seq,
                     leader_spec,
                     &task.id,
-                    status,
-                    &reason,
-                    overwrite_blocked,
+                    batch_status,
+                    &batch_reason,
+                    false,
                     &mut statuses,
                     &mut reports,
                 )

@@ -39,8 +39,9 @@ impl AgentService {
         ) {
             anyhow::bail!("intake task {id} is not runnable (status: {})", task.status);
         }
-        if task.attempts >= task.max_attempts
-            && matches!(task.status.as_str(), "failed" | "interrupted" | "cancelled")
+        if task.status == "cancelled"
+            || (task.attempts >= task.max_attempts
+                && matches!(task.status.as_str(), "failed" | "interrupted"))
         {
             task = self
                 .engine

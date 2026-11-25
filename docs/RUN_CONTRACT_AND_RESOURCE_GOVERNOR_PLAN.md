@@ -598,11 +598,15 @@ Implemented:
 - Readiness-blocked remains a dispatch gate, not a turn pause (avoids
   deadlocking approval/effect flows in an active run). The R2a resource guard
   and the critical-path admission check (using the effective Auto budget) both
-  run before queue/lease/plan-resume events; repeated identical
-  decision/admission events are deduplicated until their inputs change, and a
-  pending retry whose `next_attempt_at` is still in the future is left pending
-  instead of starting a resume cycle or being settled blocked, so a terminally
-  deferred session does not append a full cycle on every scheduler cooldown.
+  run before queue/lease/plan-resume events; the completion reserve is a
+  fraction of the effective allowance (not a separate hard cap, and Auto leaves
+  it to the Auto controller); repeated identical decision/admission events are
+  deduplicated until their inputs change, and a pending retry whose
+  `next_attempt_at` is still in the future is left pending instead of starting
+  a resume cycle or being settled blocked. A gate/task-scope budget deferral
+  settles only its task/batch, while session-scope budget stop and explicit
+  cancellation still settle the remaining plan, so a terminally deferred
+  session does not append a full cycle on every scheduler cooldown.
 
 Remaining:
 

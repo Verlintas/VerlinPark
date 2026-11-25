@@ -753,13 +753,28 @@ impl Engine {
         }
         let snapshot = self.session_resources(session_id).await?;
         let contract = self.run_contract_view(session_id).await?;
-        let unlimited = self.session_budget(session_id).await?.unlimited;
+        let budget = self.session_budget(session_id).await?;
+        let unlimited = budget.unlimited;
+        // The completion reserve is a fraction of the current effective
+        // allowance, not the hard cap that may be far above it. Auto sessions
+        // deliberately leave reserve management to the Auto controller, as the
+        // turn path already does.
+        let reserve_caps = AutoBudgetCaps {
+            token: budget.effective_token_budget,
+            cost_usd: budget.effective_cost_budget_usd,
+            wall_clock_secs: budget.effective_time_budget_secs,
+        };
+        let reserve_ratio = if budget.mode == BudgetMode::Auto {
+            0.0
+        } else {
+            contract.completion_reserve_ratio
+        };
         let inputs = ResourceGovernorInputs {
             profile: &contract.profile,
             attention_cap: contract.attention_cap,
             attention_interrupts: snapshot.attention.interrupts,
-            completion_reserve_ratio: contract.completion_reserve_ratio,
-            hard_caps: &contract.hard_caps,
+            completion_reserve_ratio: reserve_ratio,
+            hard_caps: &reserve_caps,
             dimensions: &snapshot.dimensions,
             readiness_blocked: snapshot
                 .readiness
@@ -830,12 +845,6 @@ impl Engine {
         let (attention, risk_used) = resource_attention(&approvals, effects.counts.unknown);
 
         let hard_token = budget.hard_token_cap.or(budget.effective_token_budget);
-        let hard_cost = budget
-            .hard_cost_cap_usd
-            .or(budget.effective_cost_budget_usd);
-        let hard_time = budget
-            .hard_wall_clock_secs
-            .or(budget.effective_time_budget_secs);
         let raw_tokens = usage.input_tokens.saturating_add(usage.output_tokens);
         let cost = budget.spent_cost_usd.max(usage.cost_usd);
         let pricing_source = if cost > 0.0 {
@@ -871,18 +880,23 @@ impl Engine {
             effects.blocked,
             false,
         );
-        let hard_caps = AutoBudgetCaps {
-            token: hard_token,
-            cost_usd: hard_cost,
-            wall_clock_secs: hard_time,
+        let reserve_caps = AutoBudgetCaps {
+            token: budget.effective_token_budget,
+            cost_usd: budget.effective_cost_budget_usd,
+            wall_clock_secs: budget.effective_time_budget_secs,
+        };
+        let gate_reserve_ratio = if budget.mode == BudgetMode::Auto {
+            0.0
+        } else {
+            effective_completion_reserve_ratio
         };
         let profile = profile.as_str();
         let inputs = ResourceGovernorInputs {
             profile,
             attention_cap,
             attention_interrupts: attention.interrupts,
-            completion_reserve_ratio: effective_completion_reserve_ratio,
-            hard_caps: &hard_caps,
+            completion_reserve_ratio: gate_reserve_ratio,
+            hard_caps: &reserve_caps,
             dimensions: &dimensions,
             readiness_blocked: false,
             unlimited: budget.unlimited,
@@ -1378,16 +1392,18 @@ fn resource_attention(approvals: &[Approval], unknown_effects: u64) -> (Resource
             "expired" => attention.expired += 1,
             _ => {}
         }
-        attention.interrupts = attention.interrupts.saturating_add(weight);
-        *by_risk
-            .entry(
-                approval
-                    .approval_risk
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
-            )
-            .or_insert(0) += 1;
-        risk = risk.saturating_add(weight as u64);
+        if approval.status == "pending" {
+            attention.interrupts = attention.interrupts.saturating_add(weight);
+            *by_risk
+                .entry(
+                    approval
+                        .approval_risk
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                )
+                .or_insert(0) += 1;
+            risk = risk.saturating_add(weight as u64);
+        }
     }
     attention.by_risk = by_risk
         .into_iter()
@@ -2001,6 +2017,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completion_reserve_uses_effective_budget_not_the_hard_cap() {
+        let (_data, _repo, engine, session) = fixture().await;
+        engine
+            .set_session_budget(SetSessionBudgetParams {
+                session_id: session.id.clone(),
+                mode: Some(BudgetMode::Fixed),
+                token_budget: Some(1_000),
+                hard_token_cap: Some(100_000),
+                ..SetSessionBudgetParams::default()
+            })
+            .await
+            .unwrap();
+        let fixed = engine
+            .resource_governor_decision(&session.id, "dispatch")
+            .await
+            .unwrap();
+        assert!(
+            !fixed.should_block(),
+            "a fixed effective budget must not reserve a fraction of a much larger hard cap: {fixed:?}"
+        );
+
+        let auto = engine
+            .create_session_with_budget_options(
+                session.project_id.clone(),
+                "auto reserve".into(),
+                None,
+                None,
+                None,
+                Some(BudgetMode::Auto),
+                Some(vp_protocol::types::AutoBudgetPolicy {
+                    enabled: true,
+                    initial_token_budget: Some(1_000),
+                    hard_token_cap: Some(5_000),
+                    ..vp_protocol::types::AutoBudgetPolicy::default()
+                }),
+                0,
+                false,
+            )
+            .await
+            .unwrap();
+        engine.record_usage(&auto.id, 900, 0).await.unwrap();
+        let auto_decision = engine
+            .resource_governor_decision(&auto.id, "dispatch")
+            .await
+            .unwrap();
+        assert!(
+            !auto_decision.should_block(),
+            "Auto reserve is owned by the Auto controller, not dispatch: {auto_decision:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn fixed_top_up_clamps_to_the_existing_hard_cap() {
         let (_data, _repo, engine, session) = fixture().await;
         let _ = engine
@@ -2299,7 +2367,7 @@ mod tests {
     }
 
     #[test]
-    fn attention_weights_risk_and_unknown_effects() {
+    fn attention_weights_only_pending_approvals_and_unknown_effects() {
         let approval: Approval = serde_json::from_value(json!({
             "id": "ap-1",
             "session_id": "s-1",
@@ -2325,9 +2393,13 @@ mod tests {
         let (attention, risk) = resource_attention(&[approval, denied], 1);
         assert_eq!(attention.pending, 1);
         assert_eq!(attention.denied, 1);
-        assert_eq!(attention.interrupts, 8);
-        assert_eq!(risk, 13);
-        assert_eq!(attention.by_risk.len(), 2);
+        assert_eq!(attention.interrupts, 3, "resolved approvals stop counting");
+        assert_eq!(
+            risk, 8,
+            "unknown effects still count, denied approval does not"
+        );
+        assert_eq!(attention.by_risk.len(), 1);
+        assert_eq!(attention.by_risk[0].key, "host_state");
     }
 
     #[tokio::test]

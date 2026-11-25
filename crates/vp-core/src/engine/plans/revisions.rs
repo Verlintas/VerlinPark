@@ -443,4 +443,76 @@ mod tests {
         );
         assert_eq!(store.plan_lifecycle_events(&session.id).unwrap().len(), 2);
     }
+
+    #[tokio::test]
+    async fn readding_a_removed_task_starts_a_fresh_projection() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let project = store
+            .add_project(repo.path().to_str().unwrap(), Some("plans"))
+            .unwrap();
+        let session = store.create_session(&project.id, "re-add").unwrap();
+        let engine = Engine::new(store.clone());
+        let original = plan();
+        engine
+            .submit_team_plan(&session.id, &original)
+            .await
+            .unwrap();
+        let plan_seq = store
+            .latest_event_seq(&session.id, "team_plan.submitted")
+            .unwrap();
+        store
+            .claim_plan_tasks_with_events(&session.id, plan_seq, &["T1".into()])
+            .unwrap();
+        store
+            .finish_plan_task(&session.id, plan_seq, "T1", "failed", Some("first attempt"))
+            .unwrap()
+            .unwrap();
+        store
+            .append_event(
+                &session.id,
+                "plan_task.finished",
+                serde_json::json!({
+                    "task_id": "T1",
+                    "task_status": "failed",
+                    "summary": "first attempt",
+                }),
+            )
+            .unwrap();
+
+        let without_t1 = TeamPlan {
+            goal: original.goal.clone(),
+            departments: original.departments.clone(),
+            tasks: vec![task("T2", vec![])],
+        };
+        engine
+            .revise_team_plan(&session.id, without_t1, "remove T1", "user", Some(1), 4)
+            .await
+            .unwrap();
+        engine
+            .revise_team_plan(
+                &session.id,
+                original.clone(),
+                "re-add T1",
+                "user",
+                Some(2),
+                4,
+            )
+            .await
+            .unwrap();
+
+        let t1 = store
+            .list_plan_tasks(None, Some(&session.id))
+            .unwrap()
+            .into_iter()
+            .find(|task| task.task_id == "T1")
+            .expect("re-added T1");
+        assert_eq!(
+            t1.status, "pending",
+            "a re-added task must not inherit its old failed/cancelled terminal status"
+        );
+        assert_eq!(t1.attempts, 0);
+        assert!(t1.last_error.is_none());
+    }
 }

@@ -241,6 +241,20 @@ is quiescent.
   token/cost/time caps when `Session.unlimited` is on, while attention,
   readiness, risk, context, approvals, and verification still gate work. This
   keeps the plan path consistent with the prompt path.
+- The completion reserve is measured against the effective allowance, not a
+  separate hard cap; Auto sessions leave that reserve to the Auto controller,
+  matching the turn-boundary exemption. Resolved/denied approvals no longer
+  count as operator attention or risk (only pending approvals and unresolved
+  effects do).
+- A gate or task-scope budget deferral settles only its task/batch; unrelated
+  siblings stay pending for the scheduler. A session-scope budget stop and an
+  explicit cancellation still settle the remaining plan.
+- `sync_plan_tasks` resets a task's projection when a plan revision added that
+  id after it had been removed, so a re-added task starts pending with zero
+  attempts instead of inheriting an old failed/cancelled row.
+- A landed program session can still complete an already-completed,
+  integration-clean milestone. A cancelled intake item can be manually
+  dispatched again without a separate retry command.
 - `ProjectRunPolicy.auto_reallocate_envelopes` is off by default. When enabled,
   a Worker/Labour run gets a runtime-only effective task budget from unused
   token/cost capacity of already-completed tasks in the same department.
@@ -299,7 +313,7 @@ is quiescent.
   (unit/daemon tests cover both paths).
 - Tests: targeted allocation, trade-off, auto-rescue, envelope-persist,
   protocol, CLI, and daemon tests; full workspace
-  **4,669 passed / 0 failed / 6 ignored**;
+  **4,673 passed / 0 failed / 6 ignored**;
   Swift **659 passed (527 app + 132 helper)**; fmt, clippy,
   SwiftFormat, and `xcodebuild test` pass.
 - Live DeepSeek evidence (2026-11-25): the explicit smoke passed with

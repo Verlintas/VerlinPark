@@ -507,7 +507,7 @@ impl ProgramController {
         }
         match task.status.as_str() {
             "completed" => {
-                if session.status != "idle" {
+                if !matches!(session.status.as_str(), "idle" | "landed") {
                     if matches!(session.status.as_str(), "failed" | "cancelled") {
                         self.handle_milestone_failure(
                             program,
@@ -2139,6 +2139,38 @@ mod tests {
             milestone.status,
             ProgramMilestoneStatus::Blocked,
             "an explicitly skipped task must not complete the milestone: {milestone:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn landed_session_still_completes_its_completed_milestone() {
+        let (_dir, engine, project) = setup();
+        let program = create_program(&engine, &project).await;
+        let milestone = add_milestone(&engine, &program, "Landed work", Vec::new()).await;
+        let controller = engine.programs();
+        controller.reconcile(None).await.unwrap();
+        let milestone = engine
+            .store()
+            .get_program_milestone(&milestone.id)
+            .unwrap()
+            .unwrap();
+        let session = attach_completed_plan(&engine, &controller, &program, &milestone).await;
+        engine
+            .store()
+            .update_session_status(&session.id, "landed")
+            .unwrap();
+
+        controller.reconcile(None).await.unwrap();
+        controller.reconcile(None).await.unwrap();
+        let milestone = engine
+            .store()
+            .get_program_milestone(&milestone.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            milestone.status,
+            ProgramMilestoneStatus::Completed,
+            "a landed session must not freeze a completed milestone: {milestone:?}"
         );
     }
 
