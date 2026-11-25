@@ -529,6 +529,9 @@ secrets; no unbounded data.
 
 - Event-backed profile/contract override (`session.run_contract.updated`).
 - Completion reserve and attention/risk pre-dispatch deferral.
+- `Session.unlimited` bypasses retained economic caps in both governor
+  phases while attention, readiness, risk, context, approvals, and
+  verification still gate work.
 - `session.resources.top_up` for fixed/auto budgets, clamped to caps. A
   top-up changes budget/headroom; it does not silently unblock a plan task
   already settled blocked by budget, so that task needs an explicit
@@ -593,11 +596,11 @@ Implemented:
   reallocation recommendations are advisory only; no task envelope is mutated
   automatically.
 - Readiness-blocked remains a dispatch gate, not a turn pause (avoids
-  deadlocking approval/effect flows in an active run). The dispatch guard now
-  runs before the queue/lease/plan-resume events, and repeated identical
-  decision events are deduplicated until another session event occurs, so a
-  terminally blocked session does not append a full resume cycle on every
-  scheduler cooldown.
+  deadlocking approval/effect flows in an active run). The R2a resource guard
+  and the critical-path admission check both run before queue/lease/
+  plan-resume events; repeated identical decision/admission events are
+  deduplicated until their inputs change, so a terminally blocked session
+  does not append a full resume cycle on every scheduler cooldown.
 
 Remaining:
 

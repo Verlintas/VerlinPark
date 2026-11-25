@@ -803,9 +803,11 @@ impl ProgramController {
             // only marked completed after finish_worker accepted that outcome.
             return Ok(true);
         }
+        // The deterministic Integrator's success status is `merged`.
+        // `integrated` is retained for older imported/archive rows.
         Ok(task_entries
             .iter()
-            .all(|entry| entry.status == "integrated"))
+            .all(|entry| matches!(entry.status.as_str(), "merged" | "integrated")))
     }
 
     fn milestone_result(&self, session: &Session, task: &ScheduledTask) -> Option<String> {
@@ -2037,6 +2039,52 @@ mod tests {
         let program = engine.store().get_program(&program.id).unwrap().unwrap();
         assert_eq!(program.status, ProgramStatus::Completed);
         assert!(program.completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn completed_plan_with_a_merged_integrator_entry_completes() {
+        let (_dir, engine, project) = setup();
+        let program = create_program(&engine, &project).await;
+        let milestone = add_milestone(&engine, &program, "Merged work", Vec::new()).await;
+        let controller = engine.programs();
+        controller.reconcile(None).await.unwrap();
+        let milestone = engine
+            .store()
+            .get_program_milestone(&milestone.id)
+            .unwrap()
+            .unwrap();
+        let session = attach_completed_plan(&engine, &controller, &program, &milestone).await;
+        let entry = engine
+            .store()
+            .enqueue_merge(
+                &session.id,
+                "agent-1",
+                "Worker",
+                Some("T1"),
+                "verlinpark/session/task",
+                "commit",
+                "base",
+                Some("test entry"),
+            )
+            .unwrap();
+        engine
+            .store()
+            .update_merge_queue_entry(&entry.id, "merged", Some("integrator: merged"))
+            .unwrap()
+            .expect("entry updated");
+
+        controller.reconcile(None).await.unwrap();
+        controller.reconcile(None).await.unwrap();
+        let milestone = engine
+            .store()
+            .get_program_milestone(&milestone.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            milestone.status,
+            ProgramMilestoneStatus::Completed,
+            "a real Integrator merge must count as clean integration evidence: {milestone:?}"
+        );
     }
 
     #[tokio::test]

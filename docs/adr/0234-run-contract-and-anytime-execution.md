@@ -248,6 +248,12 @@ The R3/R4 slice is read-only/advisory except for two explicit project opt-ins:
   revision fails closed; it never creates capacity and is not called by the
   scheduler, controller, or a model. Automatic persisted reallocation remains
   open.
+- The dispatch path evaluates both governor tiers before queue/lease events,
+  deduplicates identical decision/admission records, and treats
+  `Session.unlimited` as bypassing only retained economic caps (attention,
+  readiness, risk, context, approvals, and verification remain). A terminal
+  gate releases its plan task only when the current row is still blocked and
+  the latest block event names that gate.
 - Both preview RPCs append no events and mutate nothing. The macOS cards load
   only when visible or explicitly refreshed and reject a response for a
   different session.

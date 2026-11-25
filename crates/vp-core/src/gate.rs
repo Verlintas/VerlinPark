@@ -721,30 +721,57 @@ impl Engine {
         ) {
             return Ok(0);
         }
-        let events = self
-            .recent_events_of_kind(&gate.session_id, "plan_task.finished", 5_000)
-            .await?;
-        // Only the latest finish event for a task describes its current block.
-        let mut latest = HashMap::<String, serde_json::Value>::new();
-        for event in events {
-            if let Some(task_id) = event.payload["task_id"].as_str() {
-                latest.insert(task_id.to_string(), event.payload);
-            }
+        let store = self.store().clone();
+        let session_id = gate.session_id.clone();
+        let gate_id = gate.id.clone();
+        let candidates = tokio::task::spawn_blocking(move || {
+            store.plan_task_ids_with_gate_block(&session_id, &gate_id)
+        })
+        .await??;
+        if candidates.is_empty() {
+            return Ok(0);
         }
         let store = self.store().clone();
         let session_id = gate.session_id.clone();
-        let plan_seq = tokio::task::spawn_blocking(move || {
-            store.latest_event_seq(&session_id, "team_plan.submitted")
+        let (plan_seq, rows) = tokio::task::spawn_blocking(move || {
+            let plan_seq = store.latest_event_seq(&session_id, "team_plan.submitted")?;
+            let rows = store.list_plan_tasks(None, Some(&session_id))?;
+            Ok::<_, anyhow::Error>((plan_seq, rows))
         })
         .await??;
         if plan_seq == 0 {
             return Ok(0);
         }
+        let by_task = rows
+            .into_iter()
+            .map(|row| (row.task_id.clone(), row))
+            .collect::<HashMap<_, _>>();
         let mut released = 0usize;
-        for (task_id, payload) in latest {
-            if payload["task_status"].as_str() != Some("blocked")
-                || payload["reason"].as_str() != Some("waiting for external gate")
-                || payload["gate_id"].as_str() != Some(gate.id.as_str())
+        for task_id in candidates {
+            let Some(row) = by_task.get(&task_id) else {
+                continue;
+            };
+            // A later block/retry supersedes the gate wait. Never release a
+            // row whose current reason is not still the gate wait.
+            if row.status != "blocked"
+                || row.last_error.as_deref() != Some("waiting for external gate")
+            {
+                continue;
+            }
+            let store = self.store().clone();
+            let session_id = gate.session_id.clone();
+            let task = task_id.clone();
+            let latest = tokio::task::spawn_blocking(move || {
+                store.latest_plan_task_block_event(&session_id, &task)
+            })
+            .await??;
+            let Some(latest) = latest else {
+                continue;
+            };
+            if latest.kind != "plan_task.finished"
+                || latest.payload["task_status"].as_str() != Some("blocked")
+                || latest.payload["reason"].as_str() != Some("waiting for external gate")
+                || latest.payload["gate_id"].as_str() != Some(gate.id.as_str())
             {
                 continue;
             }
@@ -1217,6 +1244,136 @@ mod engine_tests {
 
     fn code(error: &anyhow::Error) -> &'static str {
         gate_error_code(error).expect("typed gate error")
+    }
+
+    #[tokio::test]
+    async fn terminal_gate_does_not_release_a_superseded_dependency_block() {
+        let fixture = fixture().await;
+        let plan = vp_protocol::types::TeamPlan {
+            goal: "gate release".into(),
+            departments: vec![vp_protocol::types::PlanDepartment {
+                name: "impl".into(),
+                manager_title: "Implementation".into(),
+                profile: "coding".into(),
+                objective: "build".into(),
+                token_budget: None,
+                cost_budget_usd: None,
+            }],
+            tasks: vec![vp_protocol::types::PlanTask {
+                id: "T1".into(),
+                department: "impl".into(),
+                title: "Wait".into(),
+                kind: "coding".into(),
+                priority: 0,
+                profile: None,
+                deps: Vec::new(),
+                write_scope: vec!["src/t1".into()],
+                acceptance: vec!["done".into()],
+                token_budget: None,
+                cost_budget_usd: None,
+                parent_task_id: None,
+                fanout_key: None,
+                fanout_join_for: None,
+            }],
+        };
+        fixture
+            .engine
+            .submit_team_plan(&fixture.session_id, &plan)
+            .await
+            .unwrap();
+        let gate = fixture
+            .engine
+            .open_gate(GateOpenParams {
+                session_id: fixture.session_id.clone(),
+                task_id: Some("T1".into()),
+                kind: Some("ci".into()),
+                label: Some("unit tests".into()),
+                payload: None,
+                expires_at: None,
+                after_secs: None,
+            })
+            .await
+            .unwrap();
+        let store = fixture.engine.store().clone();
+        let seq = store
+            .latest_event_seq(&fixture.session_id, "team_plan.submitted")
+            .unwrap();
+        store
+            .claim_plan_tasks_with_events(&fixture.session_id, seq, &["T1".to_string()])
+            .unwrap();
+        store
+            .finish_plan_task(
+                &fixture.session_id,
+                seq,
+                "T1",
+                "blocked",
+                Some("waiting for external gate"),
+            )
+            .unwrap()
+            .expect("gate block");
+        store
+            .append_event(
+                &fixture.session_id,
+                "plan_task.finished",
+                json!({
+                    "task_id": "T1",
+                    "task_status": "blocked",
+                    "gate_id": gate.gate.id,
+                    "reason": "waiting for external gate",
+                }),
+            )
+            .unwrap();
+        store
+            .unblock_plan_task_with_event(&fixture.session_id, seq, "T1", "manual retry")
+            .unwrap()
+            .expect("retry");
+        store
+            .block_plan_task_with_event(
+                &fixture.session_id,
+                seq,
+                "T1",
+                "dependency T0 failed",
+                "T0",
+            )
+            .unwrap()
+            .expect("dependency block");
+
+        fixture
+            .engine
+            .resolve_gate(
+                &gate.gate.id,
+                gate.token.expose(),
+                Some("resolved"),
+                None,
+                Some("test"),
+            )
+            .await
+            .unwrap();
+        let row = fixture
+            .engine
+            .store()
+            .list_plan_tasks(None, Some(&fixture.session_id))
+            .unwrap()
+            .into_iter()
+            .find(|row| row.task_id == "T1")
+            .expect("T1");
+        assert_eq!(row.status, "blocked");
+        assert_eq!(row.last_error.as_deref(), Some("dependency T0 failed"));
+        let events = fixture
+            .engine
+            .list_events(fixture.session_id.clone(), 0, 200)
+            .await
+            .unwrap();
+        assert!(
+            !events.iter().any(|event| {
+                event.kind == "plan_task.unblocked"
+                    && event.payload["task_id"] == "T1"
+                    && event.payload["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("external gate"))
+            }),
+            "a gate must not release a task whose latest block is unrelated"
+        );
     }
 
     #[tokio::test]

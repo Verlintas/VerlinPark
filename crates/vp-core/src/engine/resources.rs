@@ -729,6 +729,7 @@ impl Engine {
         }
         let snapshot = self.session_resources(session_id).await?;
         let contract = self.run_contract_view(session_id).await?;
+        let unlimited = self.session_budget(session_id).await?.unlimited;
         let inputs = ResourceGovernorInputs {
             profile: &contract.profile,
             attention_cap: contract.attention_cap,
@@ -740,6 +741,7 @@ impl Engine {
                 .readiness
                 .as_ref()
                 .is_some_and(|readiness| readiness.level == "blocked"),
+            unlimited,
         };
         let (action, reason) = resource_governor_action(&inputs);
         let details = resource_governor_details(
@@ -859,6 +861,7 @@ impl Engine {
             hard_caps: &hard_caps,
             dimensions: &dimensions,
             readiness_blocked: false,
+            unlimited: budget.unlimited,
         };
         let (action, reason) = resource_governor_action(&inputs);
         let mut details = resource_governor_details(
@@ -1146,6 +1149,10 @@ struct ResourceGovernorInputs<'a> {
     hard_caps: &'a AutoBudgetCaps,
     dimensions: &'a [ResourceDimension],
     readiness_blocked: bool,
+    /// `Session.unlimited` bypasses session/plan/project economic gates. It
+    /// does not bypass attention, readiness, risk, context, approvals, or any
+    /// verification/merge gate.
+    unlimited: bool,
 }
 
 fn resource_governor_action(inputs: &ResourceGovernorInputs<'_>) -> (String, String) {
@@ -1162,42 +1169,49 @@ fn resource_governor_action(inputs: &ResourceGovernorInputs<'_>) -> (String, Str
         return ("defer".to_string(), "unattended_risk".to_string());
     }
     for key in ["money", "time", "context", "tokens"] {
+        if inputs.unlimited && key != "context" {
+            continue;
+        }
         if resource_dimension(inputs.dimensions, key)
             .is_some_and(|dimension| dimension.state == "hard_limit")
         {
             return ("defer".to_string(), format!("resource_cap_{key}"));
         }
     }
-    for (key, hard) in [
-        ("tokens", inputs.hard_caps.token.map(|value| value as f64)),
-        (
-            "time",
-            inputs.hard_caps.wall_clock_secs.map(|value| value as f64),
-        ),
-    ] {
-        let Some(hard) = hard else { continue };
-        let Some(remaining) =
-            resource_dimension(inputs.dimensions, key).and_then(|dimension| dimension.remaining)
-        else {
-            continue;
-        };
-        let reserve = hard * inputs.completion_reserve_ratio;
-        if remaining < reserve {
-            return ("defer".to_string(), format!("completion_reserve_{key}"));
+    if !inputs.unlimited {
+        for (key, hard) in [
+            ("tokens", inputs.hard_caps.token.map(|value| value as f64)),
+            (
+                "time",
+                inputs.hard_caps.wall_clock_secs.map(|value| value as f64),
+            ),
+        ] {
+            let Some(hard) = hard else { continue };
+            let Some(remaining) = resource_dimension(inputs.dimensions, key)
+                .and_then(|dimension| dimension.remaining)
+            else {
+                continue;
+            };
+            let reserve = hard * inputs.completion_reserve_ratio;
+            if remaining < reserve {
+                return ("defer".to_string(), format!("completion_reserve_{key}"));
+            }
         }
-    }
-    if let (Some(hard), Some(remaining)) = (
-        inputs.hard_caps.cost_usd,
-        resource_dimension(inputs.dimensions, "money").and_then(|dimension| dimension.remaining),
-    ) && remaining < hard * inputs.completion_reserve_ratio
-    {
-        return ("defer".to_string(), "completion_reserve_money".to_string());
+        if let (Some(hard), Some(remaining)) = (
+            inputs.hard_caps.cost_usd,
+            resource_dimension(inputs.dimensions, "money")
+                .and_then(|dimension| dimension.remaining),
+        ) && remaining < hard * inputs.completion_reserve_ratio
+        {
+            return ("defer".to_string(), "completion_reserve_money".to_string());
+        }
     }
     if inputs.dimensions.iter().any(|dimension| {
         matches!(
             dimension.key.as_str(),
             "money" | "time" | "attention" | "context" | "tokens"
-        ) && matches!(dimension.state.as_str(), "soft_limit" | "watch")
+        ) && !(inputs.unlimited && matches!(dimension.key.as_str(), "money" | "time" | "tokens"))
+            && matches!(dimension.state.as_str(), "soft_limit" | "watch")
     }) {
         return ("warn".to_string(), "soft_resource_limit".to_string());
     }
@@ -1887,6 +1901,79 @@ mod tests {
             .unwrap();
         assert_eq!(reserve.action, "defer", "{reserve:?}");
         assert_eq!(reserve.reason, "completion_reserve_tokens");
+    }
+
+    #[tokio::test]
+    async fn unlimited_bypasses_economic_governor_but_keeps_attention() {
+        let (_data, _repo, engine, session) = fixture().await;
+        engine
+            .set_session_budget(SetSessionBudgetParams {
+                session_id: session.id.clone(),
+                mode: Some(BudgetMode::Fixed),
+                token_budget: Some(1_000),
+                ..SetSessionBudgetParams::default()
+            })
+            .await
+            .unwrap();
+        engine.record_usage(&session.id, 950, 0).await.unwrap();
+        let capped = engine
+            .resource_governor_decision(&session.id, "dispatch")
+            .await
+            .unwrap();
+        assert_eq!(capped.reason, "completion_reserve_tokens", "{capped:?}");
+
+        engine
+            .set_session_unlimited(&session.id, true)
+            .await
+            .unwrap();
+        let unlimited_dispatch = engine
+            .resource_governor_decision(&session.id, "dispatch")
+            .await
+            .unwrap();
+        assert!(
+            !unlimited_dispatch.should_block(),
+            "unlimited must bypass retained economic caps: {unlimited_dispatch:?}"
+        );
+        let unlimited_turn = engine
+            .resource_governor_decision(&session.id, "turn")
+            .await
+            .unwrap();
+        assert!(
+            !unlimited_turn.should_block(),
+            "unlimited must not pause on retained economic caps: {unlimited_turn:?}"
+        );
+
+        engine
+            .set_run_contract(SetRunContractParams {
+                session_id: session.id.clone(),
+                profile: RunProfile::Balanced,
+                completion_reserve_ratio: None,
+                attention_cap: Some(1),
+                stop_policy: None,
+                updated_by: None,
+            })
+            .await
+            .unwrap();
+        let (_approval, _receiver) = engine
+            .request_approval_with_risk(
+                &session.id,
+                "call-unlimited-attention",
+                "shell",
+                json!({"command": "git status"}),
+                None,
+                Some("host_state"),
+                Some("unlimited attention"),
+            )
+            .await
+            .unwrap();
+        let attention = engine
+            .resource_governor_decision(&session.id, "dispatch")
+            .await
+            .unwrap();
+        assert_eq!(
+            attention.reason, "attention_cap",
+            "unlimited does not bypass attention: {attention:?}"
+        );
     }
 
     #[tokio::test]

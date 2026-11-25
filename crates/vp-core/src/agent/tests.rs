@@ -6,6 +6,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::Ordering;
 use tempfile::TempDir;
+use vp_protocol::types::{CriticalPathPolicy, RunProfile, SetRunContractParams};
 use vp_providers::{EventStream, ProviderError};
 use vp_store::Store;
 use vp_store::store::Claim;
@@ -4462,6 +4463,108 @@ async fn dispatch_guard_defers_before_emitting_a_plan_resume_cycle() {
         event.kind == "session.resource.decision"
             && event.payload["reason"] == "resource_cap_tokens"
     }));
+}
+
+#[tokio::test]
+async fn critical_path_deferral_happens_before_a_plan_resume_cycle() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session_with_limits(
+            project.id.clone(),
+            "governor plan".into(),
+            Some(10_000),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    engine
+        .set_run_contract(SetRunContractParams {
+            session_id: session.id.clone(),
+            profile: RunProfile::Balanced,
+            completion_reserve_ratio: Some(0.0),
+            attention_cap: Some(100),
+            stop_policy: None,
+            updated_by: None,
+        })
+        .await
+        .unwrap();
+    engine
+        .set_critical_path_policy(
+            &project.id,
+            &CriticalPathPolicy {
+                enabled: true,
+                reserve_ratio: 0.25,
+                throttle_at_ratio: 0.35,
+                min_task_budget: 100,
+                ..CriticalPathPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    let plan: TeamPlan = serde_json::from_value(serde_json::json!({
+        "goal": "governor plan",
+        "departments": [{
+            "name": "impl",
+            "manager_title": "Implementation",
+            "profile": "coding",
+            "objective": "do work"
+        }],
+        "tasks": [{
+            "id": "T1",
+            "department": "impl",
+            "title": "Work",
+            "kind": "coding",
+            "deps": [],
+            "acceptance": ["done"],
+            "write_scope": ["src/lib.rs"],
+            "token_budget": 1_000
+        }]
+    }))
+    .unwrap();
+    engine.set_team_plan(&session.id, &plan).await.unwrap();
+    engine
+        .record_agent_usage(
+            &session.id,
+            "worker",
+            "Worker",
+            "worker",
+            None,
+            None,
+            "test-model",
+            9_950,
+            0,
+            false,
+            0.0,
+        )
+        .await
+        .unwrap();
+
+    assert!(!service.resume_plan(&session.id).await.unwrap());
+    assert!(!service.resume_plan(&session.id).await.unwrap());
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "agent.plan_resumed"),
+        "a critical-path deferral must not emit a plan-resume cycle"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "budget.governor.decision")
+            .count(),
+        1,
+        "identical deferred admissions are recorded once until inputs change"
+    );
 }
 
 #[tokio::test]

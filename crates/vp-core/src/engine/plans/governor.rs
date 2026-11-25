@@ -357,6 +357,17 @@ impl Engine {
         if !admission.enabled {
             return Ok(());
         }
+        // A scheduler cooldown can re-evaluate the same deferred admission.
+        // Keep one event while its deterministic inputs and decisions do not
+        // change; a real budget/task/policy change produces a new inputs hash.
+        if let Some(previous) = self
+            .latest_event_of_kind(session_id, crate::budget_governor::DECISION_EVENT_KIND)
+            .await?
+            && previous.payload["action"] == "admission"
+            && previous.payload["inputs_hash"].as_str() == Some(admission.inputs_hash.as_str())
+        {
+            return Ok(());
+        }
         let decision_id = format!("gov-{}", Uuid::now_v7());
         let now = now_rfc3339();
         let payload =

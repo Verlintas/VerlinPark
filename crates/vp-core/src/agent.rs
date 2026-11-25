@@ -2688,7 +2688,6 @@ impl AutoBudgetRuntime {
             self.state.last_forecast = Some(status.forecast.clone());
         }
         control.pause();
-        engine.update_session_status(&session.id, "paused").await?;
         // A non-owner runtime (Worker/Labour/Verifier) must never write its
         // run-start copy of the Leader-owned turn/no-progress state over newer
         // persisted state. Merge only the session-wide pause marker into the
@@ -2718,6 +2717,9 @@ impl AutoBudgetRuntime {
             object.insert("elapsed_secs".into(), json!(persisted.elapsed_secs));
             object.insert("extensions".into(), json!(persisted.extensions));
         }
+        // Append the pause event before publishing the paused projection so a
+        // cancelled/dropped run cannot leave a paused session with no
+        // `session.auto_paused` evidence.
         engine
             .update_session_auto_budget_state_with_event(
                 &session.id,
@@ -2726,6 +2728,7 @@ impl AutoBudgetRuntime {
                 payload,
             )
             .await?;
+        engine.update_session_status(&session.id, "paused").await?;
         Ok(())
     }
 

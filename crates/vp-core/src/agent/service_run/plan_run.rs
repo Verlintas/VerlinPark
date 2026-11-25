@@ -53,7 +53,7 @@ impl AgentService {
                 .record_compatibility_drift(&compatibility)
                 .await?;
         }
-        let (_, scheduled) = self.engine.scheduler().sync_plan(&session, &plan).await?;
+        let (plan_seq, scheduled) = self.engine.scheduler().sync_plan(&session, &plan).await?;
         let mut terminal = scheduled
             .iter()
             .filter(|task| matches!(task.status.as_str(), "completed" | "skipped" | "cancelled"))
@@ -94,6 +94,34 @@ impl AgentService {
                 // policy if it can be read there.
                 tracing::warn!(%error, session_id, "resource governor dispatch read failed");
             }
+        }
+        // The critical-path budget governor is also a dispatch gate. Evaluate
+        // it before queue/lease events so a deferral is not re-emitted as a
+        // full plan-resume cycle on every scheduler cooldown.
+        let governor_budget = crate::budget_governor::GovernorBudgetView::new(
+            session.token_budget,
+            session.tokens_in.saturating_add(session.tokens_out),
+            self.engine
+                .budget_registry()
+                .reserved_for_session(session_id),
+        );
+        let selection = self
+            .engine
+            .scheduler()
+            .ready_tasks_governed(&session, plan_seq, &plan, 1, Some(governor_budget))
+            .await?;
+        if selection.ready.is_empty() && !selection.deferred.is_empty() {
+            if let Some(admission) = selection.governor.as_ref() {
+                self.engine
+                    .record_budget_governor_admission(session_id, admission)
+                    .await?;
+            }
+            tracing::info!(
+                session_id,
+                deferred = selection.deferred.len(),
+                "plan dispatch deferred by the critical-path budget governor"
+            );
+            return Ok(false);
         }
 
         let control = Arc::new(RunControl::new());

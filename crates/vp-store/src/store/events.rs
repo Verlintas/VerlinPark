@@ -642,6 +642,69 @@ impl Store {
         Ok(events)
     }
 
+    /// Task ids that ever recorded a gate block for this gate. Callers must
+    /// still validate the task's current row and latest block event before
+    /// releasing it.
+    pub fn plan_task_ids_with_gate_block(
+        &self,
+        session_id: &str,
+        gate_id: &str,
+    ) -> Result<Vec<String>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT json_extract(payload, '$.task_id')
+             FROM events
+             WHERE session_id = ?1
+               AND type = 'plan_task.finished'
+               AND json_extract(payload, '$.task_status') = 'blocked'
+               AND json_extract(payload, '$.reason') = 'waiting for external gate'
+               AND json_extract(payload, '$.gate_id') = ?2",
+        )?;
+        let rows = statement.query_map(params![session_id, gate_id], |row| {
+            row.get::<_, Option<String>>(0)
+        })?;
+        let mut tasks = Vec::new();
+        for task in rows {
+            if let Some(task) = task?
+                && !task.is_empty()
+            {
+                tasks.push(task);
+            }
+        }
+        tasks.sort();
+        tasks.dedup();
+        Ok(tasks)
+    }
+
+    /// The newest finish/block event for one task. A gate release must consult
+    /// this instead of an older gate event that a later block superseded.
+    pub fn latest_plan_task_block_event(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<Option<Event>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT session_id, seq, type, payload, created_at
+             FROM events
+             WHERE session_id = ?1
+               AND type IN ('plan_task.finished', 'plan_task.blocked')
+               AND json_extract(payload, '$.task_id') = ?2
+             ORDER BY seq DESC LIMIT 1",
+        )?;
+        let mut rows = statement.query_map(params![session_id, task_id], |row| {
+            let payload: String = row.get(3)?;
+            Ok(Event {
+                session_id: row.get(0)?,
+                seq: row.get::<_, i64>(1)? as u64,
+                kind: row.get(2)?,
+                payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+                created_at: row.get(4)?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
     pub fn list_events_by_kind(
         &self,
         session_id: &str,

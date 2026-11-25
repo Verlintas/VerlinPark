@@ -3,16 +3,16 @@ use super::*;
 /// Statuses that already represent a real, settled outcome. A batch abort
 /// must not rewrite them: a completed/merged sibling stays completed, and a
 /// cancelled/failed/deferred sibling keeps the state its own result produced.
-fn preserved_terminal_status(status: &str) -> bool {
+fn preserved_terminal_status(status: &str, overwrite_blocked: bool) -> bool {
     // A blocked row carries the reason that gates its recovery (budget, gate,
     // effect, dependency). A sibling/session abort or a later no-ready batch
     // must not rewrite that reason: the rewrite would both lose the original
     // block and make the task look like a stale dependency block, which the
     // controller would release without the resource/gate/effect state change.
-    matches!(
-        status,
-        "completed" | "skipped" | "cancelled" | "failed" | "blocked"
-    )
+    // An explicit session cancellation is different: it intentionally settles
+    // every remaining task, including one that was waiting on a gate/effect.
+    matches!(status, "completed" | "skipped" | "cancelled" | "failed")
+        || (status == "blocked" && !overwrite_blocked)
 }
 
 fn task_dependency_satisfied(status: Option<&str>) -> bool {
@@ -75,11 +75,12 @@ async fn settle_aborted_task(
     task_id: &str,
     status: &str,
     reason: &str,
+    overwrite_blocked: bool,
     statuses: &mut std::collections::HashMap<String, String>,
     reports: &mut Vec<String>,
 ) -> Result<()> {
     if let Some(current) = engine.plan_task_status(session_id, task_id).await?
-        && preserved_terminal_status(&current)
+        && preserved_terminal_status(&current, overwrite_blocked)
     {
         statuses.insert(task_id.to_string(), current.clone());
         reports.push(format!(
@@ -203,6 +204,7 @@ pub(in crate::agent) async fn execute_team_plan(
                     &task.id,
                     "cancelled",
                     "session cancelled",
+                    true,
                     &mut statuses,
                     &mut reports,
                 )
@@ -223,6 +225,7 @@ pub(in crate::agent) async fn execute_team_plan(
                     &task.id,
                     "blocked",
                     "token budget exhausted",
+                    false,
                     &mut statuses,
                     &mut reports,
                 )
@@ -324,6 +327,7 @@ pub(in crate::agent) async fn execute_team_plan(
                     &task.id,
                     "blocked",
                     &reason,
+                    false,
                     &mut statuses,
                     &mut reports,
                 )
@@ -1154,6 +1158,7 @@ pub(in crate::agent) async fn execute_team_plan(
                     &task.id,
                     status,
                     &reason,
+                    false,
                     &mut statuses,
                     &mut reports,
                 )
@@ -1171,6 +1176,7 @@ pub(in crate::agent) async fn execute_team_plan(
                     &task.id,
                     status,
                     &reason,
+                    false,
                     &mut statuses,
                     &mut reports,
                 )
@@ -1236,7 +1242,14 @@ fn integration_blocked_by_effect_unknown(report: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::integration_blocked_by_effect_unknown;
+    use super::{integration_blocked_by_effect_unknown, preserved_terminal_status};
+
+    #[test]
+    fn blocked_is_preserved_except_for_an_explicit_session_cancel() {
+        assert!(preserved_terminal_status("blocked", false));
+        assert!(!preserved_terminal_status("blocked", true));
+        assert!(preserved_terminal_status("completed", true));
+    }
 
     #[test]
     fn effect_unknown_integration_is_distinguished_from_a_normal_failure() {

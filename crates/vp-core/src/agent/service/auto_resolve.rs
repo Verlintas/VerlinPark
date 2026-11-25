@@ -100,7 +100,36 @@ impl AgentService {
                 return;
             }
         };
-        for entry in queue.into_iter().filter(|entry| entry.status == "conflict") {
+        let plan = match self.engine.get_team_plan(session_id).await {
+            Ok(plan) => plan,
+            Err(error) => {
+                tracing::warn!(%error, session_id, "auto-resolve could not read the plan");
+                return;
+            }
+        };
+        let store = self.engine.store().clone();
+        let session = session_id.to_string();
+        let tasks =
+            match tokio::task::spawn_blocking(move || store.list_plan_tasks(None, Some(&session)))
+                .await
+            {
+                Ok(Ok(tasks)) => tasks,
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, session_id, "auto-resolve could not read plan tasks");
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, session_id, "auto-resolve task read failed");
+                    return;
+                }
+            };
+        for entry in queue
+            .into_iter()
+            .filter(|entry| entry.status == "conflict")
+            .filter(|entry| {
+                auto_resolve_task_allowed(plan.as_ref(), &tasks, entry.task_id.as_deref())
+            })
+        {
             let attempted = self
                 .engine
                 .auto_resolve_attempts(&entry.id)
@@ -166,5 +195,95 @@ impl AgentService {
                 }
             }
         }
+    }
+}
+
+/// Auto-resolution may only touch a conflict whose plan task still exists and
+/// was not explicitly skipped/cancelled. A plan revision can remove a task, and
+/// `task.skip` does not delete its merge-queue row; merging that branch would
+/// resurrect work the operator already settled.
+pub(in crate::agent) fn auto_resolve_task_allowed(
+    plan: Option<&TeamPlan>,
+    tasks: &[ScheduledTask],
+    task_id: Option<&str>,
+) -> bool {
+    let Some(task_id) = task_id else {
+        return true;
+    };
+    let Some(plan) = plan else {
+        return true;
+    };
+    if !plan.tasks.iter().any(|task| task.id == task_id) {
+        return false;
+    }
+    if let Some(row) = tasks.iter().find(|task| task.task_id == task_id)
+        && matches!(row.status.as_str(), "skipped" | "cancelled")
+    {
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan(ids: &[&str]) -> TeamPlan {
+        serde_json::from_value(serde_json::json!({
+            "goal": "auto resolve",
+            "departments": [{
+                "name": "impl",
+                "manager_title": "Implementation",
+                "profile": "coding",
+                "objective": "build"
+            }],
+            "tasks": ids.iter().map(|id| serde_json::json!({
+                "id": id,
+                "department": "impl",
+                "title": id,
+                "kind": "coding",
+                "deps": [],
+                "acceptance": ["done"],
+                "write_scope": ["src/lib.rs"]
+            })).collect::<Vec<_>>()
+        }))
+        .unwrap()
+    }
+
+    fn row(task_id: &str, status: &str) -> ScheduledTask {
+        ScheduledTask {
+            session_id: "ses-1".into(),
+            project_id: "prj-1".into(),
+            plan_seq: 1,
+            task_id: task_id.into(),
+            department: "impl".into(),
+            title: task_id.into(),
+            priority: 0,
+            status: status.into(),
+            deps: Vec::new(),
+            write_scope: vec!["src/lib.rs".into()],
+            attempts: 0,
+            enqueued_at: "2026-01-01T00:00:00Z".into(),
+            started_at: None,
+            finished_at: None,
+            last_error: None,
+            next_attempt_at: None,
+        }
+    }
+
+    #[test]
+    fn auto_resolve_skips_removed_skipped_and_cancelled_tasks() {
+        let plan = plan(&["T1", "T2", "T3"]);
+        let rows = vec![
+            row("T1", "pending"),
+            row("T2", "skipped"),
+            row("T3", "cancelled"),
+        ];
+        assert!(auto_resolve_task_allowed(Some(&plan), &rows, Some("T1")));
+        assert!(!auto_resolve_task_allowed(Some(&plan), &rows, Some("T2")));
+        assert!(!auto_resolve_task_allowed(Some(&plan), &rows, Some("T3")));
+        assert!(!auto_resolve_task_allowed(Some(&plan), &rows, Some("T4")));
+        assert!(auto_resolve_task_allowed(None, &rows, Some("T3")));
+        assert!(auto_resolve_task_allowed(Some(&plan), &rows, None));
     }
 }

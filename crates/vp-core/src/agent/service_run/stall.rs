@@ -136,13 +136,19 @@ impl AgentService {
                 {
                     Ok(_) => {
                         self.complete_recovery_retry(&recovery).await?;
-                        if let Err(error) = self.resume_plan(&recovery.session_id).await {
-                            tracing::warn!(
+                        match self.resume_plan(&recovery.session_id).await {
+                            Ok(true) => {}
+                            Ok(false) => tracing::warn!(
+                                session_id = %recovery.session_id,
+                                task_id = %recovery.task_id,
+                                "stall recovery retried a task; dispatch is deferred by the resource governor"
+                            ),
+                            Err(error) => tracing::warn!(
                                 %error,
                                 session_id = %recovery.session_id,
                                 task_id = %recovery.task_id,
                                 "stall recovery retried a task but the plan resume failed"
-                            );
+                            ),
                         }
                     }
                     Err(error) => {
@@ -168,13 +174,19 @@ impl AgentService {
                     return Ok(true);
                 }
                 self.complete_recovery_retry(&recovery).await?;
-                if let Err(error) = self.resume_plan(&recovery.session_id).await {
-                    tracing::warn!(
+                match self.resume_plan(&recovery.session_id).await {
+                    Ok(true) => {}
+                    Ok(false) => tracing::warn!(
+                        session_id = %recovery.session_id,
+                        task_id = %recovery.task_id,
+                        "stall recovery retry is pending; dispatch is deferred by the resource governor"
+                    ),
+                    Err(error) => tracing::warn!(
                         %error,
                         session_id = %recovery.session_id,
                         task_id = %recovery.task_id,
                         "stall recovery resume after a partial retry failed"
-                    );
+                    ),
                 }
                 Ok(true)
             }
