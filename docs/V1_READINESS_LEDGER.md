@@ -555,3 +555,46 @@ vp --data-dir "$TEMP_DATA" provider-test
 
 The live runs are recorded above. They are not a substitute for the full
 Rust/Swift suites or for the remaining acceptance scenarios.
+
+### 2026-11-26 live DeepSeek PDfuji retry: harness fixes, partial E2E
+
+A real `deepseek-flash` run against the `PDfuji` project exposed four harness
+defects and one still-open budget/governor problem. The fixes in this round are
+locally test-covered but the live acceptance path is not complete.
+
+- The daemon was configured to a 1,000,000-token context window, 16,384 output
+  tokens, 40 turns, and unattended approvals. A new
+  `agent.runtime_config.set` RPC (and `vp runtime-config-set`) changes these
+  without rebuilding the provider, so an env-only or Keychain-backed key is not
+  lost. The GUI approval-mode action also uses a dedicated RPC now instead of
+  re-running provider configuration.
+- `submit_team_plan` validation errors are now typed `INVALID_ARGUMENT` with a
+  field-specific hint, and the schema explains that writing tasks need
+  `profile="coding"` while verification tasks are read-only with an empty
+  `write_scope`. The live Leader submitted a valid one-department plan on the
+  first attempt of the retry.
+- A repeated-tool-failure guard stops a run after three consecutive
+  deterministic plan/verdict failures (six for general tools) and records
+  `agent.tool_failure_loop`; a regression test covers three invalid
+  `submit_team_plan` calls.
+- Resume now normalizes incomplete provider tool history: missing results for
+  an interrupted assistant `tool_calls` turn are synthesized in memory and
+  orphan tool messages are dropped. This unblocked a session that had been
+  poisoned by a cancellation and then rejected by the provider with HTTP 400.
+- Live plan execution started, the Worker wrote the four `site/xeno/` files,
+  passed a bounded local check, and committed exactly those four files
+  (`2e30b38`). The Verifier then started but failed at the session budget
+  boundary; no merge queue entry or session-branch integration was produced.
+- The run still burned far more input tokens than a small static site should
+  need, and the finalize loop repeatedly hit completion-reserve pauses. Setting
+  the session budget or unlimited mode during an active plan run did not
+  reliably take effect for that run; the site was preserved and visually
+  reviewed, but the live Verifier/Integrator path remains open. Do not claim a
+  successful four-tier merge from this run.
+
+Local verification for the harness fixes: `cargo test --workspace` 4,694
+passed / 0 failed / 6 ignored; Swift `xcodebuild test` 659 passed / 0 failed;
+`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+and `swiftformat --lint` passed. The built site was copied to the target
+project's `site/xeno/` for visual review and is not part of this repository's
+commit.

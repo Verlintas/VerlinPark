@@ -12456,6 +12456,29 @@ pub struct ConfigureAgentParams {
     pub approval_mode: Option<ApprovalMode>,
 }
 
+/// Set only the daemon approval policy. This must not rebuild the provider,
+/// so an env-only or Keychain-backed provider keeps working when the operator
+/// changes the permission mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetApprovalModeParams {
+    pub approval_mode: ApprovalMode,
+}
+
+/// Update runtime limits without rebuilding the configured provider. Omitted
+/// fields keep their current values. This is the safe path for an env-only or
+/// Keychain-backed provider because it never asks for or replaces the key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetRuntimeConfigParams {
+    #[serde(default)]
+    pub approval_mode: Option<ApprovalMode>,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub max_turns: Option<u32>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionDiffParams {
     pub session_id: String,

@@ -8,6 +8,7 @@ mod identity;
 mod plan_resume;
 mod preemption;
 mod tool_calls;
+mod tool_failures;
 
 pub(super) use agent::run_agent;
 pub(super) use body::run_loop_body;
@@ -16,3 +17,4 @@ pub(super) use governor::{GovernorDeferralEvent, emit_governor_deferral, emit_sc
 pub(super) use identity::resolve_run_identity;
 pub(super) use plan_resume::run_plan_resume;
 pub(super) use preemption::{record_queued_preemption, record_terminal_preemption};
+pub(super) use tool_failures::ToolFailureGuard;

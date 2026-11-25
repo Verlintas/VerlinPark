@@ -233,6 +233,56 @@ impl AgentService {
         Ok(self.info())
     }
 
+    /// Change the risk-based approval policy without touching the configured
+    /// provider. The GUI must be able to switch modes even when the provider
+    /// was configured from environment variables and has no Keychain key.
+    pub fn set_approval_mode(&self, approval_mode: ApprovalMode) -> Result<AgentInfo> {
+        self.set_runtime_config(Some(approval_mode), None, None, None)
+    }
+
+    /// Update runtime limits without rebuilding the provider. This keeps an
+    /// env-only or Keychain-backed key intact while the operator changes the
+    /// context window, turn limit, or approval mode.
+    pub fn set_runtime_config(
+        &self,
+        approval_mode: Option<ApprovalMode>,
+        context_window: Option<u64>,
+        max_turns: Option<u32>,
+        max_tokens: Option<u32>,
+    ) -> Result<AgentInfo> {
+        if approval_mode.is_none()
+            && context_window.is_none()
+            && max_turns.is_none()
+            && max_tokens.is_none()
+        {
+            return Err(anyhow!("no runtime setting was provided"));
+        }
+        {
+            let mut config = self
+                .config
+                .write()
+                .map_err(|_| anyhow!("agent config lock poisoned"))?;
+            let Some(config) = config.as_mut() else {
+                return Err(anyhow!(
+                    "agent is not configured; configure a provider before updating runtime settings"
+                ));
+            };
+            if let Some(approval_mode) = approval_mode {
+                config.approval_mode = approval_mode;
+            }
+            if let Some(context_window) = context_window {
+                config.context_window = context_window.min(10_000_000);
+            }
+            if let Some(max_turns) = max_turns {
+                config.max_turns = max_turns.clamp(1, 200);
+            }
+            if let Some(max_tokens) = max_tokens {
+                config.max_tokens = Some(max_tokens.clamp(256, 65_536));
+            }
+        }
+        Ok(self.info())
+    }
+
     pub fn info(&self) -> AgentInfo {
         let config = self
             .config

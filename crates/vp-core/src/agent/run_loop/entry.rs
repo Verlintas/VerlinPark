@@ -105,6 +105,8 @@ pub(in crate::agent) async fn run_loop(
             let message = format!("{error:#}");
             let kind = if message.contains("maximum turns reached") {
                 "max_turns"
+            } else if message.contains("TOOL_FAILURE_LOOP") {
+                "tool_failure_loop"
             } else {
                 "error"
             };

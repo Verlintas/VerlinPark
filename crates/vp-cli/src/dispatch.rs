@@ -88,6 +88,8 @@ pub(crate) async fn run_command(
         | Command::Info
         | Command::Doctor
         | Command::ProviderTest
+        | Command::ApprovalModeSet { .. }
+        | Command::RuntimeConfigSet { .. }
         | Command::A2aStatus
         | Command::A2aCard
         | Command::A2aPolicySet { .. }

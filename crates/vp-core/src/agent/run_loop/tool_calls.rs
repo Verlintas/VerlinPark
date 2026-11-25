@@ -13,6 +13,7 @@ pub(super) async fn execute_tool_calls(
     top_level: bool,
     turn: u32,
     tool_calls: Vec<ToolCall>,
+    tool_failure_guard: &mut ToolFailureGuard,
     conversation: &mut Vec<ChatMessage>,
     conversation_ids: &mut Vec<Option<String>>,
     citations: &mut CitationRegistry,
@@ -523,7 +524,17 @@ pub(super) async fn execute_tool_calls(
                         Err(error) => return Err(error),
                     }
                 }
-                Err(error) => ToolOutput::error(error.to_string()),
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    let hint = team_plan_failure_hint(&message);
+                    ToolOutput::error_coded(
+                        "submit_team_plan",
+                        crate::tooling::errors::ToolErrorCode::INVALID_ARGUMENT,
+                        message,
+                    )
+                    .with_failure_evidence("invalid_team_plan")
+                    .with_failure_hint(hint)
+                }
             }
         } else if is_plan_fanout {
             emit(
@@ -1927,6 +1938,26 @@ pub(super) async fn execute_tool_calls(
                 .await?;
             conversation_ids.push(Some(stored.id));
         }
+        if let Some(loop_stop) = tool_failure_guard.observe(&call.name, &output) {
+            emit(
+                engine,
+                &session.id,
+                spec,
+                "agent.tool_failure_loop",
+                serde_json::json!({
+                    "tool": loop_stop.tool,
+                    "attempts": loop_stop.attempts,
+                    "last_error": loop_stop.last_error,
+                }),
+            )
+            .await?;
+            return Err(anyhow!(
+                "TOOL_FAILURE_LOOP: tool '{}' failed {} consecutive times; last error: {}. Stop retrying this tool unchanged.",
+                loop_stop.tool,
+                loop_stop.attempts,
+                loop_stop.last_error
+            ));
+        }
         conversation.push(ChatMessage::tool(call_id, output.content));
         if let Some(wait) = deferred_wait.take() {
             // A gate wait is a clean handoff: do not execute any remaining
@@ -1984,6 +2015,32 @@ pub(super) async fn execute_tool_calls(
     )
     .await?;
     Ok(None)
+}
+
+/// Turn a deterministic plan-validation failure into an actionable hint. The
+/// generic `TOOL_FAILED` hint told the model to inspect unchanged evidence,
+/// which encouraged another near-identical submission instead of a fix.
+fn team_plan_failure_hint(message: &str) -> String {
+    if message.contains("needs a writable profile") {
+        if message.contains("verification") {
+            return "A verification task is read-only. Remove its write_scope (or use a separate coding task for edits) and keep kind/profile \"verification\".".to_string();
+        }
+        return "A task with a non-empty write_scope or coding kind needs profile \"coding\" (or a coding department). Verification and research tasks must leave write_scope empty.".to_string();
+    }
+    if message.contains("missing field `department`") {
+        return "Every task requires department set to one of departments[].name, plus id, title, kind, and acceptance.".to_string();
+    }
+    if message.contains("unknown department") {
+        return "tasks[].department must exactly match one of the departments[].name values in the same plan.".to_string();
+    }
+    if message.contains("unknown profile") {
+        return "Valid profiles are coding, research, verification, and generic. Writing tasks must resolve to coding.".to_string();
+    }
+    if message.contains("missing field") || message.contains("invalid type") {
+        return "Fix the reported field against the submit_team_plan schema, then resubmit. Do not resubmit the same plan unchanged.".to_string();
+    }
+    "Fix the reported validation error, then resubmit. Do not resubmit the same plan unchanged."
+        .to_string()
 }
 
 /// Return the session to `running` after an `ask_user` answer/timeout without

@@ -6720,14 +6720,30 @@ final class AppModel {
 
     func applyApprovalMode() async {
         approvalMode.store()
-        let applied = await configureStoredProvider()
-        showToast(
-            applied ? "Permission policy updated" : "Permission policy saved",
-            detail: applied
-                ? approvalMode.title
-                : (providerStatus ?? "Enter the API key to apply it to the daemon."),
-            kind: applied ? .success : .warning
-        )
+        guard agentInfo?.configured == true else {
+            showToast(
+                "Permission policy saved",
+                detail: L10n.t("Configure a provider to apply it to the daemon."),
+                kind: .warning
+            )
+            return
+        }
+        do {
+            let info = try await core.setApprovalMode(approvalMode.rawValue)
+            agentInfo = info
+            adoptApprovalMode(from: info)
+            showToast(
+                "Permission policy updated",
+                detail: approvalMode.title,
+                kind: .success
+            )
+        } catch {
+            showToast(
+                "Permission policy saved",
+                detail: error.localizedDescription,
+                kind: .warning
+            )
+        }
     }
 
     func commitSession(message: String, sessionID: String? = nil) async {

@@ -3883,6 +3883,123 @@ async fn rejects_cyclic_team_plans() {
 }
 
 #[tokio::test]
+async fn stops_repeated_submit_team_plan_validation_failures() {
+    let dir = TempDir::new().unwrap();
+    let invalid_plan = serde_json::json!({
+        "goal": "bad plan",
+        "departments": [{
+            "name": "impl",
+            "manager_title": "Implementation",
+            "profile": "coding",
+            "objective": "build"
+        }],
+        "tasks": [{
+            "id": "T1",
+            "title": "Missing department",
+            "kind": "coding",
+            "acceptance": ["done"],
+            "write_scope": ["site/xeno/"]
+        }]
+    });
+    let mut responses = VecDeque::new();
+    for index in 0..3 {
+        responses.push_back(vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: format!("call_plan_{index}"),
+                name: "submit_team_plan".into(),
+                arguments: invalid_plan.to_string(),
+            }),
+            StreamEvent::Done,
+        ]);
+    }
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(responses),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "bad plan loop".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service.start(&session.id, "bad plan loop").await.unwrap();
+    let current = wait_until_idle(&engine, &session).await;
+    assert_eq!(current.status, "failed");
+    let events = engine
+        .list_events(session.id.clone(), 0, 100)
+        .await
+        .unwrap();
+    let failures = events
+        .iter()
+        .filter(|event| {
+            event.kind == "tool.finished"
+                && event.payload["name"] == "submit_team_plan"
+                && event.payload["is_error"] == true
+        })
+        .count();
+    assert_eq!(failures, 3, "the guard must stop before a fourth attempt");
+    let stop = events
+        .iter()
+        .find(|event| event.kind == "agent.tool_failure_loop")
+        .expect("tool failure loop event");
+    assert_eq!(stop.payload["tool"], "submit_team_plan");
+    assert_eq!(stop.payload["attempts"], 3);
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.failed"
+            && event.payload["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("TOOL_FAILURE_LOOP"))
+    }));
+}
+
+#[test]
+fn approval_mode_updates_without_provider_reconfiguration() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let (_engine, service, _project) = test_service_with_provider(&dir, provider);
+    assert_eq!(service.info().approval_mode, ApprovalMode::Smart);
+    let info = service.set_approval_mode(ApprovalMode::Unattended).unwrap();
+    assert_eq!(info.approval_mode, ApprovalMode::Unattended);
+    assert_eq!(service.info().approval_mode, ApprovalMode::Unattended);
+    let info = service
+        .set_runtime_config(None, Some(1_000_000), Some(40), Some(16_384))
+        .unwrap();
+    assert_eq!(info.context_window, Some(1_000_000));
+    assert_eq!(service.info().context_window, Some(1_000_000));
+}
+
+#[test]
+fn rejects_verification_task_with_a_write_scope() {
+    let plan: TeamPlan = serde_json::from_value(serde_json::json!({
+        "goal": "verify",
+        "departments": [{
+            "name": "check",
+            "manager_title": "Verification",
+            "profile": "verification",
+            "objective": "check"
+        }],
+        "tasks": [{
+            "id": "T1",
+            "department": "check",
+            "title": "Check the result",
+            "kind": "verification",
+            "profile": "verification",
+            "acceptance": ["done"],
+            "write_scope": ["site/xeno/"]
+        }]
+    }))
+    .unwrap();
+    let error = super::plan::validate_team_plan(&plan, 5).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("read-only verification task"));
+    assert!(message.contains("remove write_scope"));
+}
+
+#[tokio::test]
 async fn resumes_persisted_queued_sessions_without_duplicating_the_prompt() {
     let dir = TempDir::new().unwrap();
     let provider: Arc<dyn Provider> = Arc::new(QueueProvider {

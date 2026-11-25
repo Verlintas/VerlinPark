@@ -562,7 +562,7 @@ pub(super) fn tool_schemas_with_capabilities(
     if role == AgentRole::Leader {
         tools.push(ToolSchema {
             name: "submit_team_plan".to_string(),
-            description: "Define the team hierarchy and task plan before delegating Managers. Departments select a Manager title and profile; tasks form a DAG.".to_string(),
+            description: "Define the team hierarchy and task plan before delegating Managers. Departments select a Manager title and profile; tasks form a DAG. Required task fields: id, department (must match departments[].name), title, kind, and acceptance. A task with a non-empty write_scope or coding kind must use profile \"coding\" (or inherit one from a coding department). Verification tasks are read-only: use kind \"verification\", profile \"verification\", and an empty write_scope.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -574,9 +574,9 @@ pub(super) fn tool_schemas_with_capabilities(
                         "items": {
                             "type": "object",
                             "properties": {
-                                "name": {"type": "string"},
-                                "manager_title": {"type": "string"},
-                                "profile": {"type": "string", "enum": ["coding", "research", "verification", "generic"]},
+                                "name": {"type": "string", "description": "Unique department name; tasks reference it exactly in department"},
+                                "manager_title": {"type": "string", "description": "Manager title shown for this department"},
+                                "profile": {"type": "string", "enum": ["coding", "research", "verification", "generic"], "description": "Default profile for tasks in this department. Use coding for implementation departments; verification is read-only."},
                                 "objective": {"type": "string"},
                                 "token_budget": {"type": "integer", "minimum": 1, "description": "Optional department token cap across all tasks"},
                                 "cost_budget_usd": {"type": "number", "exclusiveMinimum": 0, "description": "Optional department USD cap across all tasks"}
@@ -591,17 +591,18 @@ pub(super) fn tool_schemas_with_capabilities(
                             "type": "object",
                             "properties": {
                                 "id": {"type": "string"},
-                                "department": {"type": "string"},
+                                "department": {"type": "string", "description": "Must exactly match a departments[].name value"},
                                 "title": {"type": "string"},
-                                "kind": {"type": "string"},
+                                "kind": {"type": "string", "description": "Short task kind such as coding, research, verification, or review. coding implies a writable task."},
                                 "priority": {"type": "integer", "minimum": -100, "maximum": 100, "description": "Higher priority runs first within a ready batch"},
                                 "profile": {
                                     "type": "string",
-                                    "enum": ["coding", "research", "verification", "generic"]
+                                    "enum": ["coding", "research", "verification", "generic"],
+                                    "description": "Optional profile override. Must resolve to coding when write_scope is non-empty. Verification tasks use verification and no write_scope."
                                 },
-                                "deps": {"type": "array", "items": {"type": "string"}},
-                                "write_scope": {"type": "array", "items": {"type": "string"}},
-                                "acceptance": {"type": "array", "items": {"type": "string"}},
+                                "deps": {"type": "array", "items": {"type": "string"}, "description": "Task ids that must finish first; must exist in this plan"},
+                                "write_scope": {"type": "array", "items": {"type": "string"}, "description": "Repo-relative paths this task may write. Leave empty for verification, research, and other read-only tasks."},
+                                "acceptance": {"type": "array", "items": {"type": "string"}, "description": "At least one concrete acceptance item"},
                                 "token_budget": {"type": "integer", "minimum": 1, "description": "Optional task token cap"},
                                 "cost_budget_usd": {"type": "number", "exclusiveMinimum": 0, "description": "Optional task USD cap"}
                             },

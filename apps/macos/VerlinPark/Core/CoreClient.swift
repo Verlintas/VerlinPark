@@ -4892,6 +4892,16 @@ actor CoreClient {
             .decode(AgentInfo.self)
     }
 
+    /// Change only the daemon approval mode. This intentionally does not
+    /// rebuild the provider, so an env-only provider keeps its credentials.
+    func setApprovalMode(_ mode: String) async throws -> AgentInfo {
+        try await request(
+            method: "agent.approval_mode.set",
+            params: ["approval_mode": .string(mode)]
+        )
+        .decode(AgentInfo.self)
+    }
+
     func configureAgent(
         kind: String,
         baseURL: String,

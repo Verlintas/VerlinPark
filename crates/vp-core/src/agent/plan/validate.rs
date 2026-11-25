@@ -120,9 +120,14 @@ pub(crate) fn validate_team_plan(plan: &TeamPlan, max_managers: usize) -> Result
             .as_deref()
             .unwrap_or(department.profile.as_str());
         if needs_write && matches!(resolved_profile, "generic" | "verification") {
+            if task.kind.eq_ignore_ascii_case("verification") || resolved_profile == "verification"
+            {
+                return Err(anyhow!(
+                    "task '{id}' is a read-only verification task but declares a write scope: remove write_scope or move the write to a separate coding task"
+                ));
+            }
             return Err(anyhow!(
-                "task '{}' needs a writable profile: set task.profile=\"coding\" or use a coding department",
-                id
+                "task '{id}' needs a writable profile because it has a write_scope or coding kind: set task.profile=\"coding\" or use a coding department"
             ));
         }
         if task.title.trim().is_empty() {

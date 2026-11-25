@@ -120,6 +120,52 @@ pub(super) async fn dispatch(
         Command::Info => rpc(&discovery, "server.info", json!({})).await?,
         Command::Doctor => rpc(&discovery, "server.doctor", json!({})).await?,
         Command::ProviderTest => rpc(&discovery, "agent.probe", json!({})).await?,
+        Command::ApprovalModeSet { mode } => {
+            let mode = mode.trim().to_ascii_lowercase();
+            if !matches!(mode.as_str(), "smart" | "strict" | "unattended") {
+                bail!("mode must be one of: smart, strict, unattended");
+            }
+            rpc(
+                &discovery,
+                "agent.approval_mode.set",
+                json!({"approval_mode": mode}),
+            )
+            .await?
+        }
+        Command::RuntimeConfigSet {
+            approval_mode,
+            context_window,
+            max_turns,
+            max_tokens,
+        } => {
+            if approval_mode.is_none()
+                && context_window.is_none()
+                && max_turns.is_none()
+                && max_tokens.is_none()
+            {
+                bail!(
+                    "provide at least one of --approval-mode, --context-window, --max-turns, or --max-tokens"
+                );
+            }
+            let approval_mode = approval_mode.map(|mode| mode.trim().to_ascii_lowercase());
+            if approval_mode
+                .as_deref()
+                .is_some_and(|mode| !matches!(mode, "smart" | "strict" | "unattended"))
+            {
+                bail!("--approval-mode must be one of: smart, strict, unattended");
+            }
+            rpc(
+                &discovery,
+                "agent.runtime_config.set",
+                json!({
+                    "approval_mode": approval_mode,
+                    "context_window": context_window,
+                    "max_turns": max_turns,
+                    "max_tokens": max_tokens,
+                }),
+            )
+            .await?
+        }
         Command::A2aStatus => rpc(&discovery, "a2a.status", json!({})).await?,
         Command::A2aCard => rpc(&discovery, "a2a.card", json!({})).await?,
         Command::A2aPolicySet {

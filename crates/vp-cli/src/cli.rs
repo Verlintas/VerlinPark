@@ -808,6 +808,26 @@ pub(crate) enum Command {
     },
     /// Send a tiny live request to the configured provider.
     ProviderTest,
+    /// Set the daemon approval mode without reconfiguring the provider.
+    ApprovalModeSet {
+        /// One of: smart, strict, unattended.
+        mode: String,
+    },
+    /// Update runtime limits without reconfiguring the provider.
+    RuntimeConfigSet {
+        /// One of: smart, strict, unattended.
+        #[arg(long)]
+        approval_mode: Option<String>,
+        /// Model context window in tokens; 0 disables automatic management.
+        #[arg(long)]
+        context_window: Option<u64>,
+        /// Maximum provider turns per run (1-200).
+        #[arg(long)]
+        max_turns: Option<u32>,
+        /// Per-response output token limit (256-65536).
+        #[arg(long)]
+        max_tokens: Option<u32>,
+    },
     /// List projects.
     Projects,
     /// Add a local repository as a project.

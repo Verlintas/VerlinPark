@@ -574,6 +574,35 @@ pub(super) async fn handle(
                 Err(response) => response_with_id(id, response),
             }
         }
+        "agent.approval_mode.set" | "agent.approval-mode.set" => {
+            match parse_params::<SetApprovalModeParams>(request.params) {
+                Ok(params) => match state.agent.set_approval_mode(params.approval_mode) {
+                    Ok(info) => RpcResponse::success(id, info),
+                    Err(error) => RpcResponse::error(
+                        id,
+                        RpcError::new(codes::INVALID_PARAMS, error.to_string()),
+                    ),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
+        "agent.runtime_config.set" | "agent.runtime-config.set" => {
+            match parse_params::<SetRuntimeConfigParams>(request.params) {
+                Ok(params) => match state.agent.set_runtime_config(
+                    params.approval_mode,
+                    params.context_window,
+                    params.max_turns,
+                    params.max_tokens,
+                ) {
+                    Ok(info) => RpcResponse::success(id, info),
+                    Err(error) => RpcResponse::error(
+                        id,
+                        RpcError::new(codes::INVALID_PARAMS, error.to_string()),
+                    ),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "agent.configure" => match parse_params::<ConfigureAgentParams>(request.params) {
             Ok(params) => match state.agent.configure(params) {
                 Ok(info) => {

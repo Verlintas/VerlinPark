@@ -285,6 +285,68 @@ pub(in crate::agent) struct LoadedConversation {
     pub(in crate::agent) ids: Vec<Option<String>>,
 }
 
+/// Keep provider tool-call history valid after an interrupted or cancelled
+/// turn. OpenAI-compatible providers reject an assistant `tool_calls` message
+/// unless every id is followed by a matching `tool` message. A cancelled run
+/// can leave that pair incomplete, so synthesize a bounded interrupted result
+/// in memory and drop orphan tool messages. This is a resume-time projection;
+/// it does not rewrite the session's stored messages.
+fn normalize_tool_history(
+    messages: Vec<ChatMessage>,
+    ids: Vec<Option<String>>,
+) -> (Vec<ChatMessage>, Vec<Option<String>>) {
+    let mut normalized = Vec::with_capacity(messages.len());
+    let mut normalized_ids = Vec::with_capacity(ids.len());
+    let mut index = 0usize;
+    while index < messages.len() {
+        let message = &messages[index];
+        if message.role == "assistant"
+            && message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| !calls.is_empty())
+        {
+            let calls = message.tool_calls.clone().unwrap_or_default();
+            let mut results = HashMap::new();
+            let mut next = index + 1;
+            while next < messages.len() && messages[next].role == "tool" {
+                if let Some(call_id) = messages[next].tool_call_id.clone() {
+                    results.entry(call_id).or_insert(next);
+                }
+                next += 1;
+            }
+            normalized.push(message.clone());
+            normalized_ids.push(ids[index].clone());
+            for call in calls {
+                if let Some(source) = results.remove(&call.id) {
+                    normalized.push(messages[source].clone());
+                    normalized_ids.push(ids[source].clone());
+                } else {
+                    normalized.push(ChatMessage::tool(
+                        call.id,
+                        format!(
+                            "error[TOOL_FAILED] tool '{}' did not complete because the previous run ended before its result was recorded. Re-issue it if the work is still needed.",
+                            call.name
+                        ),
+                    ));
+                    normalized_ids.push(None);
+                }
+            }
+            index = next;
+            continue;
+        }
+        if message.role == "tool" {
+            // No preceding assistant call owned this result.
+            index += 1;
+            continue;
+        }
+        normalized.push(message.clone());
+        normalized_ids.push(ids[index].clone());
+        index += 1;
+    }
+    (normalized, normalized_ids)
+}
+
 /// Build the active conversation from `message.created` events. This is the
 /// resume path: it deliberately does not trust a live in-memory vector or an
 /// imported archive's convenience projection.
@@ -416,6 +478,8 @@ pub(in crate::agent) fn restored_active_messages(
     {
         restored.insert(0, ChatMessage::user(summary.clone()));
     }
+    let ids = vec![None; restored.len()];
+    let (restored, _) = normalize_tool_history(restored, ids);
     (restored, true)
 }
 
@@ -485,6 +549,7 @@ pub(in crate::agent) async fn load_conversation(
         messages.insert(0, ChatMessage::user(summary));
         ids.insert(0, None);
     }
+    let (messages, ids) = normalize_tool_history(messages, ids);
     Ok(LoadedConversation { messages, ids })
 }
 
@@ -517,4 +582,53 @@ pub(in crate::agent) fn parse_todos(input: &serde_json::Value) -> Result<Vec<Tod
         });
     }
     Ok(todos)
+}
+
+#[cfg(test)]
+mod tool_history_tests {
+    use super::*;
+
+    fn call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn synthesizes_a_missing_result_and_drops_orphans() {
+        let messages = vec![
+            ChatMessage::user("go"),
+            ChatMessage::assistant_tool_calls(
+                "",
+                vec![call("a", "read_file"), call("b", "write_file")],
+            ),
+            ChatMessage::tool("a", "ok"),
+            ChatMessage::tool("orphan", "stale"),
+            ChatMessage::user("continue"),
+        ];
+        let ids = vec![None; messages.len()];
+        let (normalized, normalized_ids) = normalize_tool_history(messages, ids);
+        assert_eq!(normalized.len(), 5);
+        assert_eq!(normalized[2].tool_call_id.as_deref(), Some("a"));
+        assert_eq!(normalized[3].tool_call_id.as_deref(), Some("b"));
+        assert!(normalized[3].content.contains("did not complete"));
+        assert_eq!(normalized[4].role, "user");
+        assert_eq!(normalized_ids.len(), 5);
+    }
+
+    #[test]
+    fn preserves_a_complete_tool_turn_and_its_message_ids() {
+        let messages = vec![
+            ChatMessage::user("go"),
+            ChatMessage::assistant_tool_calls("", vec![call("a", "read_file")]),
+            ChatMessage::tool("a", "ok"),
+        ];
+        let ids = vec![Some("m1".into()), Some("m2".into()), Some("m3".into())];
+        let (normalized, normalized_ids) = normalize_tool_history(messages, ids);
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[2].content, "ok");
+        assert_eq!(normalized_ids[2].as_deref(), Some("m3"));
+    }
 }

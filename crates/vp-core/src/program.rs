@@ -4311,8 +4311,9 @@ mod plan_tests {
         milestone.write_scope = vec!["src".into()];
         let plan = milestone_plan(&program(None, None), &milestone);
         let error = crate::agent::validate_team_plan(&plan, 5).unwrap_err();
+        let message = error.to_string();
         assert!(
-            error.to_string().contains("writable profile"),
+            message.contains("read-only verification task") && message.contains("write scope"),
             "unexpected error: {error}"
         );
     }

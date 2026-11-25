@@ -620,6 +620,7 @@ pub(in crate::agent) async fn run_loop_body(
     } else {
         config.max_turns
     };
+    let mut tool_failure_guard = ToolFailureGuard::default();
 
     for turn in 0..max_turns {
         // A long plan can outlive the assignment/workspace lease taken when
@@ -2199,6 +2200,7 @@ pub(in crate::agent) async fn run_loop_body(
             top_level,
             turn,
             tool_calls,
+            &mut tool_failure_guard,
             conversation,
             conversation_ids,
             &mut citations,
