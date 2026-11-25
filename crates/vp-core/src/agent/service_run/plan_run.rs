@@ -56,7 +56,7 @@ impl AgentService {
         let (_, scheduled) = self.engine.scheduler().sync_plan(&session, &plan).await?;
         let mut terminal = scheduled
             .iter()
-            .filter(|task| matches!(task.status.as_str(), "completed" | "skipped"))
+            .filter(|task| matches!(task.status.as_str(), "completed" | "skipped" | "cancelled"))
             .map(|task| task.task_id.clone())
             .collect::<std::collections::HashSet<_>>();
         // Tasks absent from a just-synced queue are treated as pending.
@@ -66,7 +66,7 @@ impl AgentService {
             }
         }
         if plan.tasks.iter().all(|task| terminal.contains(&task.id)) {
-            anyhow::bail!("plan is already complete or skipped");
+            anyhow::bail!("plan is already complete, skipped, or cancelled");
         }
 
         let control = Arc::new(RunControl::new());

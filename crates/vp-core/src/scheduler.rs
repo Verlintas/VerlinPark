@@ -582,10 +582,11 @@ pub(crate) fn task_aging() -> Duration {
 }
 
 pub(crate) fn is_retryable_status(status: &str) -> bool {
-    matches!(
-        status,
-        "pending" | "interrupted" | "failed" | "blocked" | "cancelled"
-    )
+    // Only runnable states are dispatchable. `failed` becomes runnable only
+    // after the orchestration controller schedules a retry (status pending +
+    // next_attempt_at); `blocked`/`cancelled` require an explicit unblock or
+    // retry transition. Re-dispatching them directly caused a live hot loop.
+    matches!(status, "pending" | "interrupted")
 }
 
 fn session_effective_priority(
@@ -1021,7 +1022,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retries_failed_tasks_but_skips_completed_dependencies() {
+    async fn failed_tasks_wait_for_orchestration_retry_and_skip_completed_dependencies() {
         let (_dir, store, _project, session) = store();
         let scheduler = TaskScheduler::new_with_aging(store, Duration::ZERO);
         let plan = plan(vec![task("a", 0, vec![]), task("b", 0, vec!["a"])]);
@@ -1038,6 +1039,30 @@ mod tests {
             .ready_tasks(&session, seq, &plan, 10)
             .await
             .unwrap();
+        assert!(
+            ready.is_empty(),
+            "failed work must wait for the orchestration retry transition"
+        );
+        let queue = scheduler
+            .queue(None, Some(session.id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(queue.tasks[0].last_error.as_deref(), Some("tests failed"));
+
+        scheduler
+            .store
+            .schedule_plan_task_retry_with_event(
+                &session.id,
+                seq,
+                "a",
+                &vp_protocol::now_rfc3339(),
+                "retry after failure",
+            )
+            .unwrap();
+        let ready = scheduler
+            .ready_tasks(&session, seq, &plan, 10)
+            .await
+            .unwrap();
         assert_eq!(
             ready
                 .iter()
@@ -1045,11 +1070,39 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["a"]
         );
-        let queue = scheduler
-            .queue(None, Some(session.id.clone()))
+    }
+
+    #[tokio::test]
+    async fn blocked_and_cancelled_tasks_are_not_scheduler_ready() {
+        let (_dir, store, _project, session) = store();
+        let scheduler = TaskScheduler::new_with_aging(store, Duration::ZERO);
+        let plan = plan(vec![task("a", 0, vec![])]);
+        let (seq, _) = scheduler.sync_plan(&session, &plan).await.unwrap();
+        scheduler
+            .claim(&session.id, seq, &["a".into()])
             .await
             .unwrap();
-        assert_eq!(queue.tasks[0].last_error.as_deref(), Some("tests failed"));
+        scheduler
+            .finish(&session.id, seq, "a", "blocked", Some("budget exhausted"))
+            .await
+            .unwrap();
+        assert!(
+            scheduler
+                .ready_tasks(&session, seq, &plan, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "blocked tasks must wait for an explicit unblock/retry"
+        );
+        assert!(
+            scheduler
+                .claim(&session.id, seq, &["a".into()])
+                .await
+                .unwrap()
+                .0
+                .is_empty(),
+            "claim must reject a blocked task"
+        );
     }
 
     #[tokio::test]

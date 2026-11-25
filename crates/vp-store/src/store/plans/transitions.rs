@@ -15,7 +15,7 @@ impl Store {
              FROM plan_tasks t
              JOIN sessions s ON s.id = t.session_id
              LEFT JOIN project_task_scheduler_policies p ON p.project_id = t.project_id
-             WHERE t.status IN ('pending', 'interrupted', 'failed', 'cancelled')
+             WHERE t.status IN ('pending', 'interrupted')
                AND s.status IN ('idle', 'failed', 'cancelled')
                AND (t.next_attempt_at IS NULL OR t.next_attempt_at <= ?3)
                AND COALESCE(p.enabled, ?1) = 1
@@ -75,7 +75,7 @@ impl Store {
                          finished_at = NULL, last_error = NULL, next_attempt_at = NULL,
                          updated_at = ?1
                      WHERE session_id = ?2 AND plan_seq = ?3 AND task_id = ?4
-                       AND status IN ('pending', 'interrupted', 'failed', 'blocked', 'cancelled')
+                       AND status IN ('pending', 'interrupted')
                        AND (next_attempt_at IS NULL OR next_attempt_at <= ?1)",
                     params![now, session_id, plan_seq as i64, task_id],
                 )?;

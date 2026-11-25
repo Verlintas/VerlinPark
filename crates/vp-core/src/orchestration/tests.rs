@@ -521,6 +521,28 @@ fn controller_unblocks_stale_blocked_tasks() {
 }
 
 #[test]
+fn controller_unblocks_waiting_on_dependency_blocks() {
+    let first = task("a", &[]);
+    let second = task("b", &["a"]);
+    let plan = plan(vec![first.clone(), second.clone()]);
+    let mut waiting = row(&second, "blocked", 0);
+    waiting.last_error = Some("waiting on a (pending)".to_string());
+    let actions = plan_actions(ControllerInput {
+        session: &session(),
+        plan: &plan,
+        scheduled: &[row(&first, "completed", 1), waiting],
+        events: &[],
+        notes: &[],
+        policy: &policy(),
+        budget_exhausted: false,
+    });
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        ControllerAction::Unblock { task_id, .. } if task_id == "b"
+    )));
+}
+
+#[test]
 fn controller_unblocks_stale_blocked_tasks_after_a_skipped_dependency() {
     let first = task("a", &[]);
     let second = task("b", &["a"]);

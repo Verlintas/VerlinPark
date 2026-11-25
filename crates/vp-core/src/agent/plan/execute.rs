@@ -348,23 +348,9 @@ pub(in crate::agent) async fn execute_team_plan(
             .available(AgentRole::Worker)
             .min(limit.saturating_sub(executed));
         if capacity == 0 {
-            if limited {
-                break;
-            }
-            for task in &remaining {
-                settle_aborted_task(
-                    engine,
-                    &session.id,
-                    plan_seq,
-                    leader_spec,
-                    &task.id,
-                    "blocked",
-                    "Worker cap is fully occupied",
-                    &mut statuses,
-                    &mut reports,
-                )
-                .await?;
-            }
+            // Capacity is transient; leave the remaining tasks pending. A
+            // terminal block here would strand them because the scheduler only
+            // dispatches pending/interrupted rows.
             break;
         }
         let batch = select_plan_batch(ready, capacity);

@@ -311,7 +311,7 @@ fn blocked_for_dependency(row: &ScheduledTask) -> bool {
     }
     match row.last_error.as_deref() {
         None => true,
-        Some(reason) => reason.starts_with("dependency "),
+        Some(reason) => reason.starts_with("dependency ") || reason.starts_with("waiting on "),
     }
 }
 
