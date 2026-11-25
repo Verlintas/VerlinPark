@@ -629,6 +629,14 @@ four-tier path with a deliberately non-human spatial output.
   (1400×900) and narrow (460/360px) reviews show the single-viewport model
   preserved, the bilingual toggle persisting, the linear fallback working, and
   the dossier links returning HTTP 200 when served beside the existing tree.
+- An automated headless-Chrome CDP smoke test at 360×800 and 1400×900 passed:
+  no console errors, 7 strata, 137/137 `data-en`/`data-zh` nodes, mobile lens
+  `overflow-y: auto` with bottom scroll reached, EN/中文 persisted under
+  `xeno.lang` across reload, linear mode exposed all 7 strata, desktop facet
+  values stayed on one line (138–207px wide, 18px high), and
+  `scrollWidth == viewport` at 1400. Linear mode is intentionally
+  session-scoped rather than persisted; the README only promises language
+  persistence.
 - Output: single-viewport irregular lens, orbital core/canvas field, numbered
   glyph spine, floating console; seven strata (Signal, Profile, Mechanism,
   Containment, Lattice, Log, Provenance); EN/中文 copy with 137/137
