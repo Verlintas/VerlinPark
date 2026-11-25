@@ -87,6 +87,16 @@ Verifier 或 Integrator。
   overlay，不是 TeamPlan 重写；自动 rescue 与 envelope 串行化是 same-daemon，
   跨 host 不成立；project RunPolicy 保存仍是整包 read-modify-write，没有
   updated_at/CAS 前置条件。
+- Live DeepSeek（2026-11-25，环境变量 key，未写入 repo/events/logs/UI）：
+  explicit smoke 通过，provider stream 正常；4-turn small cache-bench 19,290
+  input / 18,560 cache-read / 96.2157% hit / $0.000858（不是 200k 长前缀验收）。
+  完整 agent E2E 达到 idle（3 calls，36,126 input / 337 output / 24,192
+  cache-read / 66.97% hit）。第二个 live session（4 calls，49,907 input /
+  1,119 output / 75.92% hit）实际调用 `allocation` 和 `tradeoffs`：allocation
+  因简单目标没有 TeamPlan 返回 no_remaining_tasks；tradeoffs 返回 5 profiles、
+  active reserve 20% project_policy、0 recommended、dirty/watch quality、
+  low confidence 0.29/4 samples 和诚实 warnings。该 live session 没有触发
+  per-task effective/reallocation，后者由单元/daemon 测试覆盖。
 - 测试：targeted allocation/tradeoff/rescue/protocol/CLI/daemon + full
   workspace **4,651 passed / 0 failed / 6 ignored**；Swift
   **659 passed（527 app + 132 helper）**；`cargo fmt --check`、

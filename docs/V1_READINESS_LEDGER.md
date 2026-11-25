@@ -277,6 +277,21 @@ effect, Verifier, or merge row.
   daemon tests; full workspace **4,651 passed / 0 failed / 6 ignored**;
   Swift **659 passed (527 app + 132 helper)**; fmt, clippy,
   SwiftFormat, and `xcodebuild test` pass.
+- Live DeepSeek evidence (2026-11-25): the explicit smoke passed with
+  `deepseek-flash` at `https://api.deepseek.com` using an environment-only key;
+  the key was never written to the repository, events, logs, or UI (the
+  temporary 0600 env file was deleted). Provider stream passed. The small live
+  cache-bench (4 turns, ~4k stable prefix) reported 19,290 input / 18,560
+  cache-read / 730 miss / 96.2157% hit, cost $0.000858; it is not the 200k
+  long-prefix acceptance run. A full agent E2E reached idle with 3 calls,
+  36,126 input / 337 output / 24,192 cache-read / 66.97% hit. A second live
+  session (4 calls, 49,907 input / 1,119 output / 75.92% hit) exercised
+  `allocation` and `tradeoffs`: allocation returned no remaining tasks because
+  the Leader completed the simple goal without storing a TeamPlan; tradeoffs
+  returned 5 profiles, active reserve 20% from `project_policy`, no recommended
+  profile, dirty/watch quality, low confidence (0.29, 4 samples), and honest
+  warnings. Per-task effective/reallocation was not exercised by that live
+  session; unit/daemon tests cover it.
 - Limits: persisted plan-revision reallocation, cross-department/session
   pooling, reservation redistribution, and the daily attention schedule remain
   open. R3b is an event-derived runtime overlay, not a TeamPlan rewrite; it
