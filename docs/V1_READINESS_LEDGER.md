@@ -620,6 +620,15 @@ four-tier path with a deliberately non-human spatial output.
   README.md), merge `c5ae960` into the session branch. The Verifier returned
   `APPROVED` with `merged: true`; the deterministic Integrator recorded
   `merged; diff check passed`; task `T1` is `completed`.
+- A visual review found two responsive issues: the fixed mobile console could
+  cover the last line of a stratum at 360px, and the English facet values
+  collapsed into narrow stacks on desktop. A second plan revision added task
+  `T2` (dependency `T1`, same write scope); it changed only `style.css`
+  (commit `dc14a34`, merge `42eba28`) and the Verifier again returned
+  `APPROVED` with `merged: true`. `T2` is `completed`. The final desktop
+  (1400×900) and narrow (460/360px) reviews show the single-viewport model
+  preserved, the bilingual toggle persisting, the linear fallback working, and
+  the dossier links returning HTTP 200 when served beside the existing tree.
 - Output: single-viewport irregular lens, orbital core/canvas field, numbered
   glyph spine, floating console; seven strata (Signal, Profile, Mechanism,
   Containment, Lattice, Log, Provenance); EN/中文 copy with 137/137
@@ -627,14 +636,15 @@ four-tier path with a deliberately non-human spatial output.
   no external fonts, images, CDNs, trackers, or network requests. The five
   host-relative dossier links returned HTTP 200 when served beside the
   existing `site/dossier.html` tree.
-- Live cost was very high: about 11.86M input / 201.7K output tokens for one
-  task. Most of it was exploratory browser testing, repeated budget pauses,
-  and the finalize retry. This run is evidence that the path can complete, not
-  an efficiency claim.
+- Live cost was very high: about 15.1M input / 266.7K output tokens across
+  T1 and T2. Most of it was exploratory browser testing, repeated budget
+  pauses, and the finalize retry. This run is evidence that the path can
+  complete, not an efficiency claim.
 - The target project `/Users/apple/orca/projects/TEST` was not modified in
   this round; the successful output lives in the VerlinPark session worktree
   and session branch, not in the target repository.
-- Verifier non-blocking notes: the desktop English facet values wrap in narrow
-  columns; the skip link, noscript note, and four aria labels are English-only;
-  dossier fact-to-source tracing was not re-checkable from the task worktree.
-  These are open polish items, not completion claims.
+- The initial Verifier flagged narrow desktop facet wrapping and the mobile
+  console overlap; `T2` fixed both. Remaining non-blocking notes: the skip
+  link, noscript note, and four aria labels are English-only; dossier
+  fact-to-source tracing was not re-checkable from the task worktree. These
+  are open polish items, not completion claims.
