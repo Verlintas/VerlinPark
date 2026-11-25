@@ -158,6 +158,11 @@ older than the project grace as `unknown` with
 trigger it with `effect.sweep` / `vp effect-sweep`, but the daemon does it
 automatically.
 
+Reconciliation clears the receipt gate; it does not resurrect a plan task or
+merge-queue row that was already settled blocked/failed. Retry the task
+(`task.retry`) or the queue entry (`merge_queue.retry`) explicitly after
+reconciling.
+
 ### 6. Operator surfaces
 
 RPC:

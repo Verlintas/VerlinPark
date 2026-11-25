@@ -529,7 +529,10 @@ secrets; no unbounded data.
 
 - Event-backed profile/contract override (`session.run_contract.updated`).
 - Completion reserve and attention/risk pre-dispatch deferral.
-- `session.resources.top_up` for fixed/auto budgets, clamped to caps.
+- `session.resources.top_up` for fixed/auto budgets, clamped to caps. A
+  top-up changes budget/headroom; it does not silently unblock a plan task
+  already settled blocked by budget, so that task needs an explicit
+  `task.retry` (gate resolution is the automatic blocked-task release).
 - CLI `run-contract-set` / `top-up`; macOS profile menu.
 - `session.resource.decision` for defer/warn decisions; no hidden gate bypass.
 
