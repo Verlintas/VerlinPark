@@ -1,6 +1,6 @@
 # Run Contract and Resource Governor plan
 
-- Status: Accepted; P0/R1/R2a/R2b implemented plus the R3 allocation preview and opt-in runtime per-task envelope reallocation and the R4 trade-off/quality preview slice; persisted plan-revision reallocation and the daily attention schedule remain open (see R3/R4 below)
+- Status: Accepted; P0/R1/R2a/R2b implemented plus the R3 allocation preview, opt-in runtime per-task envelope reallocation, explicit operator-confirmed persistence of a recorded runtime envelope, and the R4 trade-off/quality preview slice; automatic persisted plan-revision reallocation and the daily attention schedule remain open (see R3/R4 below)
 - Date: 2026-11-24
 - Owner: Verlintas
 - Scope: V1 single-project coding
@@ -590,15 +590,19 @@ Implemented:
   reallocation recommendations are advisory only; no task envelope is mutated
   automatically.
 - Readiness-blocked remains a dispatch gate, not a turn pause (avoids
-  deadlocking approval/effect flows in an active run).
+  deadlocking approval/effect flows in an active run). The dispatch guard now
+  runs before the queue/lease/plan-resume events, and repeated identical
+  decision events are deduplicated until another session event occurs, so a
+  terminally blocked session does not append a full resume cycle on every
+  scheduler cooldown.
 
 Remaining:
 
 - None in R2b. R3a shows per-task envelopes and R3b adds opt-in event-backed
-  runtime reallocation from completed tasks; persisted plan-revision
+  runtime reallocation from completed tasks; automatic persisted plan-revision
   reallocation remains open (see below).
 
-### R3 — Allocate (preview + runtime reallocation implemented; persisted reallocation open)
+### R3 — Allocate (preview + runtime/explicit persistence implemented; automatic persisted reallocation open)
 
 Implemented (R3a):
 
@@ -652,6 +656,15 @@ Implemented (R3a):
   to verify. Only normal Worker/Labour runs (not auto-approve maintenance) may
   append a new event. The allocation preview reports stored and effective
   budgets and uses the effective values for estimates/critical-path weight.
+- `session.envelope.persist` / `vp envelope-persist --task <id> --yes` is the
+  explicit, operator-only bridge from a recorded runtime overlay into a normal
+  plan revision. It requires a quiescent session and a recorded overlay that
+  still passes the same plan-fingerprint/old-budget validator as the runtime
+  path, so a stale overlay from a prior target/department budget revision fails
+  closed instead of widening the new plan. It persists only the latest effective
+  token/cost values for one task, supports an optional expected-revision
+  precondition, creates no new capacity, and is never invoked automatically by
+  the scheduler, orchestration controller, or an LLM.
 - CLI `--auto-rescue` / `--no-auto-rescue`,
   `--auto-reallocate-envelopes` / `--no-auto-reallocate-envelopes`, the macOS
   policy toggles, and the Manage Dash allocation/trade-off cards use only these
@@ -659,9 +672,11 @@ Implemented (R3a):
 
 Remaining:
 
-- Persisted plan-revision reallocation. R3b is an event-derived runtime overlay,
-  not a TeamPlan rewrite; cross-department/session reallocation, reservation
-  redistribution, and a revisioned plan budget remain open. Its 1,000-event
+- Automatic persisted plan-revision reallocation. Explicit operator-confirmed
+  persistence of one recorded runtime overlay now exists, but R3b remains an
+  event-derived runtime overlay by default rather than an automatic TeamPlan
+  rewrite; cross-department/session reallocation, reservation redistribution,
+  and a revisioned plan budget remain open. Its 1,000-event
   source-single-use window can forget very old sources after heavy plan
   revision, though hard caps still bound actual spend. Serialization is
   per-session and same-daemon, not cross-host. If a target/department revision
@@ -711,7 +726,7 @@ Remaining:
 | Area | Tests |
 |---|---|
 | Resource math | cache weighting, missing prices, output weight, clamping, p50/p90 |
-| Allocation (R3a/R3b) | estimate precedence, partial/insufficient estimates, critical-path focus/availability, token/cost/time pressure, task-budget and cost-only feasibility, no-event preview, serialized one-shot auto rescue, runtime envelope reallocation (single-use sources, idempotent replay, department caps, plan-revision invalidation) |
+| Allocation (R3a/R3b) | estimate precedence, partial/insufficient estimates, critical-path focus/availability, token/cost/time pressure, task-budget and cost-only feasibility, no-event preview, serialized one-shot auto rescue, runtime envelope reallocation (single-use sources, idempotent replay, department caps, plan-revision invalidation, explicit validated persist into a plan revision) |
 | Trade-offs (R4a) | five profiles, active reserve vs posture, test-cache pass/fail, queued/merged distinction, confidence heuristic, deterministic recommended profile, no profile switch |
 | Contract | derive/validate/profile bounds/reserve/risk/attention/no widening |
 | Governor | pre-dispatch infeasibility, continue/throttle/reallocate/rescue/pause/stop/replan, no hidden routing |
@@ -772,10 +787,14 @@ Implemented **P0 + R1 + R2a + R2b core + R3a/R3b/R4a**:
   (`ProjectRunPolicy.auto_reallocate_envelopes`, CLI/GUI, event-backed
   single-use completed-task capacity, department/session/project caps
   unchanged, plan-revision invalidation);
+- explicit operator-confirmed `session.envelope.persist` /
+  `vp envelope-persist` into a plan revision for a validated, still-current
+  recorded overlay (quiescent session, optional expected revision, no new
+  capacity);
 - R4a read-only trade-off frontier, quality/reviewability review, calibrated
   confidence, deterministic advisory profile recommendation, RPC/CLI, and
   macOS card;
 - ledger/docs updated with the multi-resource model.
 
-Next: persisted plan-revision reallocation with reservation semantics, then the
-R4 daily attention schedule.
+Next: automatic persisted plan-revision reallocation with reservation
+semantics, then the R4 daily attention schedule.

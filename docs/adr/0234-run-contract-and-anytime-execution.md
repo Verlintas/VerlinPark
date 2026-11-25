@@ -239,13 +239,23 @@ The R3/R4 slice is read-only/advisory except for two explicit project opt-ins:
   Worker/Labour runs may append. A per-session same-daemon lock serializes event
   read/append. The allocation preview reports stored and effective budgets and
   uses effective values for estimates and critical-path weight.
+- `session.envelope.persist` / `vp envelope-persist` is an explicit
+  operator action that persists the latest recorded runtime envelope for one
+  task into a normal plan revision. It requires a quiescent session, explicit
+  `confirm`/`--yes`, and optionally an expected revision. It re-folds the
+  recorded events through the same plan-fingerprint/old-budget validator as the
+  runtime path, so a stale overlay from a prior target/department budget
+  revision fails closed; it never creates capacity and is not called by the
+  scheduler, controller, or a model. Automatic persisted reallocation remains
+  open.
 - Both preview RPCs append no events and mutate nothing. The macOS cards load
   only when visible or explicitly refreshed and reject a response for a
   different session.
 
-Limits: persisted plan-revision reallocation and the daily attention schedule
-remain open; R3b is an event-derived runtime overlay for one department, not a
-TeamPlan rewrite or cross-department/session budget pool. It scans the newest
+Limits: automatic persisted plan-revision reallocation and the daily attention
+schedule remain open; explicit one-task persistence does not make R3b an
+automatic TeamPlan rewrite, and it remains a one-department overlay rather than
+a cross-department/session budget pool. It scans the newest
 1,000 reallocation events, so source single-use memory can be forgotten after
 very heavy plan revision (hard department/session/project caps still bound
 actual spend). Envelope serialization is per-session and same-daemon, not
@@ -350,8 +360,9 @@ Negative and limits:
    preview, critical-path feasibility, project/department p50/p90,
    diagnosis/metareasoning, and the opt-in one-shot automatic
    completion-reserve rescue. R3b adds opt-in, event-backed, runtime-only
-   per-task envelope reallocation from completed same-department tasks.
-   Persisted plan-revision reallocation, cross-department/session pooling,
+   per-task envelope reallocation from completed same-department tasks, plus an
+   explicit operator-confirmed persistence of one validated overlay into a plan
+   revision. Automatic persisted reallocation, cross-department/session pooling,
    reservation-aware redistribution, and learned estimates remain open.
 5. **R4 deliver**: R4a implements the trade-off frontier, quality/reviewability
    review, calibrated-confidence heuristic, deterministic advisory profile

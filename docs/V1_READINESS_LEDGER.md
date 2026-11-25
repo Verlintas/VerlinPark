@@ -75,7 +75,7 @@ Verification gaps:
 | V1-D09 | S1 | A bare Python `unittest` project without pyproject/pytest metadata was reported as `PROJECT_UNSUPPORTED`, pushing Agent runs into shell guessing. | **CLOSED** | `project_profile` detects `tests/test_*.py` and proposes `python3 -m unittest discover -s tests -v`; regression test covers the bare fixture |
 | V1-D10 | S1 | Contract analysis treated scratch verification writes and absolute read-only git commands as host-state/scope violations, creating repeated approvals and `.scratch-proof` artifacts in the worktree. | **CLOSED (P0)** | Shell exports `$VERLINPARK_WORKTREE`/`$VERLINPARK_SCRATCH`; prompts/recipes say cwd is the worktree; contract allows the stable scratch/TMPDIR prefixes; absolute read-only git (`status/diff/log/show/rev-parse/...`) is ReadOnly; `clean`/`reset --hard` remains Destructive. Tests cover all paths. |
 | V1-D11 | S1 | Fixed token budgets charged cache-read input at full weight, ignored missing prices, starved verification, and failed solvable runs; the dashboard could not show the difference between cheap-but-stuck and expensive-near-completion. | **PARTIAL (R2a)** | R1 exposes raw vs weighted tokens, money with `pricing_source`, time, attention, risk, context, capacity, quality, and progress plus readiness/forecast. R2a adds operator top-up (clamped to caps) and pre-dispatch completion-reserve deferral. Raw token caps remain authoritative; cost-weighted settlement/automatic reallocation is R2b/R3. |
-| V1-D12 | S2 | Operator attention had no budget or governor: repeated host-state approvals could consume the run without triggering a policy decision. | **PARTIAL (R2b)** | Pre-dispatch deferral and a true turn-boundary pause (`session.resource.paused`) now stop new work at the attention cap; a bare resume re-pauses until the cap/policy changes. The pause carries a bounded attention batch (risk groups + at most 8 approval metadata rows, no raw input) and the Stage banner opens Inbox or Policies. The existing approval queue, coalescing, and batch resolve remain the only decision path; no automatic grant/template/profile. Explicit partial delivery is event-only and available; rescue reserve and opt-in R3b runtime task-envelope reallocation are implemented; persisted plan-revision reallocation remains open. |
+| V1-D12 | S2 | Operator attention had no budget or governor: repeated host-state approvals could consume the run without triggering a policy decision. | **PARTIAL (R2b)** | Pre-dispatch deferral and a true turn-boundary pause (`session.resource.paused`) now stop new work at the attention cap; a bare resume re-pauses until the cap/policy changes. The pause carries a bounded attention batch (risk groups + at most 8 approval metadata rows, no raw input) and the Stage banner opens Inbox or Policies. The existing approval queue, coalescing, and batch resolve remain the only decision path; no automatic grant/template/profile. Explicit partial delivery is event-only and available; rescue reserve, opt-in R3b runtime task-envelope reallocation, and explicit operator-confirmed persistence of one recorded overlay are implemented; automatic persisted plan-revision reallocation remains open. |
 
 ## Run Contract R1/R2a/R2b (2026-11-24)
 
@@ -146,7 +146,7 @@ Implemented the observe/operator slice from ADR-0234:
   context, approvals, Verifier, and Integrator remain authoritative. CLI and
   the Stage confirmation sheet surface it. Reallocation recommendations are
   advisory only; R3a adds per-task envelopes and R3b adds opt-in runtime
-  reallocation, while persisted plan-budget mutation remains open.
+  reallocation, while automatic persisted plan-budget mutation remains open.
 - Readiness snapshot cache: `session_resources` reuses readiness for 2 seconds,
   keyed by the newest session event sequence, bounded to 64 sessions. Any new
   event invalidates it. `session.readiness`, partial-delivery/rescue actions,
@@ -193,7 +193,9 @@ R3/R4 now have read-only allocation and trade-off previews plus two explicit
 project opt-ins: one-shot completion-reserve rescue and runtime envelope
 reallocation. No preview mutates stored state; R3b uses a runtime-only plan
 copy and never rewrites the stored TeamPlan, budget, model route, approval,
-effect, Verifier, or merge row.
+effect, Verifier, or merge row. A separate explicit operator RPC can persist
+one validated recorded overlay into a normal plan revision while the session
+is quiescent.
 
 - `session.allocation` / `vp allocation` reconciles the session envelope,
   stored TeamPlan DAG/critical path, task queue, bounded project usage history
@@ -251,6 +253,15 @@ effect, Verifier, or merge row.
   and a per-session same-daemon lock serializes event read/append. The
   allocation preview reports stored/effective budgets and uses effective values
   for estimates and critical-path weight.
+- `session.envelope.persist` / `vp envelope-persist --task <id> --yes` writes
+  the latest still-valid recorded runtime overlay for one task into a normal
+  plan revision. It requires a quiescent session and re-folds the event through
+  the same fingerprint/old-budget validator that the runtime uses; a stale
+  overlay fails closed. It supports an optional expected revision, does not
+  create new capacity, and no scheduler/controller/model path calls it.
+  Engine and daemon RPC tests cover persistence, stale-overlay rejection, and
+  the required confirmation; it was not exercised live because the live plan
+  produced no reallocation event before its deadline.
 - macOS: Project RunPolicy toggles for completion-reserve rescue and runtime
   envelope reallocation, with the fixed-budget/no-bypass and
   stored-plan/caps-unchanged caveats, and Manage Dash → Usage & Budget Allocation
@@ -273,8 +284,9 @@ effect, Verifier, or merge row.
   `auto_reallocate_envelopes=true`. No provider was configured, so no live
   turn-boundary auto rescue or runtime envelope reallocation was triggered
   (unit/daemon tests cover both paths).
-- Tests: targeted allocation, trade-off, auto-rescue, protocol, CLI, and
-  daemon tests; full workspace **4,655 passed / 0 failed / 6 ignored**;
+- Tests: targeted allocation, trade-off, auto-rescue, envelope-persist,
+  protocol, CLI, and daemon tests; full workspace
+  **4,659 passed / 0 failed / 6 ignored**;
   Swift **659 passed (527 app + 132 helper)**; fmt, clippy,
   SwiftFormat, and `xcodebuild test` pass.
 - Live DeepSeek evidence (2026-11-25): the explicit smoke passed with
@@ -298,15 +310,23 @@ effect, Verifier, or merge row.
   dependencies were complete; the controller now only releases dependency/legacy
   blocks, and the scheduler/claim path only dispatches pending/interrupted
   rows; failed work waits for the controller retry transition, while
-  budget/gate blocks stay blocked. A second
+  budget/gate blocks stay blocked. Abort/no-ready batches now preserve an
+  existing `blocked` reason instead of rewriting it into a releasable
+  dependency block; a terminal gate resolve/cancel/expiry explicitly unblocks
+  its recorded plan task; and the dispatch resource guard runs before the
+  queue/lease/plan-resume events with a deduplicated decision event, so a
+  terminal block does not append a full resume cycle on every scheduler
+  cooldown. A second
   attempt with 80k/80k budgets completed T1 and started the Verifier, but the
   session hit its 900s wall-clock budget before T2; 24 calls, 317,308 input /
   7,367 output / 87.66% cache hit, T1 completed, T2 blocked. No
   `session.envelope.reallocated` event was emitted before the deadline; the
   runtime reallocation path remains unit/daemon-tested rather than live-proven.
-- Limits: persisted plan-revision reallocation, cross-department/session
-  pooling, reservation redistribution, and the daily attention schedule remain
-  open. R3b is an event-derived runtime overlay, not a TeamPlan rewrite; it
+- Limits: automatic persisted plan-revision reallocation,
+  cross-department/session pooling, reservation redistribution, and the daily
+  attention schedule remain open. Explicit one-task persistence exists but R3b
+  remains an event-derived runtime overlay by default, not an automatic
+  TeamPlan rewrite; it
   scans the newest 1,000 reallocation events, so source single-use memory can
   be forgotten after very heavy plan revision (department/session/project caps
   still bound actual spend). A target/department budget revision invalidates an

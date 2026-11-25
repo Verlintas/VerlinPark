@@ -4285,6 +4285,16 @@ async fn batch_abort_preserves_a_completed_and_merged_sibling() {
             .map(|task| task.status.as_str())
     };
     assert_eq!(status("T1"), Some("blocked"));
+    let blocked = queue
+        .tasks
+        .iter()
+        .find(|task| task.task_id == "T1")
+        .expect("T1");
+    assert_eq!(
+        blocked.last_error.as_deref(),
+        Some("waiting for external gate"),
+        "a later no-ready batch must not rewrite the gate block: {blocked:?}"
+    );
     assert_eq!(
         status("T2"),
         Some("completed"),
@@ -4334,6 +4344,124 @@ async fn batch_abort_preserves_a_completed_and_merged_sibling() {
         }),
         "no contradictory finish event may be emitted for the completed sibling"
     );
+
+    let resolved = engine
+        .resolve_gate(
+            &gate.gate.id,
+            gate.token.expose(),
+            Some("resolved"),
+            None,
+            Some("test"),
+        )
+        .await
+        .unwrap();
+    assert!(resolved.changed);
+    let queue = engine
+        .task_queue(Some(project.id.clone()), Some(session.id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        queue
+            .tasks
+            .iter()
+            .find(|task| task.task_id == "T1")
+            .map(|task| task.status.as_str()),
+        Some("pending"),
+        "a terminal gate releases its blocked plan task: {:?}",
+        queue.tasks
+    );
+    let events = engine
+        .list_events(session.id.clone(), 0, 600)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "plan_task.unblocked"
+            && event.payload["task_id"] == "T1"
+            && event.payload["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains(&gate.gate.id))
+    }));
+}
+
+#[tokio::test]
+async fn dispatch_guard_defers_before_emitting_a_plan_resume_cycle() {
+    let dir = TempDir::new().unwrap();
+    let (engine, service, project) = test_service(&dir);
+    let session = engine
+        .create_session_with_limits(
+            project.id.clone(),
+            "exhausted plan".into(),
+            Some(10),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let plan: TeamPlan = serde_json::from_value(serde_json::json!({
+        "goal": "exhausted plan",
+        "departments": [{
+            "name": "impl",
+            "manager_title": "Implementation",
+            "profile": "coding",
+            "objective": "do work"
+        }],
+        "tasks": [{
+            "id": "T1",
+            "department": "impl",
+            "title": "Work",
+            "kind": "coding",
+            "deps": [],
+            "acceptance": ["done"],
+            "write_scope": ["src/lib.rs"]
+        }]
+    }))
+    .unwrap();
+    engine.set_team_plan(&session.id, &plan).await.unwrap();
+    engine
+        .record_agent_usage(
+            &session.id,
+            "worker",
+            "Worker",
+            "worker",
+            None,
+            None,
+            "test-model",
+            100,
+            0,
+            false,
+            0.0,
+        )
+        .await
+        .unwrap();
+
+    assert!(!service.resume_plan(&session.id).await.unwrap());
+    assert!(!service.resume_plan(&session.id).await.unwrap());
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "agent.plan_resumed"),
+        "a deferred dispatch must not emit a plan-resume cycle"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "session.resource.decision")
+            .count(),
+        1,
+        "repeated cooldown ticks keep one decision event until state changes"
+    );
+    assert!(events.iter().any(|event| {
+        event.kind == "session.resource.decision"
+            && event.payload["reason"] == "resource_cap_tokens"
+    }));
 }
 
 #[tokio::test]

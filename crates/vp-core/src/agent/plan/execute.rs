@@ -4,7 +4,15 @@ use super::*;
 /// must not rewrite them: a completed/merged sibling stays completed, and a
 /// cancelled/failed/deferred sibling keeps the state its own result produced.
 fn preserved_terminal_status(status: &str) -> bool {
-    matches!(status, "completed" | "skipped" | "cancelled" | "failed")
+    // A blocked row carries the reason that gates its recovery (budget, gate,
+    // effect, dependency). A sibling/session abort or a later no-ready batch
+    // must not rewrite that reason: the rewrite would both lose the original
+    // block and make the task look like a stale dependency block, which the
+    // controller would release without the resource/gate/effect state change.
+    matches!(
+        status,
+        "completed" | "skipped" | "cancelled" | "failed" | "blocked"
+    )
 }
 
 fn task_dependency_satisfied(status: Option<&str>) -> bool {

@@ -21,6 +21,8 @@
 //! project may explicitly enable the optional loopback resolve route, which
 //! still requires the same scoped token.
 
+use std::collections::HashMap;
+
 use anyhow::{Result, anyhow};
 use base64::Engine as Base64Engine;
 use rand::TryRngCore;
@@ -336,6 +338,10 @@ impl Engine {
                 for event in &transition.events {
                     let _ = self.events.send(event.clone());
                 }
+                if transition.changed {
+                    self.release_gate_blocked_plan_task(&transition.gate.gate)
+                        .await;
+                }
             }
             return Err(gate_error(
                 codes::GATE_EXPIRED,
@@ -358,6 +364,10 @@ impl Engine {
         .await?;
         for event in &transition.events {
             let _ = self.events.send(event.clone());
+        }
+        if transition.changed {
+            self.release_gate_blocked_plan_task(&transition.gate.gate)
+                .await;
         }
         Ok(GateResolveResult {
             continuation_id: transition.continuation.as_ref().map(|row| row.id.clone()),
@@ -402,6 +412,10 @@ impl Engine {
         .await?;
         for event in &transition.events {
             let _ = self.events.send(event.clone());
+        }
+        if transition.changed {
+            self.release_gate_blocked_plan_task(&transition.gate.gate)
+                .await;
         }
         Ok(GateCancelResult {
             continuation_id: transition.continuation.as_ref().map(|row| row.id.clone()),
@@ -582,6 +596,10 @@ impl Engine {
             for event in &transition.events {
                 let _ = self.events.send(event.clone());
             }
+            if transition.changed {
+                self.release_gate_blocked_plan_task(&transition.gate.gate)
+                    .await;
+            }
         }
         Ok(changed)
     }
@@ -677,6 +695,77 @@ impl Engine {
             ));
         }
         Ok(())
+    }
+
+    /// Release a plan task that is blocked on a gate that has just reached a
+    /// terminal state. The continuation still wakes the session through the
+    /// normal prompt path; this deterministic transition makes the task
+    /// runnable again instead of leaving it blocked forever or relying on a
+    /// later abort path to rewrite its reason. Gate/effect/budget blocks are
+    /// otherwise never released by the generic stale-block cleanup.
+    async fn release_gate_blocked_plan_task(&self, gate: &ExternalGate) {
+        if let Err(error) = self.release_gate_blocked_plan_task_inner(gate).await {
+            tracing::warn!(
+                %error,
+                gate_id = %gate.id,
+                session_id = %gate.session_id,
+                "failed to release a plan task blocked on a terminal gate"
+            );
+        }
+    }
+
+    async fn release_gate_blocked_plan_task_inner(&self, gate: &ExternalGate) -> Result<usize> {
+        if !matches!(
+            gate.state,
+            GateState::Resolved | GateState::Expired | GateState::Cancelled
+        ) {
+            return Ok(0);
+        }
+        let events = self
+            .recent_events_of_kind(&gate.session_id, "plan_task.finished", 5_000)
+            .await?;
+        // Only the latest finish event for a task describes its current block.
+        let mut latest = HashMap::<String, serde_json::Value>::new();
+        for event in events {
+            if let Some(task_id) = event.payload["task_id"].as_str() {
+                latest.insert(task_id.to_string(), event.payload);
+            }
+        }
+        let store = self.store().clone();
+        let session_id = gate.session_id.clone();
+        let plan_seq = tokio::task::spawn_blocking(move || {
+            store.latest_event_seq(&session_id, "team_plan.submitted")
+        })
+        .await??;
+        if plan_seq == 0 {
+            return Ok(0);
+        }
+        let mut released = 0usize;
+        for (task_id, payload) in latest {
+            if payload["task_status"].as_str() != Some("blocked")
+                || payload["reason"].as_str() != Some("waiting for external gate")
+                || payload["gate_id"].as_str() != Some(gate.id.as_str())
+            {
+                continue;
+            }
+            let store = self.store().clone();
+            let session_id = gate.session_id.clone();
+            let task = task_id.clone();
+            let reason = format!(
+                "external gate {} {}; task released for the resumed plan",
+                gate.id,
+                gate.state.as_str()
+            );
+            let transition = tokio::task::spawn_blocking(move || {
+                store.unblock_plan_task_with_event(&session_id, plan_seq, &task, &reason)
+            })
+            .await??;
+            if let Some((_, event)) = transition {
+                let _ = self.events.send(event);
+                released = released.saturating_add(1);
+            }
+        }
+        Ok(released)
     }
 }
 

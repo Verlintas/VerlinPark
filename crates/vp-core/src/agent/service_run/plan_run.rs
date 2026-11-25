@@ -68,6 +68,33 @@ impl AgentService {
         if plan.tasks.iter().all(|task| terminal.contains(&task.id)) {
             anyhow::bail!("plan is already complete, skipped, or cancelled");
         }
+        // Check the dispatch guard before emitting queued/plan-resume events or
+        // taking a lease. The execute path keeps the same guard as a
+        // defense-in-depth check, but a terminal resource block must not make
+        // every scheduler cooldown append a full plan-resume cycle.
+        match self
+            .engine
+            .resource_governor_decision(session_id, "dispatch")
+            .await
+        {
+            Ok(decision) if decision.should_block() => {
+                self.engine.record_resource_decision(&decision).await?;
+                tracing::info!(
+                    session_id,
+                    action = %decision.action,
+                    reason = %decision.reason,
+                    "plan dispatch deferred by the resource governor"
+                );
+                return Ok(false);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                // Advisory infrastructure: a read failure must not block an
+                // otherwise valid resume. The execute path applies the same
+                // policy if it can be read there.
+                tracing::warn!(%error, session_id, "resource governor dispatch read failed");
+            }
+        }
 
         let control = Arc::new(RunControl::new());
         let preemption_policy = self

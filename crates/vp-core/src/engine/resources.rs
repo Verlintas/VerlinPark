@@ -895,6 +895,33 @@ impl Engine {
         if decision.action == "continue" {
             return Ok(());
         }
+        // A scheduler tick can re-evaluate the same terminal resource block
+        // repeatedly. Keep one event until something else happens in the
+        // session; otherwise an unresolved approval/readiness block would grow
+        // the event log on every cooldown tick.
+        if let Some(previous) = self
+            .latest_event_of_kind(&decision.session_id, SESSION_RESOURCE_DECISION_EVENT)
+            .await?
+        {
+            let previous_seq = previous.seq;
+            if let Ok(previous) =
+                serde_json::from_value::<ResourceGovernorDecision>(previous.payload)
+                && previous.phase == decision.phase
+                && previous.action == decision.action
+                && previous.reason == decision.reason
+                && previous.bottleneck == decision.bottleneck
+                && previous.details == decision.details
+            {
+                let store = self.store.clone();
+                let session_id = decision.session_id.clone();
+                let latest =
+                    tokio::task::spawn_blocking(move || store.latest_session_seq(&session_id))
+                        .await??;
+                if latest == previous_seq {
+                    return Ok(());
+                }
+            }
+        }
         self.append_event(
             &decision.session_id,
             SESSION_RESOURCE_DECISION_EVENT,
