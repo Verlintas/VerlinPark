@@ -850,6 +850,9 @@ struct ProjectRunPolicyView: Codable, Sendable, Equatable {
     /// Opt-in runtime-only reuse of unused completed-task capacity inside one
     /// department. The stored plan and every hard cap stay unchanged.
     let autoReallocateEnvelopes: Bool
+    /// Opt-in pre-run persistence of recorded runtime envelopes into a plan
+    /// revision. It records already-effective budgets only.
+    let autoPersistEnvelopes: Bool
 
     enum CodingKeys: String, CodingKey {
         case defaultProfile = "default_profile"
@@ -858,6 +861,7 @@ struct ProjectRunPolicyView: Codable, Sendable, Equatable {
         case stopPolicy = "stop_policy"
         case autoRescue = "auto_rescue"
         case autoReallocateEnvelopes = "auto_reallocate_envelopes"
+        case autoPersistEnvelopes = "auto_persist_envelopes"
     }
 
     init(
@@ -866,7 +870,8 @@ struct ProjectRunPolicyView: Codable, Sendable, Equatable {
         attentionCap: UInt32 = 20,
         stopPolicy: RunStopPolicyView = .standard,
         autoRescue: Bool = false,
-        autoReallocateEnvelopes: Bool = false
+        autoReallocateEnvelopes: Bool = false,
+        autoPersistEnvelopes: Bool = false
     ) {
         self.defaultProfile = defaultProfile
         self.completionReserveRatio = completionReserveRatio
@@ -874,6 +879,7 @@ struct ProjectRunPolicyView: Codable, Sendable, Equatable {
         self.stopPolicy = stopPolicy
         self.autoRescue = autoRescue
         self.autoReallocateEnvelopes = autoReallocateEnvelopes
+        self.autoPersistEnvelopes = autoPersistEnvelopes
     }
 
     init(from decoder: Decoder) throws {
@@ -890,6 +896,8 @@ struct ProjectRunPolicyView: Codable, Sendable, Equatable {
         autoRescue = try container.decodeIfPresent(Bool.self, forKey: .autoRescue) ?? false
         autoReallocateEnvelopes =
             try container.decodeIfPresent(Bool.self, forKey: .autoReallocateEnvelopes) ?? false
+        autoPersistEnvelopes =
+            try container.decodeIfPresent(Bool.self, forKey: .autoPersistEnvelopes) ?? false
     }
 
     var profileTitle: String {
@@ -952,6 +960,23 @@ struct ProjectRunPolicyView: Codable, Sendable, Equatable {
         completed tasks in the same department. The stored TeamPlan, department/session/project \
         caps, approvals, Verifier, and Integrator are unchanged; a plan revision invalidates an \
         old runtime override.
+        """
+    }
+
+    var autoPersistLabel: String {
+        autoPersistEnvelopes ? "On" : "Off"
+    }
+
+    /// Auto-persistence writes already-recorded runtime envelopes into a plan
+    /// revision before the next run; it never changes task status or adds capacity.
+    var autoPersistDetail: String {
+        guard autoPersistEnvelopes else {
+            return "Off · recorded runtime envelopes stay runtime-only until an explicit persist."
+        }
+        return """
+        On · before the next plan run, still-valid recorded runtime envelopes are written into \
+        one plan revision. This records budgets the runtime already allowed; it does not create \
+        capacity, change a task status, or bypass approvals/Verifier/Integrator.
         """
     }
 
@@ -1048,6 +1073,7 @@ struct ProjectRunPolicyDraft: Equatable, Sendable {
     var marginalValueRatio = 0.2
     var autoRescue = false
     var autoReallocateEnvelopes = false
+    var autoPersistEnvelopes = false
 
     init() {}
 
@@ -1061,6 +1087,7 @@ struct ProjectRunPolicyDraft: Equatable, Sendable {
         marginalValueRatio = policy.stopPolicy.marginalValueRatio
         autoRescue = policy.autoRescue
         autoReallocateEnvelopes = policy.autoReallocateEnvelopes
+        autoPersistEnvelopes = policy.autoPersistEnvelopes
     }
 
     var validationIssue: BudgetValidationIssue? {
@@ -1118,7 +1145,8 @@ struct ProjectRunPolicyDraft: Equatable, Sendable {
                 partialDelivery: partialDelivery
             ),
             autoRescue: autoRescue,
-            autoReallocateEnvelopes: autoReallocateEnvelopes
+            autoReallocateEnvelopes: autoReallocateEnvelopes,
+            autoPersistEnvelopes: autoPersistEnvelopes
         )
         try policy.validate()
         return policy

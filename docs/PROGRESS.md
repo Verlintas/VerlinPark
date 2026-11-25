@@ -69,6 +69,13 @@ Verifier 或 Integrator。
   支持可选 expected revision，不产生新 capacity，scheduler/controller/model
   都不会自动调用。engine 与 daemon RPC 测试覆盖持久化、stale 拒绝和确认门；
   live plan 在 deadline 前没有产生 reallocation event，因此未做 live 验证。
+- `ProjectRunPolicy.auto_persist_envelopes`（默认关闭）：项目 opt-in 后，
+  下一次 plan run 开始前会把当前所有仍然有效的 recorded runtime overlay
+  一次性写入一个正常 plan revision；只写 runtime 已经允许的 budget，
+  跳过 completed/skipped/cancelled/running 等受保护 task，不改变 task
+  status、不创建 capacity；写入后旧 event 因 fingerprint 变化而 stale，
+  因此幂等；写入失败只记 log，不阻塞 run。CLI/RPC policy 和 macOS
+  Project RunPolicy 编辑器都暴露这个开关。
 - `ProjectRunPolicy.auto_rescue`（默认关闭）：项目显式 opt-in 后，turn
   boundary 只有在暂停原因正好是 `completion_reserve_*`、session 为 fixed
   budget、readiness 处于 near-completion、存在 latest commit、
@@ -111,10 +118,10 @@ Verifier 或 Integrator。
   are documented posture`、profile 行显示 `posture 25%`、`0/0 task(s)
   estimated`，以及 CURRENT 不会同时出现 RECOMMENDED；policy editor 也显示 `AUTO ENVELOPES ON` 并保存两个 opt-in；daemon 返回
   `auto_rescue=true` 和 `auto_reallocate_envelopes=true`。
-- 明确未完成：automatic persisted plan-revision reallocation（显式单 task
-  持久化已实现）、跨 department/session 的 budget pooling、reservation
-  重分配、daily attention schedule、更完整的 anytime UI、learned
-  estimates/confidence。R3b 是 event-derived runtime
+- 明确未完成：automatic reallocation with reservation semantics（显式单
+  task + opt-in pre-run auto-persist 已实现）、跨 department/session 的
+  budget pooling、reservation 重分配、daily attention schedule、更完整的
+  anytime UI、learned estimates/confidence。R3b 是 event-derived runtime
   overlay，不是 TeamPlan 重写；自动 rescue 与 envelope 串行化是 same-daemon，
   跨 host 不成立；project RunPolicy 保存仍是整包 read-modify-write，没有
   updated_at/CAS 前置条件。
@@ -142,7 +149,7 @@ Verifier 或 Integrator。
   前产生 `session.envelope.reallocated`，runtime reallocation 仍以单元/daemon
   测试为证据。
 - 测试：targeted allocation/tradeoff/rescue/envelope-persist/protocol/CLI/
-  daemon + full workspace **4,673 passed / 0 failed / 6 ignored**；Swift
+  daemon + full workspace **4,676 passed / 0 failed / 6 ignored**；Swift
   **659 passed（527 app + 132 helper）**；`cargo fmt --check`、
   `cargo clippy --workspace --all-targets -- -D warnings`、`swiftformat --lint`
   和 `xcodebuild test` 通过。临时 daemon CLI smoke 覆盖 `project-run-policy-set`

@@ -271,6 +271,13 @@ is quiescent.
   and a per-session same-daemon lock serializes event read/append. The
   allocation preview reports stored/effective budgets and uses effective values
   for estimates and critical-path weight.
+- `ProjectRunPolicy.auto_persist_envelopes` is off by default. Before the next
+  plan run, still-valid recorded overlays are written into one normal plan
+  revision. It records budgets the runtime already allowed, skips
+  protected/terminal tasks, never changes task status or creates capacity, is
+  idempotent because the revision makes old events stale, and a failure logs
+  without blocking the run. The project policy RPC/CLI and macOS editor expose
+  the toggle.
 - Program milestone completion accepts the latest merge attempt's
   deterministic Integrator `merged` status (legacy `integrated` rows remain
   accepted) and ignores older failed attempts, so a successful retry does not
@@ -313,7 +320,7 @@ is quiescent.
   (unit/daemon tests cover both paths).
 - Tests: targeted allocation, trade-off, auto-rescue, envelope-persist,
   protocol, CLI, and daemon tests; full workspace
-  **4,673 passed / 0 failed / 6 ignored**;
+  **4,676 passed / 0 failed / 6 ignored**;
   Swift **659 passed (527 app + 132 helper)**; fmt, clippy,
   SwiftFormat, and `xcodebuild test` pass.
 - Live DeepSeek evidence (2026-11-25): the explicit smoke passed with
@@ -357,11 +364,11 @@ is quiescent.
   7,367 output / 87.66% cache hit, T1 completed, T2 blocked. No
   `session.envelope.reallocated` event was emitted before the deadline; the
   runtime reallocation path remains unit/daemon-tested rather than live-proven.
-- Limits: automatic persisted plan-revision reallocation,
+- Limits: automatic reallocation with reservation semantics,
   cross-department/session pooling, reservation redistribution, and the daily
-  attention schedule remain open. Explicit one-task persistence exists but R3b
-  remains an event-derived runtime overlay by default, not an automatic
-  TeamPlan rewrite; it
+  attention schedule remain open. Explicit one-task and opt-in pre-run
+  auto-persistence record existing overlays, but R3b remains an event-derived
+  runtime overlay by default, not an automatic reallocation controller; it
   scans the newest 1,000 reallocation events, so source single-use memory can
   be forgotten after very heavy plan revision (department/session/project caps
   still bound actual spend). A target/department budget revision invalidates an

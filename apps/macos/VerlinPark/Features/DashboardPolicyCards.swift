@@ -552,6 +552,16 @@ struct ProjectRunPolicyCard: View {
                     .background(VPTheme.warning.opacity(0.10), in: Capsule())
                     .help(policy?.autoReallocateDetail ?? "")
             }
+            if policy?.autoPersistEnvelopes == true {
+                Text("AUTO PERSIST ON")
+                    .font(.system(size: 7, weight: .semibold, design: .monospaced))
+                    .tracking(0.3)
+                    .foregroundStyle(VPTheme.warning)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(VPTheme.warning.opacity(0.10), in: Capsule())
+                    .help(policy?.autoPersistDetail ?? "")
+            }
         }
     }
 
@@ -563,6 +573,7 @@ struct ProjectRunPolicyCard: View {
             policyMetric("No progress", policy.noProgressLabel)
             policyMetric("Auto rescue", policy.autoRescueLabel)
             policyMetric("Auto envelopes", policy.autoReallocateLabel)
+            policyMetric("Auto persist", policy.autoPersistLabel)
         }
     }
 
@@ -826,6 +837,18 @@ struct ProjectRunPolicySheet: View {
             .controlSize(.small)
             Text(
                 "Explicit project opt-in. Worker/Labour runtime task budgets may reuse unused token/cost capacity from completed tasks in the same department. The stored TeamPlan and department/session/project caps are unchanged; approvals, Verifier, and Integrator still apply, and a plan revision invalidates an old runtime override. Off by default."
+            )
+            .font(VPTheme.mono(7))
+            .foregroundStyle(VPTheme.textTertiary)
+            .fixedSize(horizontal: false, vertical: true)
+            Toggle(
+                "Persist recorded runtime envelopes before the next plan run",
+                isOn: valueBinding(\.autoPersistEnvelopes)
+            )
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            Text(
+                "Explicit project opt-in. Still-valid recorded runtime envelopes are written into one plan revision before the next run. This records budgets the runtime already allowed; it does not create capacity, change a task status, or bypass approvals, Verifier, or Integrator. A failed persist never blocks the run. Off by default."
             )
             .font(VPTheme.mono(7))
             .foregroundStyle(VPTheme.textTertiary)

@@ -299,6 +299,18 @@ fn project_run_policy_lines(value: &Value, policy: &Value) -> Vec<String> {
             }
         ),
         format!(
+            "  auto persist {} (still-valid recorded envelopes are written into a plan revision before the next run)",
+            if policy
+                .get("auto_persist_envelopes")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
+        format!(
             "  stop        no-progress {} turn(s) · evidence {} · partial delivery {}",
             stop["no_progress_turns"].as_u64().unwrap_or(6),
             if stop

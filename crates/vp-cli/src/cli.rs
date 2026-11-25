@@ -2338,6 +2338,12 @@ pub(crate) enum Command {
         /// Disable runtime task-envelope reallocation.
         #[arg(long, conflicts_with = "auto_reallocate_envelopes")]
         no_auto_reallocate_envelopes: bool,
+        /// Opt in to auto-persisting recorded runtime envelopes before a plan run.
+        #[arg(long, conflicts_with = "no_auto_persist_envelopes")]
+        auto_persist_envelopes: bool,
+        /// Disable automatic runtime-envelope persistence.
+        #[arg(long, conflicts_with = "auto_persist_envelopes")]
+        no_auto_persist_envelopes: bool,
     },
     /// Enable or disable unlimited budget mode for a session.
     SessionUnlimited {

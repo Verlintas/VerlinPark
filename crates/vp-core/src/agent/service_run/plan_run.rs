@@ -33,6 +33,24 @@ impl AgentService {
         ) {
             anyhow::bail!("session must be idle, failed, cancelled, or draft to resume a plan");
         }
+        // Opt-in pre-run persistence records already-effective runtime
+        // envelopes into a plan revision. A failure is logged and never blocks
+        // an otherwise valid resume.
+        match self
+            .engine
+            .auto_persist_recorded_envelopes(session_id, config.max_managers)
+            .await
+        {
+            Ok(Some(result)) => tracing::info!(
+                session_id,
+                revision = result.revision.revision,
+                "auto-persisted recorded runtime task envelopes"
+            ),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, session_id, "automatic envelope persistence failed");
+            }
+        }
         let Some(plan) = self.engine.get_team_plan(session_id).await? else {
             anyhow::bail!("session has no TeamPlan");
         };

@@ -331,6 +331,8 @@ pub(super) async fn dispatch(
             no_auto_rescue,
             auto_reallocate_envelopes,
             no_auto_reallocate_envelopes,
+            auto_persist_envelopes,
+            no_auto_persist_envelopes,
         } => {
             if profile.is_none()
                 && reserve.is_none()
@@ -340,9 +342,11 @@ pub(super) async fn dispatch(
                 && !no_auto_rescue
                 && !auto_reallocate_envelopes
                 && !no_auto_reallocate_envelopes
+                && !auto_persist_envelopes
+                && !no_auto_persist_envelopes
             {
                 bail!(
-                    "pass at least one of --profile, --reserve, --attention-cap, --no-progress-turns, --auto-rescue, --no-auto-rescue, --auto-reallocate-envelopes, or --no-auto-reallocate-envelopes"
+                    "pass at least one of --profile, --reserve, --attention-cap, --no-progress-turns, --auto-rescue, --no-auto-rescue, --auto-reallocate-envelopes, --no-auto-reallocate-envelopes, --auto-persist-envelopes, or --no-auto-persist-envelopes"
                 );
             }
             if auto_rescue && no_auto_rescue {
@@ -351,6 +355,11 @@ pub(super) async fn dispatch(
             if auto_reallocate_envelopes && no_auto_reallocate_envelopes {
                 bail!(
                     "--auto-reallocate-envelopes and --no-auto-reallocate-envelopes are mutually exclusive"
+                );
+            }
+            if auto_persist_envelopes && no_auto_persist_envelopes {
+                bail!(
+                    "--auto-persist-envelopes and --no-auto-persist-envelopes are mutually exclusive"
                 );
             }
             // Read-modify-write: unspecified fields keep the stored policy.
@@ -391,6 +400,12 @@ pub(super) async fn dispatch(
             }
             if no_auto_reallocate_envelopes {
                 policy.auto_reallocate_envelopes = false;
+            }
+            if auto_persist_envelopes {
+                policy.auto_persist_envelopes = true;
+            }
+            if no_auto_persist_envelopes {
+                policy.auto_persist_envelopes = false;
             }
             rpc(
                 &discovery,
@@ -874,6 +889,7 @@ mod tests {
             "4",
             "--auto-rescue",
             "--auto-reallocate-envelopes",
+            "--auto-persist-envelopes",
         ])
         .unwrap();
         match cli.command {
@@ -887,6 +903,8 @@ mod tests {
                 no_auto_rescue,
                 auto_reallocate_envelopes,
                 no_auto_reallocate_envelopes,
+                auto_persist_envelopes,
+                no_auto_persist_envelopes,
             } => {
                 assert_eq!(project, "proj-1");
                 assert_eq!(profile.as_deref(), Some("fast"));
@@ -897,6 +915,8 @@ mod tests {
                 assert!(!no_auto_rescue);
                 assert!(auto_reallocate_envelopes);
                 assert!(!no_auto_reallocate_envelopes);
+                assert!(auto_persist_envelopes);
+                assert!(!no_auto_persist_envelopes);
             }
             other => panic!("expected project-run-policy-set, got {other:?}"),
         }

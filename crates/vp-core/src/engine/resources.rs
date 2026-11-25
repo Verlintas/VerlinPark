@@ -1785,6 +1785,7 @@ mod tests {
             },
             auto_rescue: false,
             auto_reallocate_envelopes: false,
+            auto_persist_envelopes: false,
         };
         let saved = engine
             .set_project_run_policy(SetProjectRunPolicyParams {

@@ -552,6 +552,106 @@ impl Engine {
         )
         .await
     }
+
+    /// Opt-in pre-run persistence of all still-valid recorded runtime
+    /// envelopes. This records budgets the runtime already allowed into one
+    /// plan revision; it creates no new capacity, never changes a task status,
+    /// and skips protected/terminal tasks.
+    pub async fn auto_persist_recorded_envelopes(
+        &self,
+        session_id: &str,
+        max_managers: usize,
+    ) -> Result<Option<vp_protocol::types::ReviseTeamPlanResult>> {
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let session = tokio::task::spawn_blocking(move || store.get_session(&id))
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        let policy = self
+            .get_project_run_policy(&session.project_id)
+            .await?
+            .policy;
+        if !policy.auto_persist_envelopes {
+            return Ok(None);
+        }
+        crate::ensure_session_quiescent(&session, "auto-persist runtime envelopes")?;
+        let mut plan = self
+            .get_team_plan(session_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("session has no TeamPlan"))?;
+        let events = self
+            .recent_events_of_kind(
+                session_id,
+                SESSION_ENVELOPE_REALLOCATED_EVENT,
+                MAX_ENVELOPE_EVENTS,
+            )
+            .await?;
+        let (effective, _, valid_targets) = fold_reallocation_events(&plan, events);
+        if valid_targets.is_empty() {
+            return Ok(None);
+        }
+        let store = self.store.clone();
+        let session_id_owned = session_id.to_string();
+        let statuses = tokio::task::spawn_blocking(move || {
+            store
+                .list_plan_tasks(None, Some(&session_id_owned))
+                .map(|rows| {
+                    rows.into_iter()
+                        .map(|row| (row.task_id, row.status))
+                        .collect::<HashMap<_, _>>()
+                })
+        })
+        .await??;
+        let mut changed = false;
+        for task in plan.tasks.iter_mut() {
+            if !valid_targets.contains(&task.id) {
+                continue;
+            }
+            let status = statuses
+                .get(&task.id)
+                .map(String::as_str)
+                .unwrap_or("pending");
+            if matches!(
+                status,
+                "completed"
+                    | "skipped"
+                    | "cancelled"
+                    | "running"
+                    | "queued"
+                    | "paused"
+                    | "pausing"
+                    | "cancelling"
+                    | "waiting_input"
+            ) {
+                continue;
+            }
+            let Some(recorded) = effective.get(&task.id).copied() else {
+                continue;
+            };
+            if recorded.tokens.is_some() && task.token_budget != recorded.tokens {
+                task.token_budget = recorded.tokens;
+                changed = true;
+            }
+            if recorded.cost_usd.is_some() && task.cost_budget_usd != recorded.cost_usd {
+                task.cost_budget_usd = recorded.cost_usd;
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(None);
+        }
+        let result = self
+            .revise_team_plan(
+                session_id,
+                plan,
+                "auto-persist recorded runtime task envelopes",
+                "policy:auto-persist",
+                None,
+                max_managers,
+            )
+            .await?;
+        Ok(Some(result))
+    }
 }
 
 fn apply_effective_budget(plan: &mut TeamPlan, task_id: &str, budget: EffectiveBudget) {
@@ -644,6 +744,24 @@ mod tests {
                 project_id: project_id.to_string(),
                 policy: ProjectRunPolicy {
                     auto_reallocate_envelopes: enabled,
+                    ..current
+                },
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn set_auto_persist(engine: &Engine, project_id: &str, enabled: bool) {
+        let current = engine
+            .get_project_run_policy(project_id)
+            .await
+            .unwrap()
+            .policy;
+        engine
+            .set_project_run_policy(SetProjectRunPolicyParams {
+                project_id: project_id.to_string(),
+                policy: ProjectRunPolicy {
+                    auto_persist_envelopes: enabled,
                     ..current
                 },
             })
@@ -887,6 +1005,57 @@ mod tests {
                 .await
                 .is_err(),
             "persisting the same envelope twice fails closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_persist_recorded_envelopes_is_opt_in_and_idempotent() {
+        let plan = plan(
+            vec![department("impl", None, None)],
+            vec![
+                task("T1", "impl", Some(5_000), None),
+                task("T2", "impl", Some(1_000), None),
+            ],
+        );
+        let (_data, _repo, engine, session) = setup(&plan, true).await;
+        complete_task(&engine, &session.id, "T1");
+        engine
+            .effective_plan_for_budget(&session, &plan, "T2")
+            .await
+            .unwrap()
+            .expect("runtime overlay");
+        assert!(
+            engine
+                .auto_persist_recorded_envelopes(&session.id, 4)
+                .await
+                .unwrap()
+                .is_none(),
+            "the automatic behavior is opt-in"
+        );
+        set_auto_persist(&engine, &session.project_id, true).await;
+        let persisted = engine
+            .auto_persist_recorded_envelopes(&session.id, 4)
+            .await
+            .unwrap()
+            .expect("auto-persisted revision");
+        assert_eq!(persisted.revision.revision, 2);
+        let stored = engine.get_team_plan(&session.id).await.unwrap().unwrap();
+        assert_eq!(
+            stored
+                .tasks
+                .iter()
+                .find(|task| task.id == "T2")
+                .unwrap()
+                .token_budget,
+            Some(6_000)
+        );
+        assert!(
+            engine
+                .auto_persist_recorded_envelopes(&session.id, 4)
+                .await
+                .unwrap()
+                .is_none(),
+            "persisting the same overlay twice is a no-op"
         );
     }
 

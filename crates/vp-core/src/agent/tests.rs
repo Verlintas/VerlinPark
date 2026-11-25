@@ -4748,6 +4748,157 @@ async fn gate_defer_does_not_block_a_dependent_sibling() {
 }
 
 #[tokio::test]
+async fn cancelled_intake_can_be_dispatched_manually_without_a_separate_retry() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("manual intake run".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let task = engine
+        .create_intake_task(vp_protocol::types::IntakeCreateParams {
+            project_id: project.id.clone(),
+            title: "Cancelled intake".into(),
+            instructions: "Run this after a cancellation.".into(),
+            profile: Some("coding".into()),
+            kind: Some("coding".into()),
+            priority: Some(0),
+            write_scope: vec!["src/cancelled.txt".into()],
+            acceptance: vec!["the run was dispatched".into()],
+            deps: Vec::new(),
+            token_budget: None,
+            cost_budget_usd: None,
+            time_budget_secs: None,
+            max_attempts: Some(2),
+            labels: Vec::new(),
+            origin: Some("test".into()),
+        })
+        .await
+        .unwrap();
+    engine
+        .cancel_intake_task(task.id.clone())
+        .await
+        .unwrap()
+        .expect("task cancelled");
+    let dispatched = service.dispatch_intake_task(&task.id).await.unwrap();
+    assert!(
+        dispatched.started,
+        "manual Run now must reset a cancelled intake item before claiming it"
+    );
+    if let Some(session_id) = dispatched.session_id.clone()
+        && let Some(session) = engine.store().get_session(&session_id).unwrap()
+    {
+        let _ = wait_until_idle(&engine, &session).await;
+    }
+}
+
+#[tokio::test]
+async fn plan_resume_auto_persists_recorded_envelopes_before_starting() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("auto persist run".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id.clone(), "auto persist".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let plan: TeamPlan = serde_json::from_value(serde_json::json!({
+        "goal": "auto persist",
+        "departments": [{
+            "name": "impl",
+            "manager_title": "Implementation",
+            "profile": "coding",
+            "objective": "build"
+        }],
+        "tasks": [
+            {
+                "id": "T1",
+                "department": "impl",
+                "title": "Source",
+                "kind": "coding",
+                "deps": [],
+                "acceptance": ["done"],
+                "write_scope": ["src/t1"],
+                "token_budget": 5_000
+            },
+            {
+                "id": "T2",
+                "department": "impl",
+                "title": "Target",
+                "kind": "coding",
+                "deps": [],
+                "acceptance": ["done"],
+                "write_scope": ["src/t2"],
+                "token_budget": 1_000
+            }
+        ]
+    }))
+    .unwrap();
+    engine.set_team_plan(&session.id, &plan).await.unwrap();
+    let store = engine.store().clone();
+    let seq = store
+        .latest_event_seq(&session.id, "team_plan.submitted")
+        .unwrap();
+    store
+        .claim_plan_tasks_with_events(&session.id, seq, &["T1".to_string()])
+        .unwrap();
+    store
+        .finish_plan_task(&session.id, seq, "T1", "completed", None)
+        .unwrap();
+    store
+        .append_event(
+            &session.id,
+            "plan_task.finished",
+            serde_json::json!({"task_id": "T1", "task_status": "completed", "summary": "done"}),
+        )
+        .unwrap();
+    let mut policy = engine
+        .get_project_run_policy(&project.id)
+        .await
+        .unwrap()
+        .policy;
+    policy.auto_reallocate_envelopes = true;
+    policy.auto_persist_envelopes = true;
+    engine
+        .set_project_run_policy(vp_protocol::types::SetProjectRunPolicyParams {
+            project_id: project.id.clone(),
+            policy,
+        })
+        .await
+        .unwrap();
+    engine
+        .effective_plan_for_budget(&session, &plan, "T2")
+        .await
+        .unwrap()
+        .expect("runtime overlay");
+
+    assert!(service.resume_plan(&session.id).await.unwrap());
+    let _ = wait_until_idle(&engine, &session).await;
+    let stored = engine.get_team_plan(&session.id).await.unwrap().unwrap();
+    assert_eq!(
+        stored
+            .tasks
+            .iter()
+            .find(|task| task.id == "T2")
+            .unwrap()
+            .token_budget,
+        Some(6_000),
+        "the pre-run hook must persist the recorded overlay"
+    );
+    assert!(engine.plan_revisions(&session.id).await.unwrap().len() >= 2);
+}
+
+#[tokio::test]
 async fn task_cancel_during_verification_does_not_merge_or_complete() {
     let dir = TempDir::new().unwrap();
     let engine_slot = Arc::new(Mutex::new(None::<Engine>));

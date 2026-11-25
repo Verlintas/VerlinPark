@@ -1628,6 +1628,7 @@ mod project_run_policy_rebuild_tests {
                 },
                 auto_rescue: true,
                 auto_reallocate_envelopes: true,
+                auto_persist_envelopes: true,
             };
             engine
                 .set_project_run_policy(SetProjectRunPolicyParams {

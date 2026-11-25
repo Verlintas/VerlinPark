@@ -3794,6 +3794,11 @@ pub struct ProjectRunPolicy {
     /// The stored TeamPlan and all hard caps remain unchanged. Default off.
     #[serde(default)]
     pub auto_reallocate_envelopes: bool,
+    /// Opt in to automatically writing recorded runtime envelopes into a plan
+    /// revision before the next plan run. This records already-effective
+    /// budgets only; it creates no capacity and never changes a task status.
+    #[serde(default)]
+    pub auto_persist_envelopes: bool,
 }
 
 fn default_project_run_completion_reserve_ratio() -> f64 {
@@ -3813,6 +3818,7 @@ impl Default for ProjectRunPolicy {
             stop_policy: RunStopPolicy::default(),
             auto_rescue: false,
             auto_reallocate_envelopes: false,
+            auto_persist_envelopes: false,
         }
     }
 }
