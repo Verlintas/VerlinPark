@@ -599,6 +599,8 @@ fn run_git<S: AsRef<str>>(root: &Path, args: &[S]) -> Result<GitOutput> {
         .arg("--no-pager")
         .args(["-c", "color.ui=false"])
         .args(args.iter().map(AsRef::as_ref))
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

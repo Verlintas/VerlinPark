@@ -1875,6 +1875,7 @@ pub(crate) async fn sandboxed_command(context: &ToolContext) -> Result<Command> 
         .env("PIP_CACHE_DIR", scratch.join("pip"))
         .env("CLANG_MODULE_CACHE_PATH", scratch.join("clang-modules"))
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_CONFIG_COUNT", "1")
         .env("GIT_CONFIG_KEY_0", "gc.auto")
         .env("GIT_CONFIG_VALUE_0", "0")

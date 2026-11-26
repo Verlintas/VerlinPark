@@ -606,6 +606,10 @@ bounded locally:
   the same bound. This prevents a single task from carrying the 22-item scope
   that made the live T1 run so expensive. Test:
   `rejects_plans_with_more_than_eight_acceptance_items`.
+- **Optional-lock noise.** Worktree and `git` tool commands now set
+  `GIT_OPTIONAL_LOCKS=0`; the shell sandbox already disabled `gc.auto`. This
+  removes the non-fatal `packed-refs.lock: Operation not permitted` warning on
+  a read-only project root.
 
 Local verification after this slice: `cargo test --workspace` 4,702 passed /
 0 failed / 6 ignored; Swift `xcodebuild test` 659 passed / 0 failed;

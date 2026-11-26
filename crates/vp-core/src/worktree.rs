@@ -288,6 +288,7 @@ fn git_output_with_index(root: &Path, index: &Path, args: &[&str]) -> Result<Str
         .arg(root)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_INDEX_FILE", index)
         .env("GIT_AUTHOR_NAME", "VerlinPark")
         .env("GIT_AUTHOR_EMAIL", "verlinpark@localhost")
@@ -808,6 +809,7 @@ pub(crate) fn git_output(root: &Path, args: &[&str]) -> Result<String> {
         .arg(root)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .output()
         .context("running git")?;
     if !output.status.success() {
