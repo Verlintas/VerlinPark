@@ -32,6 +32,7 @@ pub struct ProcessReport {
 #[derive(Clone, Debug)]
 struct SupervisedRow {
     pid: u32,
+    session_id: String,
     label: String,
     heartbeat_age_secs: u64,
 }
@@ -115,6 +116,7 @@ impl ProcessSampler {
             if samples.len() < MAX_SAMPLES {
                 samples.push(ProcessPressure {
                     pid: row.pid,
+                    session_id: row.session_id.clone(),
                     label: row.label.clone(),
                     state: verdict.state.as_str().to_string(),
                     score: verdict.score,
@@ -178,7 +180,7 @@ fn list_rows(data_dir: &Path) -> Result<Vec<SupervisedRow>> {
     )?;
     connection.busy_timeout(Duration::from_millis(500))?;
     let mut statement = connection.prepare(
-        "SELECT pid, COALESCE(task_id, ''), COALESCE(agent_name, ''), \
+        "SELECT pid, session_id, COALESCE(name, ''), \
          COALESCE(CAST(strftime('%s','now') AS INTEGER) \
          - CAST(strftime('%s', heartbeat_at) AS INTEGER), 0) \
          FROM supervised_processes \
@@ -187,16 +189,16 @@ fn list_rows(data_dir: &Path) -> Result<Vec<SupervisedRow>> {
     )?;
     let rows = statement.query_map([MAX_TRACKED as i64], |row| {
         let pid: i64 = row.get(0)?;
-        let task: String = row.get(1)?;
-        let agent: String = row.get(2)?;
+        let session_id: String = row.get(1)?;
+        let name: String = row.get(2)?;
         let age: i64 = row.get(3)?;
-        let label = if task.is_empty() { agent } else { task };
         Ok(SupervisedRow {
             pid: u32::try_from(pid.max(0)).unwrap_or(0),
-            label: if label.is_empty() {
+            session_id,
+            label: if name.is_empty() {
                 "supervised process".to_string()
             } else {
-                label
+                name
             },
             heartbeat_age_secs: u64::try_from(age.max(0)).unwrap_or(0),
         })

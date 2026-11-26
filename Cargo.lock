@@ -4086,6 +4086,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "vp-protocol",
  "zip",
 ]

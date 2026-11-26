@@ -21,6 +21,7 @@ pub mod client;
 pub mod diagnostics;
 pub mod discovery;
 pub mod launchd;
+pub mod notice;
 pub mod probe;
 pub mod process_probe;
 pub mod protocol;

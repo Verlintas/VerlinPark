@@ -20,7 +20,7 @@ fn seed_database(data_dir: &Path) {
             CREATE TABLE effect_receipts(state TEXT);
             CREATE TABLE approvals(status TEXT);
             CREATE TABLE supervised_processes(
-                id TEXT, state TEXT, pid INTEGER, task_id TEXT, agent_name TEXT,
+                id TEXT, session_id TEXT, name TEXT, state TEXT, pid INTEGER,
                 heartbeat_at TEXT, updated_at TEXT
             );
             INSERT INTO sessions VALUES ('running');
@@ -36,7 +36,7 @@ fn seed_database(data_dir: &Path) {
         .unwrap();
     connection
         .execute(
-            "INSERT INTO supervised_processes              (id, state, pid, task_id, agent_name, heartbeat_at, updated_at)              VALUES ('proc1', 'running', ?1, 'task-1', 'worker-1', datetime('now'), datetime('now'))",
+            "INSERT INTO supervised_processes              (id, session_id, name, state, pid, heartbeat_at, updated_at)              VALUES ('proc1', 'session-1', 'worker-1', 'running', ?1, datetime('now'), datetime('now'))",
             [std::process::id() as i64],
         )
         .unwrap();

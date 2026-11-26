@@ -145,6 +145,7 @@ pub mod contract;
 pub mod conversation;
 pub mod coordination;
 pub mod critical_path;
+pub mod custos_notice;
 pub mod daemon_agent;
 mod dashboard;
 pub mod diagnosis;

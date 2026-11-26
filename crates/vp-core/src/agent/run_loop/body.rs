@@ -1100,6 +1100,41 @@ pub(in crate::agent) async fn run_loop_body(
             conversation.push(ChatMessage::system(notice));
             finalize_nudged = true;
         }
+        // Custos notices are sealed, one-way system messages. Drain at most two
+        // matching files at this turn boundary; the file is moved to delivered
+        // before the provider call so a retry does not duplicate it.
+        let notice_data_dir = engine.store().data_dir().to_path_buf();
+        let is_leader = matches!(spec.role, AgentRole::Leader);
+        if let Ok(notices) = crate::custos_notice::drain_for_agent(
+            &notice_data_dir,
+            &session.id,
+            Some(spec.id.as_str()),
+            is_leader,
+            2,
+        ) {
+            for notice in notices {
+                let text = notice.system_message();
+                let stored = engine
+                    .append_message(&session.id, "system", &text, serde_json::json!([]), None)
+                    .await?;
+                conversation_ids.push(Some(stored.id));
+                conversation.push(ChatMessage::system(text));
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "custos.notice",
+                    serde_json::json!({
+                        "notice_id": notice.notice_id,
+                        "severity": notice.severity,
+                        "subject": notice.subject,
+                        "state": notice.observed.state,
+                        "score": notice.observed.score,
+                    }),
+                )
+                .await?;
+            }
+        }
         let mut request = ChatRequest {
             model: model_name.clone(),
             messages: conversation.clone(),

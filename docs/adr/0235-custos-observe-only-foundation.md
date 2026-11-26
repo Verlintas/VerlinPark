@@ -45,6 +45,9 @@ The first slice implements:
   before restore;
 - an append-only hash-chained JSONL audit for start/stop and automatic 30s
   vault-state changes, with `--audit-verify`;
+- sealed one-way notice files drained by the agent loop at a turn boundary and
+  appended as persisted system messages; shadow process notices currently use
+  the session Leader because process ownership is not persisted per agent;
 - a 0600 Unix-domain socket with `status`, `health`, `charter`, `ping`, and the
   explicitly consented `diagnostics.generate`;
 - local standard + forensic ZIP bundles (0700 directory, 0600 files, SHA-256
@@ -83,8 +86,8 @@ controls.
   verify `status`, `health`, `charter`, `ping`, `METHOD_NOT_FOUND` for `act`,
   and that a missing database is not created.
 - `cargo clippy --workspace --all-targets -- -D warnings` passes.
-- `cargo test -p vp-custos`: 62 unit + 4 integration + 1 module-governance.
-- Full Rust workspace: 4,769 passed / 0 failed / 6 ignored.
+- `cargo test -p vp-custos`: 64 unit + 4 integration + 1 module-governance.
+- Full Rust workspace: 4,777 passed / 0 failed / 6 ignored.
 - Swift `xcodebuild test`: 673 passed / 0 failed, including Custos wordmark,
   protocol decoding, diagnostics-result decoding, and unavailable-socket model
   tests.
@@ -102,8 +105,8 @@ controls.
   read-only status metadata is exposed.
 - Probe coverage is bounded to the named tables and does not run a full
   `PRAGMA integrity_check`.
-- Process sampling is read-only shadow evidence; notices and any action remain
-  later slices.
+- Process sampling is read-only shadow evidence. Notices are one-way and
+  shadow-only; no process signal or containment action is executed.
 - The GUI does not yet generate diagnostic bundles.
 - No live daemon or real project data is modified by this slice.
 

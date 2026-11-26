@@ -186,6 +186,7 @@ pub struct ProbeInfo {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProcessPressure {
     pub pid: u32,
+    pub session_id: String,
     pub label: String,
     pub state: String,
     pub score: u8,

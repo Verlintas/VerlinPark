@@ -40,6 +40,12 @@ in-daemon module.
   start/stop entries, and an automatic 30s vault-state audit when the state
   changes. Audit payloads are metadata only; no prompts, messages, tool output,
   file contents, screen data, or secrets.
+- Sealed one-way notices: core shadow pressure writes `custos/notices/outbox`
+  files; the agent loop drains up to two matching notices at a turn boundary
+  and appends a persisted system message, then moves them to `delivered`.
+  Notices have `reply: forbidden`, no tool/RPC path, no action, and no prompt
+  content. Unaddressed process notices go to the session Leader until process
+  ownership is persisted per agent.
 - 0600 Unix socket and separate `custos/discovery.json`; methods are `status`,
   `health`, `charter`, `ping`, and the explicitly consented
   `diagnostics.generate`. No TCP, token, provider key, agent tool, or state
@@ -51,8 +57,8 @@ in-daemon module.
   DMG `bin/` staging; the SwiftUI window is a normal GUI with the accepted
   `Custos` wordmark as the only ASCII art and a local diagnostics sheet.
 
-Verification: `cargo test -p vp-custos` 62 unit + 4 integration + 1 module
-governance; full workspace **4,769 Rust passed / 0 failed / 6 ignored**;
+Verification: `cargo test -p vp-custos` 64 unit + 4 integration + 1 module
+governance; full workspace **4,777 Rust passed / 0 failed / 6 ignored**;
 `cargo clippy --workspace --all-targets -- -D warnings` passes; Swift
 `xcodebuild test` **673 passed / 0 failed** with English test language; the
 Custos window is a normal SwiftUI GUI with only the wordmark as ASCII art.

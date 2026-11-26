@@ -22,6 +22,7 @@ use crate::capacity::MachineCapacity;
 use crate::charter;
 use crate::diagnostics::{self, BundleMode};
 use crate::discovery;
+use crate::notice;
 use crate::probe::{self, ProbeReport};
 use crate::process_probe::{ProcessCache, ProcessReport};
 use crate::protocol::{
@@ -191,8 +192,10 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         }
     });
 
+    let notice_task = tokio::spawn(notice_loop(state.clone()));
     let result = accept_loop(listener, state).await;
     heartbeat_task.abort();
+    notice_task.abort();
     let _ = audit::append(
         &config.data_dir,
         "custos.stop",
@@ -668,6 +671,80 @@ fn overall_state(dimensions: &[Dimension]) -> CustosState {
 
 fn discovery_exists(data_dir: &Path) -> bool {
     data_dir.join("run").join("daemon.json").is_file()
+}
+
+async fn notice_loop(state: AppState) {
+    let mut last: std::collections::HashMap<String, Instant> = std::collections::HashMap::new();
+    loop {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let report = process_report(&state);
+        let mut emitted = 0usize;
+        for sample in &report.samples {
+            if emitted >= 4 {
+                break;
+            }
+            if !matches!(sample.action.as_str(), "final_notice" | "stop") {
+                continue;
+            }
+            let fingerprint = format!("{}:{}:{}", sample.session_id, sample.pid, sample.state);
+            if let Some(at) = last.get(&fingerprint)
+                && at.elapsed() < Duration::from_secs(600)
+            {
+                continue;
+            }
+            let severity = if sample.action == "stop" {
+                "critical"
+            } else {
+                "warning"
+            };
+            let notice = vp_protocol::custos_notice::CustosNotice {
+                schema: vp_protocol::custos_notice::CUSTOS_NOTICE_SCHEMA.to_string(),
+                notice_id: notice::new_notice_id(),
+                created_at: vp_protocol::now_rfc3339(),
+                severity: severity.to_string(),
+                session_id: sample.session_id.clone(),
+                agent_id: None,
+                task_id: None,
+                subject: sample.label.clone(),
+                action: sample.action.clone(),
+                observed: vp_protocol::custos_notice::CustosNoticeObserved {
+                    pid: sample.pid,
+                    cpu_share: sample.cpu_share,
+                    rss_bytes: sample.rss_bytes,
+                    children: sample.children,
+                    no_progress_secs: sample.no_progress_secs,
+                    score: sample.score,
+                    state: sample.state.clone(),
+                },
+                requested_action: "stop or reduce the workload".to_string(),
+                grace_secs: if sample.action == "stop" { 60 } else { 120 },
+                consequence: "none in observe-only shadow mode; no process signal will be sent"
+                    .to_string(),
+                reply: "forbidden".to_string(),
+                charter_hash: charter::hash(),
+                build_hash: discovery::build_hash(),
+            };
+            match notice::write_notice(&state.data_dir, &notice) {
+                Ok(_) => {
+                    last.insert(fingerprint, Instant::now());
+                    let _ = audit::append(
+                        &state.data_dir,
+                        "custos.notice",
+                        serde_json::json!({
+                            "notice_id": notice.notice_id,
+                            "session_id": notice.session_id,
+                            "severity": notice.severity,
+                            "action": notice.action,
+                        }),
+                    );
+                    emitted += 1;
+                }
+                Err(error) => {
+                    warn!(%error, "could not write custos notice");
+                }
+            }
+        }
+    }
 }
 
 async fn write_core_heartbeat(state: &AppState) -> Result<()> {

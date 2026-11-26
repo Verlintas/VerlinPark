@@ -4005,6 +4005,80 @@ async fn injects_a_finalize_nudge_before_the_turn_limit() {
 }
 
 #[tokio::test]
+async fn delivers_a_sealed_custos_notice_at_the_turn_boundary() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("notice handled".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "custos notice".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    let outbox = crate::custos_notice::outbox_dir(engine.store().data_dir());
+    std::fs::create_dir_all(&outbox).unwrap();
+    let notice = vp_protocol::custos_notice::CustosNotice {
+        schema: vp_protocol::custos_notice::CUSTOS_NOTICE_SCHEMA.to_string(),
+        notice_id: format!("cn_{}", uuid::Uuid::new_v4().simple()),
+        created_at: vp_protocol::now_rfc3339(),
+        severity: "warning".to_string(),
+        session_id: session.id.clone(),
+        agent_id: None,
+        task_id: None,
+        subject: "worker-1".to_string(),
+        action: "final_notice".to_string(),
+        observed: vp_protocol::custos_notice::CustosNoticeObserved {
+            pid: 123,
+            cpu_share: 0.8,
+            rss_bytes: 1024 * 1024,
+            children: 1,
+            no_progress_secs: 620,
+            score: 94,
+            state: "suspected_stall".to_string(),
+        },
+        requested_action: "stop or reduce the workload".to_string(),
+        grace_secs: 120,
+        consequence: "none in observe-only shadow mode".to_string(),
+        reply: "forbidden".to_string(),
+        charter_hash: "sha256:charter".to_string(),
+        build_hash: "sha256:dev".to_string(),
+    };
+    std::fs::write(
+        outbox.join(format!("{}.json", notice.notice_id)),
+        serde_json::to_vec(&notice).unwrap(),
+    )
+    .unwrap();
+    service.start(&session.id, "custos notice").await.unwrap();
+    let current = wait_until_idle(&engine, &session).await;
+    assert_eq!(current.status, "idle");
+    let messages = engine.list_messages(&session.id).await.unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.role == "system" && message.content.contains("◇CUSTOS NOTICE"))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.content.contains("do not reply"))
+    );
+    assert!(
+        crate::custos_notice::delivered_dir(engine.store().data_dir())
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn stops_repeated_submit_team_plan_validation_failures() {
     let dir = TempDir::new().unwrap();
     let invalid_plan = serde_json::json!({

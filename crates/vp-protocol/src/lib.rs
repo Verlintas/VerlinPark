@@ -5,6 +5,7 @@
 //! runtime concerns.
 
 pub mod a2a;
+pub mod custos_notice;
 pub mod diagnosis;
 pub mod discovery;
 pub mod lsp;
