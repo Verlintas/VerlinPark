@@ -1,4 +1,4 @@
-# CUSTOS — accepted wordmark + animation
+# CUSTOS — accepted wordmark + animation v2
 
 Status: **design draft, no implementation**  
 Date: 2026-11-26  
@@ -6,10 +6,9 @@ Companion: `docs/CUSTOS_CHARTER_V0.md`, `docs/CUSTOS_PLAN.md`
 
 The accepted letterform is the tight four-row `Custos` wordmark. There is **no
 small diamond before the word**: the large diamond belongs to the center of the
-Custos window, and repeating it here would weaken both marks.
+Custos window.
 
-This file is pure ASCII. No Unicode box drawing, block glyphs, or `◇`
-characters.
+This file is pure ASCII. No Unicode box drawing, block glyphs, `◇`, or scanline.
 
 ## Accepted wordmark
 
@@ -22,50 +21,94 @@ characters.
 
 ## Animation principle
 
-The wordmark is an identity, not a loading spinner. The letters should not
-continuously morph, rotate, or bounce. The animation is a **terminal signal
-lock**:
+The wordmark is an identity, not a loading spinner. The letters never morph,
+rotate, or bounce. Motion is split into three moments:
 
-1. boot/reveal: a print head writes the word left to right;
-2. idle: the word is static, with a single blinking cursor at the baseline;
-3. state change: ink/glow changes; one short jitter is allowed on `CRITICAL`;
-4. `QUARANTINED` / `SIGNAL LOST`: static, no cursor, no pulse.
-
-This keeps the static frame strong and makes motion mean something.
+1. **boot** — a print head writes the word left to right (more frames, not a
+   single flash);
+2. **idle** — static letters, a slow baseline carrier, and a soft glow breath;
+3. **critical** — a short multi-frame jitter, then static. No scanline.
 
 ---
 
-## 1. Boot reveal: print head
+## 1. Boot: 8-frame print head
 
-A vertical `#` cursor sweeps left to right, revealing the word behind it. Each
-step is 80–100 ms; the whole reveal is 600–900 ms. The cursor disappears after
-the final frame.
+A vertical `|` print head sweeps left to right. Each step is ~70–80 ms; the
+whole reveal is ~600–700 ms, then a 120 ms hold.
 
-Frame 0 — empty:
-
-```text
-#
-```
-
-Frame 1 — first slice:
+### Frame 0 — empty
 
 ```text
-  ___#
- / __#
-| (__#
- \___#
+|
+|
+|
+|
 ```
 
-Frame 2 — middle:
+### Frame 1 — cut 4
 
 ```text
-  ___         _#
- / __|_  _ __| |#
-| (__| || (_-<  _#
- \___|\_,_/__/\__#
+  __|
+ / _|
+| (_|
+ \__|
 ```
 
-Frame 3 — complete:
+### Frame 2 — cut 8
+
+```text
+  ___   |
+ / __|_ |
+| (__| ||
+ \___|\_|
+```
+
+### Frame 3 — cut 12
+
+```text
+  ___       |
+ / __|_  _ _|
+| (__| || (_|
+ \___|\_,_/_|
+```
+
+### Frame 4 — cut 16
+
+```text
+  ___         _ |
+ / __|_  _ __| ||
+| (__| || (_-<  |
+ \___|\_,_/__/\_|
+```
+
+### Frame 5 — cut 20
+
+```text
+  ___         _     |
+ / __|_  _ __| |_ __|
+| (__| || (_-<  _/ _|
+ \___|\_,_/__/\__\__|
+```
+
+### Frame 6 — cut 24
+
+```text
+  ___         _         |
+ / __|_  _ __| |_ ___ __|
+| (__| || (_-<  _/ _ (_-|
+ \___|\_,_/__/\__\___/__|
+```
+
+### Frame 7 — cut 28, cursor at the end
+
+```text
+  ___         _             |
+ / __|_  _ __| |_ ___ ___   |
+| (__| || (_-<  _/ _ (_-<   |
+ \___|\_,_/__/\__\___/__/   |
+```
+
+### Frame 8 — complete, cursor gone
 
 ```text
   ___         _
@@ -74,57 +117,77 @@ Frame 3 — complete:
  \___|\_,_/__/\__\___/__/
 ```
 
-The reveal is a mask, not a rewrite: the final frame is always the exact
-accepted wordmark. If the process is interrupted, show the completed static
-frame rather than a half-written logo.
+The reveal is a mask; the final frame is always the exact accepted wordmark.
+If boot is interrupted, show frame 8, not a half-written logo.
 
 ---
 
-## 2. Idle: cursor blink
+## 2. Idle: baseline carrier + glow
 
-The wordmark is static. A single `_` cursor after the last line blinks at
-1.6 s on / 1.6 s off. This is the only idle character animation.
+The wordmark is static. A 27-character baseline carries a 3-character `===`
+segment from left to right every 6 seconds. A soft glow breathes ±8% over the
+same 6-second cycle, offset by 3 seconds.
 
-On:
+Carrier frame A:
 
 ```text
   ___         _
  / __|_  _ __| |_ ___ ___
 | (__| || (_-<  _/ _ (_-<
- \___|\_,_/__/\__\___/__/_
+ \___|\_,_/__/\__\___/__/
+ ===------------------------
 ```
 
-Off:
+Carrier frame B:
 
 ```text
   ___         _
  / __|_  _ __| |_ ___ ___
 | (__| || (_-<  _/ _ (_-<
- \___|\_,_/__/\__\___/__/ 
+ \___|\_,_/__/\__\___/__/
+ --------===----------------
 ```
 
-The trailing `_` is intentionally outside the wordmark, like a terminal prompt.
-Do not blink any letter inside the word.
+Carrier frame C:
 
-Optional slow glow: the ink brightness breathes ±8% over 6 s. No character
-changes. Reduce Motion disables both the cursor and the glow.
+```text
+  ___         _
+ / __|_  _ __| |_ ___ ___
+| (__| || (_-<  _/ _ (_-<
+ \___|\_,_/__/\__\___/__/
+ ----------------===--------
+```
+
+Carrier frame D:
+
+```text
+  ___         _
+ / __|_  _ __| |_ ___ ___
+| (__| || (_-<  _/ _ (_-<
+ \___|\_,_/__/\__\___/__/
+ ------------------------===
+```
+
+Rules:
+
+- the carrier is a **signal line**, not a progress bar; it never has a border,
+  percentage, or label;
+- the wordmark never moves during idle;
+- `WATCH` shortens the carrier loop to 4s; `DEGRADED` to 3s;
+- `CRITICAL` pauses the carrier during the jitter, then resumes at 2s;
+- `QUARANTINED` and `SIGNAL LOST` stop the carrier and the glow.
+
+This replaces the blinking cursor. If the carrier feels like too much, the
+fallback is **glow only**: same wordmark, no character motion, ±8% breathing.
 
 ---
 
-## 3. State change: ink, not movement
+## 3. CRITICAL: multi-frame jitter
 
-Keep the letterforms identical:
+The jitter is a short controlled fracture, not a loop. 7 frames at 10 fps
+(~700 ms), then static. At most two cycles per incident.
 
-- `HEALTHY`: ice cyan; cursor blink 1.6 s.
-- `WATCH`: amber; cursor blink 1.2 s; no letter movement.
-- `DEGRADED`: amber-red; cursor blink 0.9 s; one slow scanline every 8 s.
-- `CRITICAL`: red; one 2-frame row jitter, then static; scanline every 4 s.
-- `QUARANTINED`: near-black with red rim; no cursor, no pulse, no scanline.
-- `SIGNAL LOST`: dim grey; no cursor, no pulse.
-
-### CRITICAL jitter
-
-Frame A — normal:
+### Frame 1 — normal
 
 ```text
   ___         _
@@ -133,63 +196,82 @@ Frame A — normal:
  \___|\_,_/__/\__\___/__/
 ```
 
-Frame B — second line shifts one column for one frame:
+### Frame 2 — all rows right 1
 
 ```text
-  ___         _
+   ___         _
   / __|_  _ __| |_ ___ ___
+ | (__| || (_-<  _/ _ (_-<
+  \___|\_,_/__/\__\___/__/
+```
+
+### Frame 3 — all rows left 1
+
+```text
+ ___         _
+/ __|_  _ __| |_ ___ ___
+| (__| || (_-<  _/ _ (_-<
+\___|\_,_/__/\__\___/__/
+```
+
+### Frame 4 — row 2 right 2, row 3 left 1
+
+```text
+  ___         _
+   / __|_  _ __| |_ ___ ___
 | (__| || (_-<  _/ _ (_-<
  \___|\_,_/__/\__\___/__/
 ```
 
-Then back to frame A. This is the only glitch; do not loop it.
-
----
-
-## 4. Optional scanline
-
-If a scanline is preferred over the cursor, use a separate `-` row that moves
-between the wordmark rows. It never replaces a letter row.
+### Frame 5 — one substituted character
 
 ```text
   ___         _
  / __|_  _ __| |_ ___ ___
- -------------------------
+| (__| || (_#<  _/ _ (_-<
+ \___|\_,_/__/\__\___/__/
+```
+
+### Frame 6 — tail cursor
+
+```text
+  ___         _
+ / __|_  _ __| |_ ___ ___
+| (__| || (_-<  _/ _ (_-<
+ \___|\_,_/__/\__\___/__/#
+```
+
+### Frame 7 — normal, hold
+
+```text
+  ___         _
+ / __|_  _ __| |_ ___ ___
 | (__| || (_-<  _/ _ (_-<
  \___|\_,_/__/\__\___/__/
 ```
 
-Timing: one sweep every 8 s in `HEALTHY`/`WATCH`, every 4 s in `CRITICAL`.
-Do not combine the scanline with the blinking cursor; choose one idle motion.
+Do not add a scanline. The jitter is the entire critical animation.
 
 ---
 
-## Comparison
+## 4. State timing
 
-| Direction | Idle motion | Feel | Recommendation |
+| State | Boot | Idle | Critical |
 |---|---|---|---|
-| SIGNAL LOCK | cursor blink | terminal, restrained | **primary** |
-| SCAN | slow scanline | radar/instrument | alternate |
-| GLITCH | rare jitter | cyberpunk, noisy | CRITICAL only |
-| BREATH | glow only | quiet, static | Reduce Motion / low-power |
+| `HEALTHY` | 8-frame print head | carrier 6s + glow | — |
+| `WATCH` | same | carrier 4s + glow | — |
+| `DEGRADED` | same | carrier 3s + glow | — |
+| `CRITICAL` | same | carrier paused during jitter, then 2s | 7-frame jitter, max 2 cycles |
+| `QUARANTINED` | static frame | none | none |
+| `SIGNAL LOST` | static frame | none | none |
 
-## Recommendation
-
-Use **SIGNAL LOCK**:
-
-- boot: print-head reveal;
-- idle: static wordmark + blinking `_` cursor;
-- state: ink/glow only;
-- CRITICAL: one short row jitter, then static;
-- QUARANTINED / SIGNAL LOST: fully static.
-
-This is the most "sealed instrument" option and keeps the wordmark readable at
-all times. The only constant motion is a one-character cursor, which is easy to
-ignore and easy to stop for Reduce Motion.
+Reduce Motion: static wordmark, no carrier, no glow, no jitter. State color is
+the only difference.
 
 ## Implementation note
 
 Render as a `Text` layer with a fixed-width monospaced font and explicit
-`lineSpacing`. The reveal is a width mask over the final string; do not build
-the logo from per-character glyphs that can drift. The wordmark is
-`accessibilityHidden`; the status word and log carry the accessible meaning.
+`lineSpacing`. The boot reveal is a width mask over the final string; the idle
+carrier is a separate baseline row; the critical jitter is a precomputed list of
+six alternate strings. The wordmark is `accessibilityHidden`; the status word
+and log carry the accessible meaning.

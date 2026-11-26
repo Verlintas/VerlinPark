@@ -61,7 +61,7 @@
 | **Design** | [CUSTOS_PLAN.md](CUSTOS_PLAN.md) | ◇CUSTOS 讨论与 handoff：确定性四进程守护环（core/warden/anchor/sentinel）、固定宪章、只读独立窗口、单向下发 notice、双诊断包、容量自适应/负载校准、launchd/watchdog 与 signed-vault 自愈；尚未实现 |
 | **Design** | [CUSTOS_CHARTER_V0.md](CUSTOS_CHARTER_V0.md) | ◇CUSTOS Charter v0 草案：L0–L5 权力、容量归一化与工作负载校准评分、动作目录、notice 模板、无完整路径/stack sample 的诊断包、GUI 信息层级、四进程自保/自愈与残余风险；未签名、未实现 |
 | **Design** | [CUSTOS_GUI_ASCII.md](CUSTOS_GUI_ASCII.md) | ◇CUSTOS 窗口布局字符画：MONOLITH / VIGIL / REACTOR / RELIC / CATHEDRAL 五种密封仪表方向与动画帧；未实现 |
-| **Design** | [CUSTOS_WORDMARK_ASCII.md](CUSTOS_WORDMARK_ASCII.md) | CUSTOS 名称字符画：保留已接受的四行 `Custos` wordmark，不加小菱形；SIGNAL LOCK 打印头揭示、闪烁光标、状态变色与 CRITICAL 单次抖动；未实现 |
+| **Design** | [CUSTOS_WORDMARK_ASCII.md](CUSTOS_WORDMARK_ASCII.md) | CUSTOS 名称字符画：保留已接受的四行 `Custos` wordmark，不加小菱形；8 帧打印头启动、baseline carrier + glow 空闲、7 帧 CRITICAL 抖动（无扫描线）；未实现 |
 | **Reference** | [OBSCURA_ASSESSMENT.md](OBSCURA_ASSESSMENT.md) | Obscura（Rust/V8/CDP/MCP headless browser）评估：适用场景、安全约束、三种集成方案、结论为 cache 轮之后再做可选外部网页后端 |
 | **Reference** | [PRIDE_FLAGS.md](PRIDE_FLAGS.md) | Pride flag 资产来源与许可 |
 | **Reference** | [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | FlagKit 等第三方资产许可 |
