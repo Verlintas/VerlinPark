@@ -816,7 +816,8 @@ diamond status item; no stack samples/full paths.
 
 Remaining:
 
-- Which pure-ASCII wordmark to use (see `docs/CUSTOS_WORDMARK_ASCII.md`).
+- Wordmark animation: SIGNAL LOCK (print-head reveal + blinking cursor) vs
+  SCAN vs GLITCH (see `docs/CUSTOS_WORDMARK_ASCII.md`).
 - Audit-chain tamper handling: gap marker vs restored head.
 - Calibration drift: distinguish a permanently slow machine from a real stall
   without letting a poisoned baseline hide regressions.
@@ -830,23 +831,22 @@ vault/app-bundle self-heal baseline, and inbox delivery for idle-agent notices.
 The quarantine display and menu-bar diamond status item are also accepted.
 
 The main window now treats **fixed-width pure-ASCII art** as a first-class
-layer: a drawn diamond at the left of the name, character animation at 8–12
-fps, a static frame that is still readable, and no essential information that
-exists only in the art. Reduce Motion freezes the animation; VoiceOver ignores
-the art and reads the status text.
+layer, but the identity is split cleanly:
 
-There are two separate design sets:
+- the **large diamond** lives in the center of the window; it is the only
+  diamond;
+- the **`Custos` wordmark** stands alone, with no small diamond before it;
+- character animation at 8–12 fps, a static frame that is still readable, and
+  no essential information that exists only in the art.
 
-- `docs/CUSTOS_GUI_ASCII.md` — **window layout** studies: MONOLITH / VIGIL /
-  REACTOR / RELIC / CATHEDRAL. These still use box-drawing characters for
-  concept; they will be normalized to pure ASCII before implementation.
-- `docs/CUSTOS_WORDMARK_ASCII.md` — the accepted four-row `Custos` wordmark plus
-  drawn diamond marks: WIDE HASH, WIDE PLUS, WIDE DOUBLE, and the rejected
-  narrow slash for comparison. The diamond uses explicit `#`/`+` points and a
-  two-column horizontal step per row so it reads as a roughly 90-degree
-  rhombus instead of a steep `/\` spike.
+`docs/CUSTOS_GUI_ASCII.md` holds the window-layout studies. It still uses
+box-drawing characters for concept and will be normalized to pure ASCII before
+implementation. `docs/CUSTOS_WORDMARK_ASCII.md` holds the accepted four-row
+wordmark and its animation: a print-head reveal, a blinking terminal cursor,
+ink/glow state changes, and a single short jitter on `CRITICAL`.
 
-Recommended lockup: the accepted `Custos` wordmark + WIDE HASH. WIDE PLUS is the
-quiet variant; WIDE DOUBLE is for boot/large title. The selection is a design
-choice, not a runtime policy; the chosen variant will be implemented as a
-monospaced text layer with a static fallback, not as an image asset.
+Recommended wordmark animation: **SIGNAL LOCK** — print-head reveal on boot,
+then static letters with a blinking `_` cursor. SCAN is the alternate; GLITCH
+is reserved for `CRITICAL` only. The selection is a design choice, not a runtime
+policy; the wordmark will be implemented as a monospaced text layer with a
+static fallback, not as an image asset.

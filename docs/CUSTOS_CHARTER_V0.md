@@ -643,9 +643,10 @@ A sealed instrument, not a dashboard. It is an **independent window owned by
 the VerlinPark app** (like the Settings window), not a separate `.app` and not
 a panel embedded in the main Stage:
 
-- obsidian black background, thin ice lines, a drawn ASCII diamond mark at the
-  left of the name (see `docs/CUSTOS_WORDMARK_ASCII.md`);
-- `CUSTOS` and `SEALED GUARDIAN` in mono uppercase, diamond before the word;
+- obsidian black background, thin ice lines, one large ASCII diamond at the
+  center of the window; it is the only diamond in the main surface;
+- the `Custos` wordmark stands alone, with no small diamond before it;
+- `SEALED GUARDIAN` in mono uppercase below or above the wordmark;
 - one state word: `HEALTHY / WATCH / DEGRADED / CRITICAL / QUARANTINED`;
 - 5–7 integrity rings or bars: RUNTIME, DATA, LEASES, QUEUES, WORKTREES,
   BACKUP, SIGNAL;
@@ -678,6 +679,8 @@ a panel embedded in the main Stage:
   proportional fallback, no ligatures, no essential information only in art;
 - character animation runs at 8–12 fps, never faster than 1.2s per pulse and
   4s per scan; no flashing above 3 Hz;
+- the wordmark uses a print-head reveal and a blinking baseline cursor; the
+  letters themselves stay fixed, and `CRITICAL` may add one short jitter;
 - state colors: ice (healthy), amber (watch/degraded), red (critical),
   near-black (quarantined);
 - Reduce Motion freezes the static frame and disables pulse/scanline; Reduce
@@ -1018,10 +1021,10 @@ Answered in this round: capacity formulas and 5-run learning mode (yes), vault
 UX (project/task label, category, consequence, diagnostics entry), menu-bar
 diamond status item (yes), no stack samples/full paths. Remaining:
 
-1. Which diamond mark to use with the accepted `Custos` wordmark; see
-   `docs/CUSTOS_WORDMARK_ASCII.md` for WIDE HASH / WIDE PLUS / WIDE DOUBLE and
-   the rejected narrow-slash reference. Window-layout concepts remain in
-   `docs/CUSTOS_GUI_ASCII.md`.
+1. Which wordmark animation to use: SIGNAL LOCK (print-head reveal + blinking
+   cursor), SCAN, or GLITCH-on-CRITICAL; see
+   `docs/CUSTOS_WORDMARK_ASCII.md`. The wordmark itself has no small diamond;
+   the large diamond belongs to the window center.
 2. Should audit-chain tamper restore the head from anchor memory and mark a
    gap, or only flag the gap without writing a new head? Proposed: preserve
    the tampered file, write a `tamper_detected` gap marker, never fabricate

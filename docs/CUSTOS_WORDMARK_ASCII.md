@@ -1,13 +1,15 @@
-# CUSTOS — accepted wordmark + diamond mark
+# CUSTOS — accepted wordmark + animation
 
 Status: **design draft, no implementation**  
 Date: 2026-11-26  
 Companion: `docs/CUSTOS_CHARTER_V0.md`, `docs/CUSTOS_PLAN.md`
 
-The accepted letterform is the tight four-row `Custos` wordmark. This file keeps
-that wordmark unchanged and studies only the **drawn diamond mark** that goes to
-its left. Everything here is pure ASCII; no Unicode box drawing, block glyphs,
-or `◇` characters.
+The accepted letterform is the tight four-row `Custos` wordmark. There is **no
+small diamond before the word**: the large diamond belongs to the center of the
+Custos window, and repeating it here would weaken both marks.
+
+This file is pure ASCII. No Unicode box drawing, block glyphs, or `◇`
+characters.
 
 ## Accepted wordmark
 
@@ -18,152 +20,176 @@ or `◇` characters.
  \___|\_,_/__/\__\___/__/
 ```
 
-## Why the first diamond was too steep
+## Animation principle
 
-A single `/` or `\` occupies one character cell, and a terminal cell is roughly
-twice as tall as it is wide. A one-column shift per row therefore looks like a
-steep spike, not a 45-degree edge. A diamond with roughly 90-degree corners
-needs a **two-column shift per row**. The `#`/`+` points make that step explicit:
+The wordmark is an identity, not a loading spinner. The letters should not
+continuously morph, rotate, or bounce. The animation is a **terminal signal
+lock**:
 
-```text
-narrow slash (too steep)        wide step (about 45 degrees)
+1. boot/reveal: a print head writes the word left to right;
+2. idle: the word is static, with a single blinking cursor at the baseline;
+3. state change: ink/glow changes; one short jitter is allowed on `CRITICAL`;
+4. `QUARANTINED` / `SIGNAL LOST`: static, no cursor, no pulse.
 
-       /\                              #
-      /  \                           #   #
-     /    \                        #       #
-      \  /                           #   #
-       \/                              #
-```
+This keeps the static frame strong and makes motion mean something.
 
-## Diamond marks
+---
 
-### 1. WIDE HASH (recommended)
+## 1. Boot reveal: print head
 
-One character per point, two-column steps. Reads as a diamond, stays light, and
-matches the thin wordmark.
+A vertical `#` cursor sweeps left to right, revealing the word behind it. Each
+step is 80–100 ms; the whole reveal is 600–900 ms. The cursor disappears after
+the final frame.
 
-```text
-    #
-  #   #
-#       #
-  #   #
-    #
-```
-
-Lockup with the accepted wordmark:
+Frame 0 — empty:
 
 ```text
-    #
-  #   #       ___         _
-#       #    / __|_  _ __| |_ ___ ___
-  #   #     | (__| || (_-<  _/ _ (_-<
-    #        \___|\_,_/__/\__\___/__/
+#
 ```
 
-### 2. WIDE PLUS
-
-Same geometry, `+` points. Lighter and more instrument-like; good when the
-diamond should not compete with the wordmark.
+Frame 1 — first slice:
 
 ```text
-    +
-  +   +
-+       +
-  +   +
-    +
+  ___#
+ / __#
+| (__#
+ \___#
 ```
 
-Lockup:
+Frame 2 — middle:
 
 ```text
-    +
-  +   +       ___         _
-+       +    / __|_  _ __| |_ ___ ___
-  +   +     | (__| || (_-<  _/ _ (_-<
-    +        \___|\_,_/__/\__\___/__/
+  ___         _#
+ / __|_  _ __| |#
+| (__| || (_-<  _#
+ \___|\_,_/__/\__#
 ```
 
-### 3. WIDE DOUBLE
-
-Two characters per point. Heavier, more "sealed plate"; best for boot or a large
-title card, not the compact header.
+Frame 3 — complete:
 
 ```text
-    ##
-  ##  ##
-##      ##
-  ##  ##
-    ##
+  ___         _
+ / __|_  _ __| |_ ___ ___
+| (__| || (_-<  _/ _ (_-<
+ \___|\_,_/__/\__\___/__/
 ```
 
-Lockup:
+The reveal is a mask, not a rewrite: the final frame is always the exact
+accepted wordmark. If the process is interrupted, show the completed static
+frame rather than a half-written logo.
+
+---
+
+## 2. Idle: cursor blink
+
+The wordmark is static. A single `_` cursor after the last line blinks at
+1.6 s on / 1.6 s off. This is the only idle character animation.
+
+On:
 
 ```text
-    ##
-  ##  ##       ___         _
-##      ##    / __|_  _ __| |_ ___ ___
-  ##  ##     | (__| || (_-<  _/ _ (_-<
-    ##        \___|\_,_/__/\__\___/__/
+  ___         _
+ / __|_  _ __| |_ ___ ___
+| (__| || (_-<  _/ _ (_-<
+ \___|\_,_/__/\__\___/__/_
 ```
 
-### 4. NARROW SLASH (reference only)
-
-The original `/\` mark. It is clean, but too steep for a "90-degree" diamond.
-Kept here only as a comparison.
+Off:
 
 ```text
-   /\
-  /  \
- /    \
-  \  /
-   \/
+  ___         _
+ / __|_  _ __| |_ ___ ___
+| (__| || (_-<  _/ _ (_-<
+ \___|\_,_/__/\__\___/__/ 
 ```
 
-## Placement
+The trailing `_` is intentionally outside the wordmark, like a terminal prompt.
+Do not blink any letter inside the word.
 
-- Diamond always to the **left** of `Custos`, never above it.
-- The wordmark is four rows; the diamond is five rows. Align the wordmark's
-  first row with the diamond's second row so the diamond has one row of air
-  above and one row below.
-- Keep at least two spaces between the diamond's widest row and the wordmark.
-- Do not add a second diamond or a second frame around the wordmark.
+Optional slow glow: the ink brightness breathes ±8% over 6 s. No character
+changes. Reduce Motion disables both the cursor and the glow.
 
-## Animation
+---
 
-One motion language only:
+## 3. State change: ink, not movement
 
-- **Core pulse:** the top and bottom `#`/`+` points switch to `*` for one frame,
-  then back. The letters do not move.
-- **Scan:** a single `-` row crosses the wordmark once per 4 seconds. It does
-  not replace a letter row.
-- **Point travel:** for WIDE PLUS only, a `*` moves between the four points.
-  Do not use this on WIDE HASH.
+Keep the letterforms identical:
 
-Recommended: core pulse on WIDE HASH, scan on WIDE DOUBLE, no animation on WIDE
-PLUS (it is the quiet variant).
+- `HEALTHY`: ice cyan; cursor blink 1.6 s.
+- `WATCH`: amber; cursor blink 1.2 s; no letter movement.
+- `DEGRADED`: amber-red; cursor blink 0.9 s; one slow scanline every 8 s.
+- `CRITICAL`: red; one 2-frame row jitter, then static; scanline every 4 s.
+- `QUARANTINED`: near-black with red rim; no cursor, no pulse, no scanline.
+- `SIGNAL LOST`: dim grey; no cursor, no pulse.
 
-## State variants
+### CRITICAL jitter
 
-Keep the letterforms identical. Change only ink/glow:
+Frame A — normal:
 
-- `HEALTHY`: ice cyan.
-- `WATCH`: amber.
-- `DEGRADED`: amber-red.
-- `CRITICAL`: red; the diamond points may pulse once per second.
-- `QUARANTINED`: near-black fill with a red rim; no pulse.
-- `SIGNAL LOST`: dim grey; no animation.
+```text
+  ___         _
+ / __|_  _ __| |_ ___ ___
+| (__| || (_-<  _/ _ (_-<
+ \___|\_,_/__/\__\___/__/
+```
+
+Frame B — second line shifts one column for one frame:
+
+```text
+  ___         _
+  / __|_  _ __| |_ ___ ___
+| (__| || (_-<  _/ _ (_-<
+ \___|\_,_/__/\__\___/__/
+```
+
+Then back to frame A. This is the only glitch; do not loop it.
+
+---
+
+## 4. Optional scanline
+
+If a scanline is preferred over the cursor, use a separate `-` row that moves
+between the wordmark rows. It never replaces a letter row.
+
+```text
+  ___         _
+ / __|_  _ __| |_ ___ ___
+ -------------------------
+| (__| || (_-<  _/ _ (_-<
+ \___|\_,_/__/\__\___/__/
+```
+
+Timing: one sweep every 8 s in `HEALTHY`/`WATCH`, every 4 s in `CRITICAL`.
+Do not combine the scanline with the blinking cursor; choose one idle motion.
+
+---
+
+## Comparison
+
+| Direction | Idle motion | Feel | Recommendation |
+|---|---|---|---|
+| SIGNAL LOCK | cursor blink | terminal, restrained | **primary** |
+| SCAN | slow scanline | radar/instrument | alternate |
+| GLITCH | rare jitter | cyberpunk, noisy | CRITICAL only |
+| BREATH | glow only | quiet, static | Reduce Motion / low-power |
 
 ## Recommendation
 
-- **Primary:** WIDE HASH. It solves the angle, stays legible at small sizes,
-  and matches the accepted wordmark.
-- **Quiet/secondary:** WIDE PLUS.
-- **Boot/large title:** WIDE DOUBLE.
-- **Do not use:** the narrow slash diamond as the primary mark.
+Use **SIGNAL LOCK**:
+
+- boot: print-head reveal;
+- idle: static wordmark + blinking `_` cursor;
+- state: ink/glow only;
+- CRITICAL: one short row jitter, then static;
+- QUARANTINED / SIGNAL LOST: fully static.
+
+This is the most "sealed instrument" option and keeps the wordmark readable at
+all times. The only constant motion is a one-character cursor, which is easy to
+ignore and easy to stop for Reduce Motion.
 
 ## Implementation note
 
 Render as a `Text` layer with a fixed-width monospaced font and explicit
-`lineSpacing`. Measure the diamond and wordmark in the same font; if a glyph is
-missing, fall back to `#`/`+`/`-`. The wordmark is `accessibilityHidden`; the
-status word and log carry the accessible meaning.
+`lineSpacing`. The reveal is a width mask over the final string; do not build
+the logo from per-character glyphs that can drift. The wordmark is
+`accessibilityHidden`; the status word and log carry the accessible meaning.
