@@ -33,8 +33,8 @@ in-daemon module.
 - Custos-owned hash vault (`--vault-init`, `--vault-verify`,
   `--vault-repair --yes`): content-addressed binary/plist baseline, quarantine
   before explicit restore, no VerlinPark source/policy/worktree/database writes.
-  The vault manifest is explicitly unsigned/draft; automatic repair and signed
-  releases remain open.
+  The unsigned manifest is surfaced as a `vault` status dimension; automatic
+  repair and signed releases remain open.
 - 0600 Unix socket and separate `custos/discovery.json`; methods are `status`,
   `health`, `charter`, `ping`, and the explicitly consented
   `diagnostics.generate`. No TCP, token, provider key, agent tool, or state

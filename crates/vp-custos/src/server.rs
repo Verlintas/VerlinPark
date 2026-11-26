@@ -25,13 +25,16 @@ use crate::probe::{self, ProbeReport};
 use crate::process_probe::{ProcessCache, ProcessReport};
 use crate::protocol::{
     CUSTOS_PROTOCOL_VERSION, CUSTOS_VERSION, CustosRole, CustosState, Dimension, DimensionState,
-    Health, PingResult, RpcRequest, RpcResponse, Status,
+    Health, PingResult, RpcRequest, RpcResponse, Status, VaultView,
 };
 use crate::ring::{self, Heartbeat};
+use crate::vault::{self, VaultState};
 
 const PROBE_CACHE_TTL: Duration = Duration::from_secs(2);
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_REQUESTS_PER_CONNECTION: usize = 32;
+
+type VaultCache = Arc<Mutex<Option<(Instant, Option<VaultView>)>>>;
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -69,6 +72,7 @@ struct AppState {
     seq: Arc<AtomicU64>,
     cache: Arc<Mutex<Option<(Instant, ProbeReport)>>>,
     process_cache: ProcessCache,
+    vault_cache: VaultCache,
 }
 
 pub async fn run(config: ServerConfig) -> Result<()> {
@@ -104,6 +108,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         seq: Arc::new(AtomicU64::new(1)),
         cache: Arc::new(Mutex::new(None)),
         process_cache: ProcessCache::new(),
+        vault_cache: Arc::new(Mutex::new(None)),
     };
     write_core_heartbeat(&state)
         .await
@@ -243,20 +248,23 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         "status" => {
             let report = probe_cached(state).await;
             let processes = process_report(state);
+            let vault = vault_view(state);
             RpcResponse::ok(
                 request.id,
-                serde_json::to_value(build_status(state, &report, &processes))
+                serde_json::to_value(build_status(state, &report, &processes, vault.as_ref()))
                     .unwrap_or(Value::Null),
             )
         }
         "health" => {
             let report = probe_cached(state).await;
             let processes = process_report(state);
+            let vault = vault_view(state);
             let health = Health {
                 schema: crate::protocol::HEALTH_SCHEMA.to_string(),
-                status: build_status(state, &report, &processes),
+                status: build_status(state, &report, &processes, vault.as_ref()),
                 probe: report.info.clone(),
                 processes: processes.samples.clone(),
+                vault: vault.clone(),
             };
             RpcResponse::ok(
                 request.id,
@@ -356,9 +364,14 @@ async fn probe_cached(state: &AppState) -> ProbeReport {
     report
 }
 
-fn build_status(state: &AppState, report: &ProbeReport, processes: &ProcessReport) -> Status {
+fn build_status(
+    state: &AppState,
+    report: &ProbeReport,
+    processes: &ProcessReport,
+    vault: Option<&VaultView>,
+) -> Status {
     let ring = ring::snapshot(&state.data_dir);
-    let dimensions = dimensions(state, report, &ring, processes);
+    let dimensions = dimensions(state, report, &ring, processes, vault);
     let overall = overall_state(&dimensions);
     let mut counts = report.counts.clone();
     counts.processes_tracked = processes.tracked;
@@ -391,6 +404,7 @@ fn dimensions(
     report: &ProbeReport,
     ring: &crate::protocol::RingView,
     processes: &ProcessReport,
+    vault: Option<&VaultView>,
 ) -> Vec<Dimension> {
     let data_state = if !report.info.db_present {
         DimensionState::Watch
@@ -519,7 +533,77 @@ fn dimensions(
                 processes.tracked, processes.pressure, processes.shadow_stop
             ),
         },
+        Dimension {
+            key: "vault".to_string(),
+            state: vault
+                .map(|value| match value.state.as_str() {
+                    "ok" => DimensionState::Ok,
+                    "not_initialized" => DimensionState::Watch,
+                    "drift" => DimensionState::Degraded,
+                    "vault_drift" => DimensionState::Critical,
+                    _ => DimensionState::Unknown,
+                })
+                .unwrap_or(DimensionState::Unknown),
+            detail: vault
+                .map(|value| value.detail.clone())
+                .unwrap_or_else(|| "vault path unavailable".to_string()),
+        },
     ]
+}
+
+fn vault_view(state: &AppState) -> Option<VaultView> {
+    if let Ok(cache) = state.vault_cache.try_lock()
+        && let Some((at, view)) = cache.as_ref()
+        && at.elapsed() <= Duration::from_secs(30)
+    {
+        return view.clone();
+    }
+    let paths = ring::launchd_paths(&state.data_dir)?;
+    let report = vault::verify(&state.data_dir, &paths, &paths.binary).ok()?;
+    let files_ok = report
+        .files
+        .iter()
+        .filter(|file| file.target_state == "ok")
+        .count() as u32;
+    let files_drift = report
+        .files
+        .iter()
+        .filter(|file| file.target_state == "drift")
+        .count() as u32;
+    let files_missing = report
+        .files
+        .iter()
+        .filter(|file| file.target_state == "missing")
+        .count() as u32;
+    let detail = match report.state {
+        VaultState::Ok => format!("{files_ok} files verified"),
+        VaultState::NotInitialized => "vault not initialized".to_string(),
+        VaultState::Drift => format!("{files_drift} drift · {files_missing} missing"),
+        VaultState::VaultDrift => "vault baseline drift".to_string(),
+    };
+    let view = VaultView {
+        state: vault_state_str(report.state).to_string(),
+        manifest_present: std::path::Path::new(&report.manifest_path).is_file(),
+        files_ok,
+        files_drift,
+        files_missing,
+        build_hash: report.build_hash,
+        charter_hash: report.charter_hash,
+        detail,
+    };
+    if let Ok(mut cache) = state.vault_cache.try_lock() {
+        *cache = Some((Instant::now(), Some(view.clone())));
+    }
+    Some(view)
+}
+
+fn vault_state_str(state: VaultState) -> &'static str {
+    match state {
+        VaultState::Ok => "ok",
+        VaultState::NotInitialized => "not_initialized",
+        VaultState::Drift => "drift",
+        VaultState::VaultDrift => "vault_drift",
+    }
 }
 
 fn overall_state(dimensions: &[Dimension]) -> CustosState {

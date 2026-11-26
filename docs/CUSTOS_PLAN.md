@@ -883,7 +883,7 @@ ADR-0235 adds `crates/vp-custos` with `custosd` and `custos`:
 Tests: 58 unit + 4 integration + 1 module-governance; full Rust workspace
 4,765 passed / 0 failed / 6 ignored; full Swift suite 673 passed / 0 failed.
 The SwiftUI window is a normal GUI with the `Custos` wordmark as the only ASCII
-art: graphical diamond, eight dimension rows, counts, ring line, local
+art: graphical diamond, nine dimension rows (including vault/process shadows), counts, ring line, local
 diagnostics sheet, and a read-only menu-bar item that only opens/closes the
 window.
 

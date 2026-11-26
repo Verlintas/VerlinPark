@@ -86,11 +86,19 @@ async fn observe_only_status_health_charter_and_ping() {
             .iter()
             .any(|dimension| dimension["key"] == "data" && dimension["state"] == "ok")
     );
+    assert!(
+        status["dimensions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|dimension| dimension["key"] == "vault" && dimension["state"] == "watch")
+    );
 
     let health = vp_custos::client::health(&socket).await.unwrap();
     assert_eq!(health["probe"]["db_open"], true);
     assert_eq!(health["probe"]["user_version"], 1);
     assert!(!health["processes"].as_array().unwrap().is_empty());
+    assert_eq!(health["vault"]["state"], "not_initialized");
 
     let charter = vp_custos::client::charter(&socket).await.unwrap();
     assert_eq!(charter["observe_only"], true);

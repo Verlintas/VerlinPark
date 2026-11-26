@@ -199,11 +199,24 @@ pub struct ProcessPressure {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VaultView {
+    pub state: String,
+    pub manifest_present: bool,
+    pub files_ok: u32,
+    pub files_drift: u32,
+    pub files_missing: u32,
+    pub build_hash: Option<String>,
+    pub charter_hash: Option<String>,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Health {
     pub schema: String,
     pub status: Status,
     pub probe: ProbeInfo,
     pub processes: Vec<ProcessPressure>,
+    pub vault: Option<VaultView>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
