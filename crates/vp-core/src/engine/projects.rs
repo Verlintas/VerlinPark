@@ -1,6 +1,14 @@
 use super::*;
 
 impl Engine {
+    /// Release-facing Git preflight for a project root. This is separate from
+    /// `add_project` so store-level tests and fixture builders can still create
+    /// synthetic project rows.
+    pub async fn preflight_project(&self, root: &str) -> Result<()> {
+        let root = PathBuf::from(root);
+        tokio::task::spawn_blocking(move || preflight_project_root(&root)).await?
+    }
+
     pub async fn add_project(&self, root: String, name: Option<String>) -> Result<Project> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.add_project(&root, name.as_deref())).await?
@@ -787,4 +795,125 @@ fn normalize_shell_policy(mut policy: ShellPolicy) -> Result<ShellPolicy> {
     policy.network = network;
     policy.read_deny = normalized;
     Ok(policy)
+}
+
+pub(crate) fn preflight_project_root(root: &Path) -> Result<()> {
+    if !root.is_dir() {
+        bail!("project root is not a directory: {}", root.display());
+    }
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("resolving {}", root.display()))?;
+    let git = |args: &[&str]| -> Result<std::process::Output> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .output()
+            .with_context(|| "Git is required for a VerlinPark project; install Git or the Xcode command line tools")?;
+        Ok(output)
+    };
+    let inside = git(&["rev-parse", "--show-toplevel"])?;
+    if !inside.status.success() {
+        bail!(
+            "project root must be a Git repository; run `git init` and create an initial commit first"
+        );
+    }
+    let top = String::from_utf8_lossy(&inside.stdout).trim().to_string();
+    let top = PathBuf::from(top)
+        .canonicalize()
+        .with_context(|| "resolving the Git repository root")?;
+    if top != root {
+        bail!(
+            "project root must be the repository root, not a subdirectory: {}",
+            top.display()
+        );
+    }
+    let head = git(&["rev-parse", "--verify", "HEAD"])?;
+    if !head.status.success() {
+        bail!("repository has no commits; create an initial commit before adding it");
+    }
+    for (key, value) in [
+        ("user.name", "Git user.name"),
+        ("user.email", "Git user.email"),
+    ] {
+        let output = git(&["config", "--get", key])?;
+        if !output.status.success() || String::from_utf8_lossy(&output.stdout).trim().is_empty() {
+            bail!("{value} is not configured; run `git config {key} \"...\"`");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod project_preflight_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn repo() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        std::fs::write(dir.path().join("README.md"), "hello\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-q", "-m", "initial"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        dir
+    }
+
+    #[test]
+    fn accepts_a_non_empty_git_repository() {
+        let dir = repo();
+        preflight_project_root(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn rejects_a_non_git_directory() {
+        let dir = TempDir::new().unwrap();
+        let error = preflight_project_root(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("Git repository"));
+    }
+
+    #[test]
+    fn rejects_a_git_subdirectory() {
+        let dir = repo();
+        let nested = dir.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let error = preflight_project_root(&nested).unwrap_err().to_string();
+        assert!(error.contains("repository root"));
+    }
+
+    #[test]
+    fn rejects_a_repository_without_commits() {
+        let dir = TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        let error = preflight_project_root(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("no commits"));
+    }
 }

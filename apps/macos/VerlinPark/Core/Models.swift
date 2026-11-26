@@ -13,6 +13,16 @@ struct ShellPolicy: Codable, Hashable, Sendable {
         readJail: false
     )
 
+    /// First-run trust decision with the narrowest useful shell posture: no
+    /// shell network access and no reads outside the worktree, scratch, Git
+    /// metadata, and toolchain allowlist. The operator can relax it later.
+    static let hardened = ShellPolicy(
+        network: "deny",
+        readDeny: [],
+        restrictHome: true,
+        readJail: true
+    )
+
     enum CodingKeys: String, CodingKey {
         case network
         case readDeny = "read_deny"

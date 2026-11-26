@@ -1809,6 +1809,26 @@ async fn doctor_reports_missing_worktrees_and_clean_mirrors() {
             .iter()
             .any(|check| check.name == "event mirrors" && check.status == "ok")
     );
+    assert!(
+        checks
+            .iter()
+            .any(|check| check.name == "shell trust" && check.status == "warn")
+    );
+    let mut policy = engine.get_shell_policy(&session.project_id).await.unwrap();
+    policy.network = "deny".into();
+    policy.restrict_home = true;
+    policy.read_jail = true;
+    engine
+        .set_shell_policy(&session.project_id, policy)
+        .await
+        .unwrap();
+    let checks = engine.doctor_checks().await.unwrap();
+    assert!(
+        checks
+            .iter()
+            .any(|check| check.name == "shell trust" && check.status == "ok"),
+        "hardened shell policy must clear the doctor warning"
+    );
     let worktree = session.worktree.clone().unwrap();
     std::fs::remove_dir_all(&worktree).unwrap();
     let checks = engine.doctor_checks().await.unwrap();

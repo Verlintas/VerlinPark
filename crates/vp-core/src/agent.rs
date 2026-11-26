@@ -22,9 +22,9 @@ use vp_protocol::remote::{
     RemoteIntegrationResult, RemoteIntegrationVerification,
 };
 use vp_protocol::types::{
-    AgentInfo, AgentProbeResult, AgentRecord, ApprovalMode, AutoBudgetExtension, AutoBudgetPolicy,
-    BudgetMode, CapacityInfo, ConfigureAgentParams, ContextCheckpoint,
-    ContextCheckpointDetailResult, ContextCompactionSummary, ContextMeasurement,
+    AgentInfo, AgentProbeResult, AgentRecord, AgentToolProbeResult, ApprovalMode,
+    AutoBudgetExtension, AutoBudgetPolicy, BudgetMode, CapacityInfo, ConfigureAgentParams,
+    ContextCheckpoint, ContextCheckpointDetailResult, ContextCompactionSummary, ContextMeasurement,
     ContextRestorePreflight, ContextRestoreResult, ContextStructuredState, EffectReceipt,
     EffectState, IntakeDispatchResult, IntakeTask, MERGE_SOURCE_REMOTE, MergeQueueEntry,
     MergeQueueSource, OrchestrationRecovery, PlanDepartment, PlanRevisionDetailResult, PlanTask,

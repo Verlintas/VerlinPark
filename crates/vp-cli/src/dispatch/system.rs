@@ -119,7 +119,15 @@ pub(super) async fn dispatch(
         }
         Command::Info => rpc(&discovery, "server.info", json!({})).await?,
         Command::Doctor => rpc(&discovery, "server.doctor", json!({})).await?,
-        Command::ProviderTest => rpc(&discovery, "agent.probe", json!({})).await?,
+        Command::ProviderTest { tools } => {
+            let connection = rpc(&discovery, "agent.probe", json!({})).await?;
+            if tools {
+                let capability = rpc(&discovery, "agent.probe.tools", json!({})).await?;
+                json!({"connection": connection, "tools": capability})
+            } else {
+                connection
+            }
+        }
         Command::ApprovalModeSet { mode } => {
             let mode = mode.trim().to_ascii_lowercase();
             if !matches!(mode.as_str(), "smart" | "strict" | "unattended") {

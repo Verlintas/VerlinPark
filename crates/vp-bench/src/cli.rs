@@ -28,6 +28,7 @@ use crate::reliability::{
 };
 use crate::report::{BenchReport, REPORT_CAVEAT, ReportArtifacts, load_report, write_artifacts};
 use crate::runner::{BenchRunOptions, ProviderSelection, report_environment, run_scenarios};
+use crate::scale_fault::{run_fault_report, run_scale_report};
 use crate::scenario::{Availability, Scenario};
 
 #[derive(Debug, Parser)]
@@ -67,6 +68,13 @@ pub enum BenchCommand {
     /// coordination overhead over repeated deterministic trials. This is
     /// observation-only and never a merge gate.
     Reliability(ReliabilityArgs),
+    /// Deterministic 100-task plan validation and scheduled-dispatch harness.
+    /// Uses the real vp-core validator and task scheduler; no provider call.
+    Scale(ScaleArgs),
+    /// Deterministic fake-provider fault matrix at state transitions.
+    /// Provider retry/truncation/cancellation use a real AgentService session;
+    /// duplicate-tool and batch-abort cases are labeled harness models.
+    Fault,
     /// Prompt-cache benchmark: deterministic simulator or explicit live mode.
     #[command(name = "cache-bench")]
     CacheBench {
@@ -131,6 +139,13 @@ pub struct RunArgs {
     /// Override every scenario's wall-clock timeout (1-3600 seconds).
     #[arg(long)]
     pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ScaleArgs {
+    /// Worker cap used by the synthetic dispatch batches (1-10).
+    #[arg(long, default_value_t = 10)]
+    pub workers: usize,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -201,6 +216,8 @@ pub async fn execute(command: BenchCommand, json_mode: bool) -> Result<CommandOu
             allow_mismatch,
         } => compare_command(&a, &b, allow_mismatch, json_mode),
         BenchCommand::Reliability(args) => reliability_command(args, json_mode).await,
+        BenchCommand::Scale(args) => scale_command(args, json_mode).await,
+        BenchCommand::Fault => fault_command(json_mode).await,
         BenchCommand::CacheBench { command } => {
             let exit_code = crate::cache_bench::execute(command, json_mode).await?;
             Ok(CommandOutcome {
@@ -267,6 +284,80 @@ fn list_command(json_mode: bool) -> Result<CommandOutcome> {
     });
     Ok(CommandOutcome {
         exit_code: 0,
+        human,
+        json,
+    })
+}
+
+fn pass_label(passed: bool) -> &'static str {
+    if passed { "PASS" } else { "FAIL" }
+}
+
+async fn scale_command(args: ScaleArgs, json_mode: bool) -> Result<CommandOutcome> {
+    let report = run_scale_report(args.workers).await?;
+    let exit_code = if report.passed { 0 } else { 1 };
+    let mut human = format!(
+        "vp bench scale: {}\n  {} tasks / {}-worker cap / {} dependency layers / {} departments\n  {} batches, peak {}, {}/{} tasks completed\n  checks: {}/{} passed, {} failed\n  boundary: real vp-core TeamPlan validation + task scheduler projection; synthetic claim/finish (no live Worker agents)\n",
+        pass_label(report.passed),
+        report.task_count,
+        report.max_workers,
+        report.dependency_layers,
+        report.department_count,
+        report.batch_count,
+        report.peak_batch,
+        report.completed_tasks,
+        report.task_count,
+        report.checks_passed,
+        report.checks_total,
+        report.checks_failed,
+    );
+    for check in report.checks.iter().filter(|check| !check.passed) {
+        human.push_str(&format!("  FAIL {}: {}\n", check.name, check.detail));
+    }
+    let json = json_mode.then(|| {
+        json!({
+            "exit_code": exit_code,
+            "report": &report,
+        })
+    });
+    Ok(CommandOutcome {
+        exit_code,
+        human,
+        json,
+    })
+}
+
+async fn fault_command(json_mode: bool) -> Result<CommandOutcome> {
+    let report = run_fault_report().await?;
+    let exit_code = if report.passed { 0 } else { 1 };
+    let mut human = format!(
+        "vp bench fault: {}\n  {}/{} cases passed, {}/{} checks passed, {} failed\n  boundary: real AgentService runs for retry/truncation/cancellation; duplicate-tool and batch-abort cases are harness models\n",
+        pass_label(report.passed),
+        report.cases_passed,
+        report.case_count,
+        report.checks_passed,
+        report.checks_total,
+        report.checks_failed,
+    );
+    for case in &report.cases {
+        human.push_str(&format!(
+            "  {} {} [{}]\n",
+            pass_label(case.passed),
+            case.id,
+            case.boundary.as_str()
+        ));
+        for check in case.checks.iter().filter(|check| !check.passed) {
+            human.push_str(&format!("    FAIL {}: {}\n", check.name, check.detail));
+        }
+    }
+    let json = json_mode.then(|| {
+        json!({
+            "exit_code": exit_code,
+            "report": &report,
+        })
+    });
+    Ok(CommandOutcome {
+        exit_code,
         human,
         json,
     })

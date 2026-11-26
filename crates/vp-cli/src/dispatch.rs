@@ -87,7 +87,7 @@ pub(crate) async fn run_command(
         | Command::Metrics { .. }
         | Command::Info
         | Command::Doctor
-        | Command::ProviderTest
+        | Command::ProviderTest { .. }
         | Command::ApprovalModeSet { .. }
         | Command::RuntimeConfigSet { .. }
         | Command::A2aStatus

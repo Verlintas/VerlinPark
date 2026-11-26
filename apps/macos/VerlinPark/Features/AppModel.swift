@@ -758,6 +758,8 @@ final class AppModel {
     var providerBusy = false
     var providerProbeBusy = false
     var providerProbeStatus: String?
+    /// True only after a live probe succeeds for the current provider config.
+    var providerProbeSucceeded = false
     var planResumeBusy = false
     var cleanupOlderDaysText = "7"
     var cleanupDryRun = true
@@ -1963,7 +1965,7 @@ final class AppModel {
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
         panel.prompt = "Add Project"
-        panel.message = "Choose a Git repository or project folder."
+        panel.message = "Choose a Git repository with an initial commit."
         if panel.runModal() == .OK, let url = panel.url {
             await addProject(at: url)
         }
@@ -1986,6 +1988,26 @@ final class AppModel {
         }
     }
 
+    /// Apply the first-run shell trust decision to one project. This is an
+    /// explicit operator choice, not a hidden default: the wizard recommends
+    /// hardened mode and the caller can still choose standard access.
+    func applyShellTrust(projectID: String, hardened: Bool) async -> Bool {
+        guard connection == .connected else { return false }
+        isBusy = true
+        defer { isBusy = false }
+        do {
+            _ = try await core.setShellPolicy(
+                projectID: projectID,
+                policy: hardened ? .hardened : .allow
+            )
+            lastError = nil
+            return true
+        } catch {
+            handle(error)
+            return false
+        }
+    }
+
     var defaultTokenBudget: Int {
         UserDefaults.standard.object(forKey: "verlinpark.session.tokenBudget") as? Int
             ?? 200_000
@@ -2004,6 +2026,10 @@ final class AppModel {
         budgetMode: BudgetMode? = nil,
         autoBudget: AutoBudgetPolicy? = nil
     ) async -> Bool {
+        guard agentInfo?.configured == true else {
+            lastError = "Configure a model provider before starting a session."
+            return false
+        }
         guard let projectID = selectedProjectID else {
             lastError = "Choose a project first."
             return false
@@ -6502,6 +6528,7 @@ final class AppModel {
             return
         }
         providerBusy = true
+        providerProbeSucceeded = false
         defer { providerBusy = false }
 
         let typedKey = providerAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -6549,7 +6576,7 @@ final class AppModel {
             if let data = try? JSONEncoder().encode(roleModels) {
                 UserDefaults.standard.set(data, forKey: "provider.roleModels")
             }
-            providerStatus = "Connected · \(model)"
+            providerStatus = "Saved · \(model) — test the connection to finish setup"
             showToast("Provider connected", detail: model, kind: .success)
         } catch {
             providerStatus = error.localizedDescription
@@ -9958,6 +9985,7 @@ final class AppModel {
         defer { providerProbeBusy = false }
         do {
             let result = try await core.probeProvider()
+            providerProbeSucceeded = true
             let streamDetail = if let chunks = result.chunks, let firstToken = result.firstTokenMs {
                 " · \(chunks) chunks · first token \(firstToken) ms"
             } else {
@@ -9966,6 +9994,7 @@ final class AppModel {
             providerProbeStatus =
                 "\(result.provider) / \(result.model) · \(result.latencyMs) ms\(streamDetail) · \(result.text)"
         } catch {
+            providerProbeSucceeded = false
             providerProbeStatus = error.localizedDescription
             handle(error)
         }

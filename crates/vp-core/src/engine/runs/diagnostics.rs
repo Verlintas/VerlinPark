@@ -99,14 +99,26 @@ impl Engine {
     pub async fn doctor_checks(&self) -> Result<Vec<DoctorCheck>> {
         let store = self.store.clone();
         let data_dir = store.data_dir().to_path_buf();
-        let (integrity, projects, sessions) = tokio::task::spawn_blocking(move || {
-            Ok::<_, anyhow::Error>((
-                store.integrity_check()?,
-                store.list_projects()?,
-                store.list_sessions(None)?,
-            ))
-        })
-        .await??;
+        let (integrity, projects, sessions, shell_policies) =
+            tokio::task::spawn_blocking(move || {
+                let projects = store.list_projects()?;
+                let shell_policies = projects
+                    .iter()
+                    .map(|project| {
+                        store
+                            .get_shell_policy(&project.id)
+                            .map(|policy| (project.name.clone(), policy))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let sessions = store.list_sessions(None)?;
+                Ok::<_, anyhow::Error>((
+                    store.integrity_check()?,
+                    projects,
+                    sessions,
+                    shell_policies,
+                ))
+            })
+            .await??;
         let mut checks = Vec::new();
         checks.push(DoctorCheck {
             name: "database".into(),
@@ -136,6 +148,63 @@ impl Engine {
                 "{} project(s), {missing_projects} missing root(s)",
                 projects.len()
             ),
+        });
+        let git_failures = projects
+            .iter()
+            .filter_map(|project| {
+                super::super::projects::preflight_project_root(Path::new(&project.root))
+                    .err()
+                    .map(|error| format!("{}: {error:#}", project.name))
+            })
+            .collect::<Vec<_>>();
+        checks.push(DoctorCheck {
+            name: "git projects".into(),
+            status: if git_failures.is_empty() {
+                "ok"
+            } else {
+                "warn"
+            }
+            .into(),
+            detail: if git_failures.is_empty() {
+                "all project roots are non-empty Git repositories with user.name/user.email"
+                    .to_string()
+            } else {
+                format!(
+                    "{} project(s) need Git repair: {}",
+                    git_failures.len(),
+                    git_failures
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                )
+            },
+        });
+        let permissive_shell = shell_policies
+            .iter()
+            .filter(|(_, policy)| {
+                policy.network != "deny" && !policy.restrict_home && !policy.read_jail
+            })
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        checks.push(DoctorCheck {
+            name: "shell trust".into(),
+            status: if permissive_shell.is_empty() {
+                "ok"
+            } else {
+                "warn"
+            }
+            .into(),
+            detail: if permissive_shell.is_empty() {
+                "all projects use an explicit shell trust posture".to_string()
+            } else {
+                format!(
+                    "{} project(s) use permissive shell defaults (network allow, no read jail): {}. Choose hardened setup or set a project shell policy.",
+                    permissive_shell.len(),
+                    permissive_shell.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+                )
+            },
         });
         let missing_worktrees = sessions
             .iter()

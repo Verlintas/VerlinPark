@@ -20,6 +20,7 @@ pub mod office;
 pub mod process;
 pub mod project;
 pub mod recipes;
+pub mod redaction;
 pub mod remote;
 pub mod search;
 pub mod web;

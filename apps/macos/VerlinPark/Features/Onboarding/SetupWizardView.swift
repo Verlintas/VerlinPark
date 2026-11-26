@@ -12,6 +12,8 @@ struct SetupWizardView: View {
     @State private var step = 0
     @State private var selectedPreset = "deepseek"
     @State private var didLoad = false
+    @State private var allowShellAccess = false
+    @State private var applyingTrust = false
 
     private struct Preset: Identifiable {
         let id: String
@@ -81,7 +83,7 @@ struct SetupWizardView: View {
     }
 
     private var providerReady: Bool {
-        model.agentInfo?.configured == true
+        model.agentInfo?.configured == true && model.providerProbeSucceeded
     }
 
     private var projectReady: Bool {
@@ -274,6 +276,12 @@ struct SetupWizardView: View {
             if let status = model.providerProbeStatus, !status.isEmpty {
                 Text(status).font(VPTheme.mono(8)).foregroundStyle(VPTheme.textTertiary)
             }
+            if model.agentInfo?.configured == true, !model.providerProbeSucceeded {
+                Text(L10n.t("Run Save & test once so setup can verify a real response before continuing."))
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
@@ -283,7 +291,7 @@ struct SetupWizardView: View {
                 .font(VPTheme.font(14, weight: .semibold))
             Text(L10n
                 .t(
-                    "Pick a Git repository or a folder. Session worktrees are created under VerlinPark's data directory; the original checkout remains read-only to agents."
+                    "Choose a Git repository with at least one commit and configured user.name/user.email. Session worktrees are created under VerlinPark's data directory; the original checkout remains read-only to agents."
                 ))
                 .font(VPTheme.mono(8))
                 .foregroundStyle(VPTheme.textTertiary)
@@ -297,6 +305,13 @@ struct SetupWizardView: View {
                 }
             }
             .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
+
+            if let error = model.lastError, !error.isEmpty {
+                Text(error)
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             if model.projects.isEmpty {
                 Text(L10n.t("No project yet."))
@@ -324,6 +339,32 @@ struct SetupWizardView: View {
                     .background(VPTheme.surface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                 }
             }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Toggle(isOn: $allowShellAccess) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(allowShellAccess
+                            ? L10n.t("Standard shell access")
+                            : L10n.t("Hardened shell (recommended)"))
+                            .font(VPTheme.font(10.5, weight: .medium))
+                        Text(allowShellAccess
+                            ? L10n
+                            .t(
+                                "Shell may use the network and read outside the worktree. Choose this only when the repository is trusted and builds need it."
+                            )
+                            : L10n
+                            .t(
+                                "Shell network is denied, and reads outside the worktree, scratch, Git metadata, and toolchain allowlist are denied. You can relax this later in project settings."
+                            ))
+                            .font(VPTheme.mono(7.5))
+                            .foregroundStyle(VPTheme.textTertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .toggleStyle(.switch)
+            }
+            .padding(10)
+            .background(VPTheme.surface, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
         }
     }
 
@@ -341,6 +382,12 @@ struct SetupWizardView: View {
             VStack(alignment: .leading, spacing: 6) {
                 summaryRow(providerReady, L10n.t("Model provider"))
                 summaryRow(projectReady, L10n.t("Project"))
+                summaryRow(
+                    projectReady,
+                    allowShellAccess
+                        ? L10n.t("Shell trust: standard access")
+                        : L10n.t("Shell trust: hardened")
+                )
                 summaryRow(true, L10n.t("Smart approvals · Verifier gate · deterministic Integrator"))
             }
         }
@@ -362,7 +409,12 @@ struct SetupWizardView: View {
                 advance()
             }
             .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
-            .disabled(step == 1 && !providerReady)
+            .disabled(
+                applyingTrust
+                    || (step == 1 && !providerReady)
+                    || (step == 2 && !projectReady)
+                    || (step == 3 && (!providerReady || !projectReady))
+            )
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
@@ -414,14 +466,28 @@ struct SetupWizardView: View {
         case 1:
             step = 2
         case 2:
+            guard projectReady else { return }
             step = 3
         default:
+            guard providerReady, projectReady else { return }
             finish()
         }
     }
 
     private func finish() {
-        onFinish()
-        dismiss()
+        guard !applyingTrust, let project = model.selectedProject ?? model.projects.first else {
+            return
+        }
+        applyingTrust = true
+        Task {
+            let applied = await model.applyShellTrust(
+                projectID: project.id,
+                hardened: !allowShellAccess
+            )
+            applyingTrust = false
+            guard applied else { return }
+            onFinish()
+            dismiss()
+        }
     }
 }

@@ -52,3 +52,9 @@ lint:
 clean:
     cargo clean
     rm -rf apps/macos/build apps/macos/VerlinPark.xcodeproj
+
+release-preflight:
+    ./scripts/release-preflight.sh full
+
+backup-drill:
+    ./scripts/backup-restore-drill.sh

@@ -105,16 +105,42 @@ pub(super) async fn dispatch(
 ) -> Result<Option<Value>> {
     let value = match command {
         Command::Projects => rpc(&discovery, "project.list", json!({})).await?,
-        Command::ProjectAdd { path, name } => {
+        Command::ProjectAdd {
+            path,
+            name,
+            hardened_shell,
+        } => {
             let root = path
                 .canonicalize()
                 .with_context(|| format!("resolving {}", path.display()))?;
-            rpc(
+            let project = rpc(
                 &discovery,
                 "project.add",
                 json!({"root": root, "name": name}),
             )
-            .await?
+            .await?;
+            if hardened_shell {
+                let project_id = project["id"]
+                    .as_str()
+                    .context("project.add did not return an id")?;
+                let current = rpc(
+                    &discovery,
+                    "project.shell_policy.get",
+                    json!({"project_id": project_id}),
+                )
+                .await?;
+                let mut policy = current["policy"].clone();
+                policy["network"] = json!("deny");
+                policy["restrict_home"] = json!(true);
+                policy["read_jail"] = json!(true);
+                rpc(
+                    &discovery,
+                    "project.shell_policy.set",
+                    json!({"project_id": project_id, "policy": policy}),
+                )
+                .await?;
+            }
+            project
         }
         Command::ProjectBudget { project } => {
             rpc(

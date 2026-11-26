@@ -1104,26 +1104,62 @@ fn redact_secrets(text: &str) -> String {
     static ASSIGNMENT: OnceLock<Regex> = OnceLock::new();
     static BEARER: OnceLock<Regex> = OnceLock::new();
     static URL_USERINFO: OnceLock<Regex> = OnceLock::new();
+    static URL_QUERY: OnceLock<Regex> = OnceLock::new();
+    static COOKIE_QUOTED: OnceLock<Regex> = OnceLock::new();
+    static COOKIE_LINE: OnceLock<Regex> = OnceLock::new();
+    static QUOTED_PAIR: OnceLock<Regex> = OnceLock::new();
     static TOKEN_SHAPE: OnceLock<Regex> = OnceLock::new();
+    static JWT_SHAPE: OnceLock<Regex> = OnceLock::new();
     let assignment = ASSIGNMENT.get_or_init(|| {
         Regex::new(
-            r"(?i)\b(authorization|token|access[_-]?token|api[_-]?key|secret|password|passwd|credential)\b\s*[:=]\s*(?:bearer\s+)?[^\s,;]+",
+            r"(?i)\b(authorization|proxy[_-]?authorization|token|access[_-]?token|refresh[_-]?token|session[_-]?token|api[_-]?key|secret|client[_-]?secret|password|passwd|credential|credentials|signature|private[_-]?key)\b\s*[:=]\s*(?:bearer\s+)?[^\s,;&]+",
         )
         .expect("validated secret assignment regex")
     });
     let bearer = BEARER
-        .get_or_init(|| Regex::new(r"(?i)\bbearer\s+[^\s,;]+").expect("validated bearer regex"));
+        .get_or_init(|| Regex::new(r"(?i)\bbearer\s+[^\s,;&]+").expect("validated bearer regex"));
     let url_userinfo = URL_USERINFO.get_or_init(|| {
         Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s@]+@").expect("validated URL userinfo regex")
     });
+    let url_query = URL_QUERY.get_or_init(|| {
+        Regex::new(
+            r"(?i)([?&](?:token|access[_-]?token|refresh[_-]?token|session[_-]?token|api[_-]?key|apikey|key|secret|client[_-]?secret|password|passwd|signature|credential|auth|authorization)=)([^&#\s]*)",
+        )
+        .expect("validated URL query secret regex")
+    });
+    let cookie_quoted = COOKIE_QUOTED.get_or_init(|| {
+        Regex::new(r#"(?i)(['"`])((?:set-)?cookie\s*:\s*)[^'"`\r\n]+"#)
+            .expect("validated quoted cookie regex")
+    });
+    let cookie_line = COOKIE_LINE.get_or_init(|| {
+        Regex::new(r"(?im)^([ \t]*)((?:set-)?cookie\s*:\s*)[^\r\n]+")
+            .expect("validated cookie line regex")
+    });
+    let quoted_pair = QUOTED_PAIR.get_or_init(|| {
+        Regex::new(
+            r#"(?i)("(?:authorization|proxy[_-]?authorization|cookie|set-cookie|password|passwd|secret|client[_-]?secret|token|access[_-]?token|refresh[_-]?token|session[_-]?token|api[_-]?key|apikey|private[_-]?key|credential|credentials|signature)"\s*:\s*)("[^"]*")"#,
+        )
+        .expect("validated quoted credential pair regex")
+    });
     let token_shape = TOKEN_SHAPE.get_or_init(|| {
-        Regex::new(r"\b(sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9-]{8,}|AKIA[0-9A-Z]{12,}|ATATT[A-Za-z0-9_=-]{8,}|ATBB[A-Za-z0-9_=-]{8,})\b")
+        Regex::new(r"\b(sk-[A-Za-z0-9_-]{8,}|sk_live_[A-Za-z0-9]{8,}|sk_test_[A-Za-z0-9]{8,}|ghp_[A-Za-z0-9]{8,}|gh[ousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9-]{8,}|AKIA[0-9A-Z]{12,}|ATATT[A-Za-z0-9_=-]{8,}|ATBB[A-Za-z0-9_=-]{8,}|vpg_[A-Za-z0-9_-]{8,}|glpat-[A-Za-z0-9_-]{8,})\b")
             .expect("validated token shape regex")
     });
-    let redacted = assignment.replace_all(text, "$1=[redacted]");
-    let redacted = bearer.replace_all(&redacted, "Bearer [redacted]");
+    let jwt_shape = JWT_SHAPE.get_or_init(|| {
+        Regex::new(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")
+            .expect("validated JWT shape regex")
+    });
+    // Query values are redacted first so the generic assignment pass cannot
+    // swallow later query parameters such as `&keep=1`.
+    let redacted = url_query.replace_all(text, "${1}[redacted]");
     let redacted = url_userinfo.replace_all(&redacted, "$1[redacted]@");
-    token_shape
+    let redacted = cookie_quoted.replace_all(&redacted, "$1$2[redacted]");
+    let redacted = cookie_line.replace_all(&redacted, "$1$2[redacted]");
+    let redacted = quoted_pair.replace_all(&redacted, r#"$1"[redacted]""#);
+    let redacted = assignment.replace_all(&redacted, "$1=[redacted]");
+    let redacted = bearer.replace_all(&redacted, "Bearer [redacted]");
+    let redacted = token_shape.replace_all(&redacted, "[redacted-token]");
+    jwt_shape
         .replace_all(&redacted, "[redacted-token]")
         .to_string()
 }

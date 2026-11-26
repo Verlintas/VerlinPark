@@ -21,6 +21,7 @@ pub mod provider;
 pub mod reliability;
 pub mod report;
 pub mod runner;
+pub mod scale_fault;
 pub mod scenario;
 
 pub use cache_bench::{
@@ -58,6 +59,10 @@ pub use report::{
     load_report, parse_report, write_artifacts,
 };
 pub use runner::{BenchRunOptions, ProviderSelection, run_scenarios};
+pub use scale_fault::{
+    BenchCheck, FaultBoundary, FaultCase, FaultReport, SCALE_FAULT_SCHEMA, SCALE_TASK_COUNT,
+    ScaleBatch, ScaleReport, run_fault_report, run_scale_report,
+};
 pub use scenario::{
     Availability, DirectTask, ExpectedMerges, FixtureKind, PlanSpec, PlanTaskSpec, Requirements,
     Scenario, ScenarioConfig, VerifierRequirement,

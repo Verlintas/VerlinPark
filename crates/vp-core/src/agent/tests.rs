@@ -7232,6 +7232,47 @@ async fn probes_the_configured_provider() {
 }
 
 #[tokio::test]
+async fn tool_probe_requires_the_expected_tool_call() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::ToolCall(vp_providers::ToolCall {
+                id: "probe-1".into(),
+                name: "probe_echo".into(),
+                arguments: r#"{"value":"ok"}"#.into(),
+            }),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (_engine, service, _project) = test_service_with_provider(&dir, provider);
+    let result = service.probe_tool_calling().await.unwrap();
+    assert!(result.tool_calling);
+    assert_eq!(result.tool_name.as_deref(), Some("probe_echo"));
+    assert_eq!(
+        result.arguments_preview.as_deref(),
+        Some(r#"{"value":"ok"}"#)
+    );
+    assert!(result.done);
+    assert!(result.note.contains("expected tool call"));
+}
+
+#[tokio::test]
+async fn tool_probe_reports_text_only_providers() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![vec![
+            StreamEvent::TextDelta("OK".into()),
+            StreamEvent::Done,
+        ]])),
+    });
+    let (_engine, service, _project) = test_service_with_provider(&dir, provider);
+    let result = service.probe_tool_calling().await.unwrap();
+    assert!(!result.tool_calling);
+    assert!(result.tool_name.is_none());
+    assert!(result.note.contains("no tool call"));
+}
+
+#[tokio::test]
 async fn runs_a_plan_through_the_openai_http_adapter() {
     use vp_providers::OpenAiCompatibleProvider;
     use wiremock::matchers::{method, path};

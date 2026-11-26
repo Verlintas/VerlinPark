@@ -31,6 +31,29 @@ fn approval_mode_from_env() -> ApprovalMode {
     }
 }
 
+fn provider_env_is_usable(base_url: Option<&str>, api_key: Option<&str>) -> bool {
+    if base_url.is_none() && api_key.is_none() {
+        return false;
+    }
+    !base_url.is_some_and(|url| !is_loopback_url(url)) || api_key.is_some()
+}
+
+fn is_loopback_url(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    let Some(rest) = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    if authority.starts_with("[::1]") || authority == "::1" {
+        return true;
+    }
+    let host = authority.split(':').next().unwrap_or(authority);
+    matches!(host, "localhost" | "127.0.0.1")
+}
+
 impl AgentService {
     pub fn from_env(engine: Engine) -> Self {
         let base_url = env::var("VERLINPARK_BASE_URL")
@@ -38,12 +61,19 @@ impl AgentService {
             .or_else(|| env::var("OPENAI_BASE_URL").ok());
         let api_key = env::var("VERLINPARK_API_KEY")
             .ok()
-            .or_else(|| env::var("OPENAI_API_KEY").ok());
+            .or_else(|| env::var("OPENAI_API_KEY").ok())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         let model = env::var("VERLINPARK_MODEL")
             .ok()
             .or_else(|| env::var("OPENAI_MODEL").ok());
 
-        if base_url.is_none() && api_key.is_none() {
+        if !provider_env_is_usable(base_url.as_deref(), api_key.as_deref()) {
+            if base_url.as_deref().is_some_and(|url| !is_loopback_url(url)) {
+                tracing::warn!(
+                    "remote provider is missing an API key; refusing to report it as configured"
+                );
+            }
             return Self::unconfigured(engine);
         }
 
@@ -489,6 +519,126 @@ impl AgentService {
             text: truncate(&text),
         })
     }
+
+    /// Explicit tool-calling capability probe. A text-only [`Self::probe`]
+    /// cannot prove that an endpoint accepts `tools`, so this method spends one
+    /// small provider call and reports whether the model emitted the expected
+    /// tool call. It never executes a tool.
+    pub async fn probe_tool_calling(&self) -> Result<AgentToolProbeResult> {
+        let config = self
+            .config
+            .read()
+            .ok()
+            .and_then(|config| config.as_ref().cloned())
+            .ok_or_else(|| anyhow!("agent provider is not configured"))?;
+        let started = std::time::Instant::now();
+        let request = ChatRequest {
+            model: config.model.clone(),
+            messages: vec![ChatMessage::user(
+                "Call the probe_echo tool exactly once with value \"ok\". Do not answer with text.",
+            )],
+            system: Some(
+                "You are a tool-calling capability probe. You must use the provided tool."
+                    .to_string(),
+            ),
+            system_stable_prefix: None,
+            system_sections: Vec::new(),
+            tail_sections: Vec::new(),
+            cache: None,
+            max_tokens: Some(config.max_tokens.unwrap_or(1024).clamp(256, 1024)),
+            temperature: Some(0.0),
+            tools: vec![ToolSchema {
+                name: "probe_echo".into(),
+                description: "Release capability probe. Echo the provided value.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "value": {
+                            "type": "string",
+                            "description": "The value to echo."
+                        }
+                    },
+                    "required": ["value"],
+                    "additionalProperties": false
+                }),
+            }],
+        };
+        let mut stream = timeout(
+            Duration::from_secs(60),
+            config.provider.stream_chat(request),
+        )
+        .await
+        .map_err(|_| anyhow!("provider tool probe timed out"))?
+        .context("starting provider tool probe")?;
+        let mut text = String::new();
+        let mut usage = (0u64, 0u64);
+        let mut chunks = 0u32;
+        let mut first_token_ms = 0u64;
+        let mut done = false;
+        let mut tool_name: Option<String> = None;
+        let mut arguments_preview: Option<String> = None;
+        while let Some(item) = timeout(Duration::from_secs(60), stream.next())
+            .await
+            .map_err(|_| anyhow!("provider tool probe stream timed out"))?
+        {
+            match item? {
+                StreamEvent::TextDelta(delta) => {
+                    if !delta.is_empty() {
+                        if chunks == 0 {
+                            first_token_ms =
+                                started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                        }
+                        chunks = chunks.saturating_add(1);
+                        text.push_str(&delta);
+                    }
+                }
+                StreamEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                    ..
+                } => {
+                    usage.0 = usage.0.saturating_add(input_tokens as u64);
+                    usage.1 = usage.1.saturating_add(output_tokens as u64);
+                }
+                StreamEvent::ToolCall(call) => {
+                    if chunks == 0 && first_token_ms == 0 {
+                        first_token_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                    }
+                    if tool_name.is_none() {
+                        tool_name = Some(call.name.clone());
+                        arguments_preview = Some(truncate_to(&call.arguments, 512));
+                    }
+                }
+                StreamEvent::Done => done = true,
+            }
+        }
+        let tool_calling = tool_name.as_deref() == Some("probe_echo");
+        let note = if tool_calling {
+            "provider emitted the expected tool call".to_string()
+        } else if tool_name.is_some() {
+            "provider emitted a tool call with an unexpected name".to_string()
+        } else if !text.trim().is_empty() {
+            "provider returned text but no tool call; tool calling may be unsupported or disabled"
+                .to_string()
+        } else {
+            "provider returned no text and no tool call".to_string()
+        };
+        Ok(AgentToolProbeResult {
+            provider: config.provider_name,
+            model: config.model,
+            latency_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            first_token_ms,
+            chunks,
+            done,
+            input_tokens: usage.0,
+            output_tokens: usage.1,
+            tool_calling,
+            tool_name,
+            arguments_preview,
+            text: truncate_to(&text, 512),
+            note,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -503,5 +653,37 @@ mod approval_mode_tests {
             resolve_approval_mode(Some("unattended")),
             ApprovalMode::Unattended
         );
+    }
+}
+
+#[cfg(test)]
+mod provider_preflight_tests {
+    use super::is_loopback_url;
+
+    #[test]
+    fn identifies_loopback_endpoints() {
+        assert!(is_loopback_url("http://127.0.0.1:11434/v1"));
+        assert!(is_loopback_url("http://localhost:1234/v1"));
+        assert!(is_loopback_url("http://[::1]:8080/v1"));
+        assert!(!is_loopback_url("https://api.deepseek.com"));
+        assert!(!is_loopback_url("https://example.com/v1"));
+    }
+
+    #[test]
+    fn remote_provider_requires_an_api_key() {
+        assert!(super::provider_env_is_usable(
+            Some("http://127.0.0.1:11434/v1"),
+            None
+        ));
+        assert!(super::provider_env_is_usable(
+            Some("https://api.deepseek.com"),
+            Some("key")
+        ));
+        assert!(!super::provider_env_is_usable(
+            Some("https://api.deepseek.com"),
+            None
+        ));
+        assert!(!super::provider_env_is_usable(None, None));
+        assert!(super::provider_env_is_usable(None, Some("key")));
     }
 }

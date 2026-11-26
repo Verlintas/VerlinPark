@@ -1,10 +1,44 @@
 # VerlinPark 进度
 
-> 最后更新：2026-11-26
+> 最后更新：2026-11-27
 > 当前阶段：M2 四层 runtime + M2.5 硬化 + Merge Queue/Integrator/Retry/Conflict Resolve + Opt-in Auto-Resolve + Global Session Queue/Scope Locks + Global Worker/Labour Capacity + Per-role Models/USD/Time Budgets + Per-call Usage Ledger + Task/Department Budgets + Mailbox Retention + Content-Addressed Artifacts + Typed Mailbox/Binary Artifacts/GC + Landing/PR + Session 协作式 Pause/Resume + Shell 沙箱/Policy + Black Crystal Glass UI + EN/CN-S localization + Workspace Shell 硬化 + 多智能体编排控制器/重试策略/持久协调投影/计划修订/会话租约 + 默认开启的 standalone task inbox/autopilot + 懒加载文件树/内容搜索 + 项目知识源/引用 + 项目 skill packs + artifact versions/idempotent publication + deterministic agent tooling (atomic patch/project task/git/code intelligence/process/local HTTP) + optional LSP/web search/PDF/image/office-document/data readers/runtime introspection + sandboxed WKWebView browser/ComputerLease + cache-aware long-task telemetry/stable prompt prefix + operator steering/task progress ledger + policy-gated stall recovery/deferred continuations + evidence-backed project memory v2/long-task operator console + memory conflict review/health/verifier capture + daemon Prometheus metrics/recurring continuations/Gitea-Forgejo PR/rich artifact preview/backup-restore + efficiency playbook E1-E4/cache telemetry/read-only Scout/idempotent operations + durable run journal/crash resume/remote SSH workspaces/project programs/native macOS computer control + tool-output paging/compaction budget/cross-process lease fencing/hybrid memory/cost-per-solved-task bench + context checkpoint/restore/ACP HTTP-WS/IVF ANN memory/encrypted incremental backup + cache-first prompt sections/TTL/warm-plan-audit + unified GUI lease/queue/snapshot generations/stale refs + uniform tool errors/recipes/activity + LSP-first code intelligence + deterministic Worker/Labour scaling + durable process supervisor + semantic project-source index + remote bundle integration + critical-path budget governor + approval templates/dedup/attention + test-result cache/impact map + precise preemption/deadlines + multi-path budget fairness + signed/rotatable backups + source ANN/rerank/expansion + safe archives/media + Bitbucket Cloud forge + backup revocation/rekey/portable anchor + LaunchAgent boot persistence/GUI retention + remote helper bootstrap/test evidence + cache-lossless instruction store/append-only/tool bundles/epochs/benchmark + task contracts/intent authorization/MCP schema pins + effect receipts/postconditions + external gates/durable waits + runtime pinning/controller replay + reliability/OTel + project-scoped identities S1–S8 + failure attribution/cascade + production hardening rounds 1–3 (ADR-0213/0214/0215) + C7 bounded fan-out (ADR-0216) + C8 tool search v2 (ADR-0217) + C9 MCP async tasks (ADR-0218) + C10 Code Mode (ADR-0219) + C11 loopback A2A (ADR-0221) + C12 advisory progress ledger (ADR-0220) + M3.1 store split 已跑通 + Run Contract R3a allocation preview/R3b runtime envelope reallocation/explicit envelope persistence/R4a trade-off preview + opt-in one-shot auto rescue
 > 审计与优先级：[AUDIT.md](AUDIT.md)<br>
 > Agent 工具路线：[TOOLING_ROADMAP.md](TOOLING_ROADMAP.md)<br>
 > 文档索引：[README.md](README.md)
+
+---
+
+## 2026-11-27 V1 release hardening batch
+
+- Daemon `project.add` now runs a Git preflight: repository root (not a
+  subdirectory), at least one commit, and `user.name`/`user.email`; doctor
+  reports `git projects`.
+- Remote provider configuration without an API key no longer reports
+  `configured`; loopback endpoints remain keyless. A new
+  `agent.probe.tools` / `vp provider-test --tools` sends one `probe_echo` tool
+  request and reports real tool-calling capability without executing a tool.
+- First-run setup requires a project, a successful live probe, and an explicit
+  shell trust decision. Hardened mode (network deny, HOME/volume read jail) is
+  the recommended default; `vp project-add --hardened-shell` mirrors it. New
+  Session creation is blocked until a provider is configured; doctor warns
+  while a project uses permissive shell defaults.
+- `scripts/backup-restore-drill.sh` / `just backup-drill` seeds a real daemon
+  data directory, adds a Git project via RPC, and verifies v1 ZIP plus
+  signed/encrypted repository backup, `backup-verify`, restore, and project-row
+  equality. `just release-preflight` includes it.
+- `vp bench scale` validates and completes a 100-task/10-Worker plan through the
+  real TeamPlan validator and task scheduler projection; `vp bench fault` runs
+  three fake-provider runtime faults (pre-output failure, truncation,
+  cancellation) plus explicitly labeled duplicate-replay and batch-abort harness
+  models. This is CI-scale structural evidence, not live 10-Worker/soak proof.
+- Deterministic persistence-boundary redaction removes secret-like headers,
+  bearer/JWT/provider tokens, URL query credentials, and assignment-shaped
+  values from tool and approval payloads while leaving execution inputs intact.
+
+Remaining honest gaps: no live tool-calling probe in this workspace yet, no
+real-machine Keychain/TCC pass, no live multi-Worker/merge-conflict/daemon
+restart/72-hour soak evidence, and release signing/notarization plus a real
+CUSTOS ring install remain open.
 
 ---
 

@@ -107,6 +107,10 @@ pub(super) async fn handle(
             Ok(result) => RpcResponse::success(id, result),
             Err(error) => internal_error(id, error),
         },
+        "agent.probe.tools" => match state.agent.probe_tool_calling().await {
+            Ok(result) => RpcResponse::success(id, result),
+            Err(error) => internal_error(id, error),
+        },
         "agent.list" => match parse_params::<AgentListParams>(request.params) {
             Ok(params) => match state.engine.list_agents(&params.session_id).await {
                 Ok(agents) => RpcResponse::success(id, AgentListResult { agents }),

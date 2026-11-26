@@ -462,8 +462,9 @@ impl Engine {
         &self,
         session_id: &str,
         kind: &str,
-        payload: serde_json::Value,
+        mut payload: serde_json::Value,
     ) -> Result<Event> {
+        apply_event_persistence_redaction(kind, &mut payload);
         let store = self.store.clone();
         let session_id = session_id.to_string();
         let kind = kind.to_string();
@@ -472,6 +473,18 @@ impl Engine {
                 .await??;
         let _ = self.events.send(event.clone());
         Ok(event)
+    }
+}
+
+/// Sanitize only event kinds that persist tool input/output or approval input.
+/// Agent messages, file content stored by dedicated tools, and journal/effect
+/// inputs are deliberately outside this filter.
+fn apply_event_persistence_redaction(kind: &str, payload: &mut serde_json::Value) {
+    if matches!(
+        kind,
+        "tool.started" | "tool.finished" | "approval.created" | "approval.requested"
+    ) {
+        crate::tooling::redaction::redact_persisted_payload(payload);
     }
 }
 

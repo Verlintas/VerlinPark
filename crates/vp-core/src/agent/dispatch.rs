@@ -159,7 +159,7 @@ pub(super) fn tool_finished_payload(
     approval_wait_ms: Option<u64>,
 ) -> serde_json::Value {
     let failure = output.failure.as_ref();
-    json!({
+    let mut payload = json!({
         "tool_call_id": tool_call_id,
         "name": name,
         "output": crate::tools::truncate(output.content.clone()),
@@ -180,7 +180,12 @@ pub(super) fn tool_finished_payload(
         "approval_risk": approval_risk.map(RiskLevel::as_str),
         "approval_mode": approval_mode.as_str(),
         "approval_wait_ms": approval_wait_ms.map(|wait| wait.min(86_400_000)),
-    })
+    });
+    // The journal completion path appends this payload directly instead of
+    // going through `Engine::append_event`, so redact it here as well. The
+    // filter is idempotent for the normal event path.
+    crate::tooling::redaction::redact_persisted_payload(&mut payload);
+    payload
 }
 
 pub(super) struct ToolAuthorization {

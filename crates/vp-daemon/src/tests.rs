@@ -18,6 +18,9 @@ use vp_store::Store;
 use crate::AppState;
 use crate::backup_status::backup_status_in;
 use crate::dispatch::dispatch;
+
+#[cfg(test)]
+mod project_preflight_tests;
 use crate::errors::{
     coordination_error, diagnosis_error, identity_error, otel_error, runtime_pin_error,
     workspace_error,
@@ -1101,7 +1104,7 @@ mod protocol_transport_tests {
         }
     }
 
-    fn empty_state() -> (TempDir, AppState) {
+    pub(super) fn empty_state() -> (TempDir, AppState) {
         let data = TempDir::new().unwrap();
         let engine = Engine::new(Store::open(data.path()).unwrap());
         let agent = AgentService::unconfigured(engine.clone());

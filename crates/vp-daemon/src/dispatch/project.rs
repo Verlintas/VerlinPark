@@ -7,10 +7,15 @@ pub(super) async fn handle(
 ) -> RpcResponse {
     match request.method.as_str() {
         "project.add" => match parse_params::<AddProjectParams>(request.params) {
-            Ok(params) => match state.engine.add_project(params.root, params.name).await {
-                Ok(project) => RpcResponse::success(id, project),
-                Err(error) => internal_error(id, error),
-            },
+            Ok(params) => {
+                if let Err(error) = state.engine.preflight_project(&params.root).await {
+                    return internal_error(id, error);
+                }
+                match state.engine.add_project(params.root, params.name).await {
+                    Ok(project) => RpcResponse::success(id, project),
+                    Err(error) => internal_error(id, error),
+                }
+            }
             Err(response) => response_with_id(id, response),
         },
         "project.list" => match state.engine.list_projects().await {

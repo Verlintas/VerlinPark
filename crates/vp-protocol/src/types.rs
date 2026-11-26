@@ -9728,6 +9728,32 @@ pub struct AgentProbeResult {
     pub text: String,
 }
 
+/// Explicit capability probe for provider tool calling. It is separate from
+/// [`AgentProbeResult`] because it spends one extra provider call; text-only
+/// connectivity probes do not imply that an endpoint supports tools.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct AgentToolProbeResult {
+    pub provider: String,
+    pub model: String,
+    pub latency_ms: u64,
+    pub first_token_ms: u64,
+    pub chunks: u32,
+    pub done: bool,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// True only when the model emitted the expected probe tool call.
+    pub tool_calling: bool,
+    pub tool_name: Option<String>,
+    /// Bounded preview of the tool arguments. It is provider output, not a
+    /// secret-bearing user payload.
+    pub arguments_preview: Option<String>,
+    /// Any assistant text returned alongside the call, bounded.
+    pub text: String,
+    /// Human-readable interpretation for the release check.
+    pub note: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapacityInfo {
     #[serde(default)]

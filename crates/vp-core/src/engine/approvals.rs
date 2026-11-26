@@ -3,7 +3,15 @@ use super::*;
 impl Engine {
     pub async fn list_approvals(&self, session_id: Option<String>) -> Result<Vec<Approval>> {
         let store = self.store.clone();
-        tokio::task::spawn_blocking(move || store.list_approvals(session_id.as_deref())).await?
+        let mut approvals =
+            tokio::task::spawn_blocking(move || store.list_approvals(session_id.as_deref()))
+                .await??;
+        // New rows are redacted before insert. This read-side pass also hides
+        // credential-like input persisted by an older build or imported bundle.
+        for approval in &mut approvals {
+            crate::tooling::redaction::redact_persisted_payload(&mut approval.input);
+        }
+        Ok(approvals)
     }
 
     pub async fn list_approval_grants(&self, project_id: &str) -> Result<Vec<ApprovalGrant>> {
@@ -181,6 +189,9 @@ impl Engine {
             .and_then(serde_json::Value::as_str)
             .and_then(|task_id| self.store.approval_task_priority(session_id, task_id).ok())
             .unwrap_or(0);
+        // Hash and dedup from the real input so identical calls still coalesce.
+        // The store row/event gets a redacted copy; evaluation already ran on
+        // the real value before this request was created.
         let scope_hash = crate::approvals::approval_scope_hash(&input);
         let dedup_key = crate::approvals::approval_dedup_key(
             session_id,
@@ -189,6 +200,7 @@ impl Engine {
             &scope_hash,
             approval_risk.as_deref().unwrap_or("unknown"),
         );
+        let input_for_store = crate::tooling::redaction::redact_persisted_value(&input);
         let now = time::OffsetDateTime::now_utc();
         let expires_at = policy
             .enabled
@@ -216,7 +228,7 @@ impl Engine {
                 &session_id_owned,
                 &tool_call_id,
                 &tool,
-                &input,
+                &input_for_store,
                 agent_for_store.as_ref(),
                 risk_for_store.as_deref(),
                 reason_for_store.as_deref(),
@@ -422,10 +434,13 @@ impl Engine {
         let store = self.store.clone();
         let session_filter = session_id.clone();
         let project_filter = project_id.clone();
-        let approvals = tokio::task::spawn_blocking(move || {
+        let mut approvals = tokio::task::spawn_blocking(move || {
             store.list_pending_approvals(session_filter.as_deref(), project_filter.as_deref())
         })
         .await??;
+        for approval in &mut approvals {
+            crate::tooling::redaction::redact_persisted_payload(&mut approval.input);
+        }
         let policy = match (&session_id, &project_id) {
             (Some(session_id), _) => self.store.attention_policy_for_session(session_id)?,
             (None, Some(project_id)) => self.store.get_attention_policy(project_id)?,

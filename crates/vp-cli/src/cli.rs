@@ -807,7 +807,12 @@ pub(crate) enum Command {
         require_newer: bool,
     },
     /// Send a tiny live request to the configured provider.
-    ProviderTest,
+    ProviderTest {
+        /// Also send one tool-calling capability probe. This is a second
+        /// provider call and does not execute any local tool.
+        #[arg(long)]
+        tools: bool,
+    },
     /// Set the daemon approval mode without reconfiguring the provider.
     ApprovalModeSet {
         /// One of: smart, strict, unattended.
@@ -835,6 +840,11 @@ pub(crate) enum Command {
         path: PathBuf,
         #[arg(long)]
         name: Option<String>,
+        /// Explicit first-run trust decision: deny shell network access and
+        /// deny HOME/volume reads outside the worktree, scratch, and toolchain
+        /// allowlist. The policy can be relaxed later with `shell-policy-set`.
+        #[arg(long)]
+        hardened_shell: bool,
     },
     /// List project execution hosts (local and ssh).
     HostList,

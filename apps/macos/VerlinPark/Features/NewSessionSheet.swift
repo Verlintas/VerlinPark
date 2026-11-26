@@ -189,6 +189,20 @@ struct NewSessionSheet: View {
                 unknownBudgetNote
             }
 
+            if model.agentInfo?.configured != true {
+                HStack(alignment: .top, spacing: 7) {
+                    Image(systemName: "bolt.slash.fill")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(VPTheme.warning)
+                    Text("Connect a model provider in Settings before starting a session.")
+                        .font(VPTheme.mono(8))
+                        .foregroundStyle(VPTheme.warning)
+                }
+                .padding(9)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(VPTheme.warning.opacity(0.08), in: RoundedRectangle(cornerRadius: 9))
+            }
+
             if let issue = budgetValidation ?? budgetError {
                 HStack(alignment: .top, spacing: 7) {
                     Image(systemName: "exclamationmark.triangle.fill")
@@ -492,6 +506,7 @@ struct NewSessionSheet: View {
         model.isBusy ||
             goal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
             model.selectedProject == nil ||
+            model.agentInfo?.configured != true ||
             budgetValidation != nil
     }
 }

@@ -731,3 +731,60 @@ four-tier path with a deliberately non-human spatial output.
   link, noscript note, and four aria labels are English-only; dossier
   fact-to-source tracing was not re-checkable from the task worktree. These
   are open polish items, not completion claims.
+
+## Release hardening (2026-11-27)
+
+### Closed in this batch
+
+- **Project add accepted non-Git/empty directories.** `Engine::preflight_project`
+  now requires a canonical Git repository root, at least one commit, and
+  configured `user.name`/`user.email`; the daemon `project.add` RPC runs it
+  before inserting a row. Tests: four `vp-core` preflight tests plus
+  `project_add_rejects_a_non_git_directory_before_insert`.
+- **Remote provider without a key appeared configured.** `AgentService::from_env`
+  now trims/filters empty keys and returns `unconfigured` for a non-loopback
+  endpoint with no API key; loopback endpoints remain usable without one.
+  Tests: `identifies_loopback_endpoints` and
+  `remote_provider_requires_an_api_key`.
+- **Text connectivity did not prove tool calling.** `agent.probe.tools` /
+  `vp provider-test --tools` sends one explicit `probe_echo` tool request and
+  reports whether the model emitted the expected call. It performs no local
+  tool execution. Tests: `tool_probe_requires_the_expected_tool_call` and
+  `tool_probe_reports_text_only_providers`. This is a live capability check, not
+  evidence that a specific real endpoint was probed in this workspace.
+- **Doctor lacked Git and shell-trust readiness checks.** `server.doctor` now
+  reports `git projects` and `shell trust` rows; the latter warns while a
+  project still uses the permissive default (`network=allow`, no read jail).
+- **First-run setup could claim connected without a project or a probe.** The
+  wizard now requires an added project, an explicit shell trust decision
+  (hardened recommended), and a successful live `agent.probe` before Continue.
+  Session creation is also blocked until a provider is configured.
+- **The first-run shell decision was implicit.** The wizard offers hardened
+  shell access (network deny plus HOME/volume read jail) by default and standard
+  access as an explicit opt-in; `vp project-add --hardened-shell` applies the
+  same policy from the CLI.
+- **No scripted backup/restore drill.** `scripts/backup-restore-drill.sh` seeds
+  a real daemon data directory, adds a Git project through the normal RPC, then
+  proves v1 ZIP and signed/encrypted repository (v3) restore round trips and
+  project-row equality. Run with `just backup-drill`; `just release-preflight`
+  includes it.
+- **Tool/approval secrets could be persisted.** A deterministic,
+  persistence-boundary redactor now sanitizes `tool.started`/`tool.finished`
+  payloads (including the journal path), approval event/row input, URL query
+  credentials, cookie headers, bearer/JWT/provider token shapes, and
+  assignment-shaped secrets. Execution arguments, effect probes, contract
+  checks, and journal fingerprints still use the real input. Tests:
+  `crates/vp-core/tests/secret_redaction.rs` plus the redaction unit tests.
+- **No bounded scale/fault harness.** `vp bench scale` validates and completes a
+  100-task/10-Worker plan through the real TeamPlan validator and task
+  scheduler projection, and `vp bench fault` covers two real fake-provider
+  runtime faults (pre-output stream failure, truncation, cancellation) plus two
+  explicitly labeled harness models (duplicate-call replay and batch abort).
+  This is CI-scale structural evidence, not the Phase 2 live 10-Worker/soak
+  proof.
+
+Still open in the same area: Keychain/TCC first-run needs a real-machine pass;
+the provider tool probe has not yet been run against a live endpoint in this
+workspace; automatic project creation from non-GUI clients does not force a
+shell trust decision; and the scale/fault harness does not replace live
+multi-Worker, merge-conflict, daemon restart, or 72-hour soak evidence.

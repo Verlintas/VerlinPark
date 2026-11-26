@@ -9,10 +9,14 @@
   cache + macOS top-up/pause/project policy complete R2b (2026-11-25); R3 per-task envelope, explicit and opt-in pre-run envelope
   persistence, and R4a trade-off preview are implemented; Phase 0 target
   baseline, remaining Phase 1 carried items, Phase 2 scale/fault/soak evidence,
-  and the acceptance scenarios remain. Open findings and
-  live evidence are tracked in
+  and the acceptance scenarios remain. The 2026-11-27 hardening batch adds
+  Git/provider/setup preflights, an explicit first-run shell trust decision,
+  a provider tool-calling probe, a scripted backup/restore drill, bounded
+  scale/fault harnesses, and deterministic tool-payload redaction. Open findings
+  and live evidence are tracked in
   [V1_READINESS_LEDGER.md](V1_READINESS_LEDGER.md).
-- Date: 2026-11-22 (live validation update 2026-11-23; Phase 1 closure batch 2026-11-26)
+- Date: 2026-11-22 (live validation 2026-11-23; Phase 1 closure batch 2026-11-26;
+  release hardening 2026-11-27)
 - Owner: Verlintas
 - Scope: **single-project coding ADE**
 - Primary use: the owner's own development of a large, complex project
