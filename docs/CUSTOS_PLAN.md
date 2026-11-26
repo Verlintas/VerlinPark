@@ -8,8 +8,9 @@ and L2–L4 mutation classes remain open.
 Process sampling is read-only shadow evidence and never signals; sealed one-way
 notices are delivered at turn boundaries and route to the owning agent/task when
 `supervised_process_owners` is present (Leader fallback otherwise); the hash vault
-supports optional local Ed25519 and opt-in plist/binary auto-repair; binary
-repair requests a launchd restart and is off by default.
+supports optional local Ed25519, pinned-key release-style verification, and
+opt-in plist/binary auto-repair; binary repair requests a launchd restart and
+is off by default.
 Date: 2026-11-26  
 Repository: `/Users/apple/orca/workspaces/VerlinPark/m3-round`  
 Branch: `Verlintas/m3-round`
@@ -878,7 +879,8 @@ ADR-0235 adds `crates/vp-custos` with `custosd` and `custos`:
   `diagnostics.generate`;
 - content-addressed vault: `--vault-init`, `--vault-verify`,
   `--vault-repair --yes`, optional local Ed25519 (`--vault-keygen`,
-  `--vault-init --signing-key`), opt-in `--vault-auto-repair` for plists and
+  `--vault-public-key`, `--vault-init --signing-key`), pinned
+  `--vault-pinned-key` verification, opt-in `--vault-auto-repair` for plists and
   `--vault-auto-repair-binary` for binary+launchd restart, with quarantine
   before restore;
 - hash-chained JSONL audit (`--audit-verify`) for start/stop and automatic 30s
@@ -891,8 +893,8 @@ ADR-0235 adds `crates/vp-custos` with `custosd` and `custos`:
 - separate `custos/custos.discovery.json` (0600), not the daemon token;
 - no mutation method, token, TCP listener, agent tool, or provider key.
 
-Tests: 64 unit + 4 integration + 1 module-governance; full Rust workspace
-4,779 passed / 0 failed / 6 ignored; full Swift suite 673 passed / 0 failed.
+Tests: 66 unit + 4 integration + 1 module-governance; full Rust workspace
+4,781 passed / 0 failed / 6 ignored; full Swift suite 673 passed / 0 failed.
 The SwiftUI window is a normal GUI with the `Custos` wordmark as the only ASCII
 art: graphical diamond, nine dimension rows (including vault/process shadows), counts, ring line, local
 diagnostics sheet, and a read-only menu-bar item that only opens/closes the
@@ -903,7 +905,7 @@ Still open before mutation authority:
 - install/verify the four-role launchd ring on a real machine;
 - add peer-uid/token checks and the signed/automatic self-heal path;
 - add exact task-scoped notice wording for Labour/Worker and verify on a live run;
-- implement release signing (the vault supports optional local Ed25519 and
-  opt-in plist/binary repair);
+- ship a real release key and signing workflow (the vault supports pinned
+  verification and opt-in plist/binary repair);
 - validate thresholds against shadow-mode evidence;
 - implement L2/L3/L4 action execution and audit chain.

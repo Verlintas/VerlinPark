@@ -47,6 +47,7 @@ pub struct ServerConfig {
     pub observe_only: bool,
     pub auto_repair: bool,
     pub auto_repair_binary: bool,
+    pub pinned_key: Option<PathBuf>,
 }
 
 impl ServerConfig {
@@ -59,6 +60,7 @@ impl ServerConfig {
             observe_only,
             auto_repair: false,
             auto_repair_binary: false,
+            pinned_key: None,
         }
     }
 
@@ -76,6 +78,11 @@ impl ServerConfig {
         self.auto_repair_binary = auto_repair_binary;
         self
     }
+
+    pub fn with_pinned_key(mut self, pinned_key: PathBuf) -> Self {
+        self.pinned_key = Some(pinned_key);
+        self
+    }
 }
 
 #[derive(Clone)]
@@ -85,6 +92,7 @@ struct AppState {
     observe_only: bool,
     auto_repair: bool,
     auto_repair_binary: bool,
+    pinned_key: Option<PathBuf>,
     started_at: Instant,
     started_at_rfc: String,
     pid: u32,
@@ -123,6 +131,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         observe_only: config.observe_only,
         auto_repair: config.auto_repair,
         auto_repair_binary: config.auto_repair_binary,
+        pinned_key: config.pinned_key.clone(),
         started_at: Instant::now(),
         started_at_rfc: started_at_rfc.clone(),
         pid: std::process::id(),
@@ -190,7 +199,11 @@ pub async fn run(config: ServerConfig) -> Result<()> {
             }
             if ticks.is_multiple_of(15)
                 && let Some(paths) = paths.as_ref()
-                && let Ok(report) = vault::verify(&heartbeat_state.data_dir, paths, &paths.binary)
+                && let Ok(report) = verify_vault(
+                    &heartbeat_state.data_dir,
+                    paths,
+                    heartbeat_state.pinned_key.as_deref(),
+                )
             {
                 let state = vault_state_str(report.state).to_string();
                 if state != last_vault_state {
@@ -676,7 +689,7 @@ fn vault_view(state: &AppState) -> Option<VaultView> {
         return view.clone();
     }
     let paths = ring::launchd_paths(&state.data_dir)?;
-    let report = vault::verify(&state.data_dir, &paths, &paths.binary).ok()?;
+    let report = verify_vault(&state.data_dir, &paths, state.pinned_key.as_deref()).ok()?;
     let files_ok = report
         .files
         .iter()
@@ -713,6 +726,19 @@ fn vault_view(state: &AppState) -> Option<VaultView> {
         *cache = Some((Instant::now(), Some(view.clone())));
     }
     Some(view)
+}
+
+fn verify_vault(
+    data_dir: &Path,
+    paths: &crate::launchd::LaunchdPaths,
+    pinned_key: Option<&Path>,
+) -> Result<vault::VaultReport> {
+    if let Some(key) = pinned_key {
+        let public = vault::read_public_key(key)?;
+        vault::verify_pinned(data_dir, paths, &paths.binary, &public)
+    } else {
+        vault::verify(data_dir, paths, &paths.binary)
+    }
 }
 
 fn vault_state_str(state: VaultState) -> &'static str {

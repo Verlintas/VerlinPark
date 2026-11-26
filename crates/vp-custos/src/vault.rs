@@ -110,6 +110,30 @@ pub fn init_signed(
     init_inner(data_dir, paths, binary, Some(&seed))
 }
 
+/// Export the base64 public key for a seed. This is public material; the seed
+/// itself remains 0600 and is never printed.
+pub fn export_public_key(seed_path: &Path, public_path: &Path, confirmed: bool) -> Result<String> {
+    if !confirmed {
+        bail!("public-key export requires explicit confirmation");
+    }
+    if public_path.exists() {
+        bail!(
+            "refusing to overwrite existing public key: {}",
+            public_path.display()
+        );
+    }
+    let seed = read_signing_seed(seed_path)?;
+    let pair = Ed25519KeyPair::from_seed_unchecked(&seed)
+        .map_err(|_| anyhow::anyhow!("signing seed is not a valid Ed25519 seed"))?;
+    let text = format!("{}\n", BASE64.encode(pair.public_key().as_ref()));
+    fs::write(public_path, text).with_context(|| format!("writing {}", public_path.display()))?;
+    set_mode(public_path, 0o644)?;
+    Ok(format!(
+        "ed25519 public key written to {}",
+        public_path.display()
+    ))
+}
+
 /// Generate a 0600 32-byte Ed25519 seed for local vault signing.
 pub fn keygen(path: &Path, confirmed: bool) -> Result<String> {
     if !confirmed {
@@ -237,6 +261,26 @@ fn read_signing_seed(path: &Path) -> Result<[u8; 32]> {
 }
 
 pub fn verify(data_dir: &Path, paths: &LaunchdPaths, binary: &Path) -> Result<VaultReport> {
+    verify_inner(data_dir, paths, binary, None)
+}
+
+/// Verify against a caller-pinned Ed25519 public key. A missing/invalid
+/// signature is a vault drift, not a local trust fallback.
+pub fn verify_pinned(
+    data_dir: &Path,
+    paths: &LaunchdPaths,
+    binary: &Path,
+    pinned_public_key: &[u8],
+) -> Result<VaultReport> {
+    verify_inner(data_dir, paths, binary, Some(pinned_public_key))
+}
+
+fn verify_inner(
+    data_dir: &Path,
+    paths: &LaunchdPaths,
+    binary: &Path,
+    pinned_public_key: Option<&[u8]>,
+) -> Result<VaultReport> {
     let path = manifest_path(data_dir);
     let mut report = VaultReport {
         schema: "verlinpark.custos_vault_report/v1".to_string(),
@@ -279,9 +323,9 @@ pub fn verify(data_dir: &Path, paths: &LaunchdPaths, binary: &Path) -> Result<Va
             .push("charter hash changed since vault init".to_string());
         report.state = VaultState::VaultDrift;
     }
-    if let Some(signature) = manifest.signature.as_ref() {
-        match verify_signature(&manifest, signature) {
-            Ok(()) => report.signature = "valid_local_ed25519".to_string(),
+    match manifest.signature.as_ref() {
+        Some(signature) => match verify_signature(&manifest, signature, pinned_public_key) {
+            Ok(state) => report.signature = state.to_string(),
             Err(error) => {
                 report.signature = "invalid".to_string();
                 report
@@ -289,9 +333,15 @@ pub fn verify(data_dir: &Path, paths: &LaunchdPaths, binary: &Path) -> Result<Va
                     .push(format!("vault signature invalid: {error:#}"));
                 report.state = VaultState::VaultDrift;
             }
+        },
+        None if pinned_public_key.is_some() => {
+            report.signature = "missing".to_string();
+            report
+                .errors
+                .push("pinned release key requires a signed vault manifest".to_string());
+            report.state = VaultState::VaultDrift;
         }
-    } else {
-        report.signature = "unsigned_dev".to_string();
+        None => report.signature = "unsigned_dev".to_string(),
     }
     let root = vault_root(data_dir);
     let mut target_drift = false;
@@ -341,27 +391,66 @@ pub fn verify(data_dir: &Path, paths: &LaunchdPaths, binary: &Path) -> Result<Va
     Ok(report)
 }
 
-fn verify_signature(manifest: &VaultManifest, signature: &VaultSignature) -> Result<()> {
+fn verify_signature(
+    manifest: &VaultManifest,
+    signature: &VaultSignature,
+    pinned_public_key: Option<&[u8]>,
+) -> Result<&'static str> {
     if signature.algorithm != "ed25519" {
         bail!("unsupported signature algorithm");
     }
-    let public = BASE64
+    let embedded = BASE64
         .decode(signature.public_key_b64.as_bytes())
         .context("public key is not base64")?;
     let sig = BASE64
         .decode(signature.signature_b64.as_bytes())
         .context("signature is not base64")?;
-    if public.len() != 32 || sig.len() != 64 {
+    if embedded.len() != 32 || sig.len() != 64 {
         bail!("public key or signature has the wrong length");
     }
-    if key_id(&public) != signature.key_id {
-        bail!("signature key id does not match the public key");
-    }
+    let public = match pinned_public_key {
+        Some(pinned) => {
+            if pinned.len() != 32 {
+                bail!("pinned public key must be 32 bytes");
+            }
+            if pinned != embedded {
+                bail!("signature public key does not match the pinned release key");
+            }
+            if key_id(pinned) != signature.key_id {
+                bail!("signature key id does not match the pinned release key");
+            }
+            pinned
+        }
+        None => {
+            if key_id(&embedded) != signature.key_id {
+                bail!("signature key id does not match the public key");
+            }
+            embedded.as_slice()
+        }
+    };
     let payload = canonical_payload(manifest)?;
     UnparsedPublicKey::new(&ED25519, public)
         .verify(&payload, &sig)
         .map_err(|_| anyhow::anyhow!("Ed25519 verification failed"))?;
-    Ok(())
+    Ok(if pinned_public_key.is_some() {
+        "valid_pinned_ed25519"
+    } else {
+        "valid_local_ed25519"
+    })
+}
+
+/// Read a base64 Ed25519 public key (32 raw bytes). A leading `ed25519:` is
+/// accepted for convenience; no key material is logged.
+pub fn read_public_key(path: &Path) -> Result<[u8; 32]> {
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let text = text.trim();
+    let text = text.strip_prefix("ed25519:").unwrap_or(text);
+    let bytes = BASE64
+        .decode(text.as_bytes())
+        .context("public key is not base64")?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("public key must contain exactly 32 bytes"))
 }
 
 /// Explicit repair of drifted/missing targets from the vault. The tampered
@@ -559,6 +648,44 @@ mod tests {
         let tampered = verify(&data, &paths, &binary).unwrap();
         assert_eq!(tampered.state, VaultState::VaultDrift);
         assert_eq!(tampered.signature, "invalid");
+    }
+
+    #[test]
+    fn pinned_release_key_verifies_only_the_matching_signature() {
+        let (root, paths, binary) = fixture();
+        let data = paths.data_dir.clone();
+        let key = root.path().join("release.key");
+        let public = root.path().join("release.pub");
+        keygen(&key, true).unwrap();
+        export_public_key(&key, &public, true).unwrap();
+        init_signed(&data, &paths, &binary, &key).unwrap();
+        let pinned = read_public_key(&public).unwrap();
+        let report = verify_pinned(&data, &paths, &binary, &pinned).unwrap();
+        assert_eq!(report.state, VaultState::Ok);
+        assert_eq!(report.signature, "valid_pinned_ed25519");
+
+        let other = root.path().join("other.key");
+        keygen(&other, true).unwrap();
+        let other_public = read_signing_seed(&other).unwrap();
+        let wrong = {
+            let pair = Ed25519KeyPair::from_seed_unchecked(&other_public).unwrap();
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(pair.public_key().as_ref());
+            bytes
+        };
+        let rejected = verify_pinned(&data, &paths, &binary, &wrong).unwrap();
+        assert_eq!(rejected.state, VaultState::VaultDrift);
+        assert_eq!(rejected.signature, "invalid");
+    }
+
+    #[test]
+    fn pinned_release_key_rejects_an_unsigned_vault() {
+        let (_root, paths, binary) = fixture();
+        let data = paths.data_dir.clone();
+        init(&data, &paths, &binary).unwrap();
+        let report = verify_pinned(&data, &paths, &binary, &[7u8; 32]).unwrap();
+        assert_eq!(report.state, VaultState::VaultDrift);
+        assert_eq!(report.signature, "missing");
     }
 
     #[test]

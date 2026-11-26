@@ -37,7 +37,10 @@ in-daemon module.
   The manifest is surfaced as a `vault` status dimension. `--vault-auto-repair`
   is opt-in and repairs drifted plists only. `--vault-auto-repair-binary` (with
   `--vault-auto-repair`) additionally restores a drifted binary and requests a
-  launchd restart; it never runs by default. Release signing remains open.
+  launchd restart; it never runs by default. Local keygen can export a base64
+  public key, and `--vault-pinned-key` verifies against an explicitly pinned
+  Ed25519 key (`valid_pinned_ed25519`) instead of trusting the manifest key. No
+  release key is shipped yet.
 - Hash-chained `custos/audit/events.jsonl` (0600) with `--audit-verify`, core
   start/stop entries, and an automatic 30s vault-state audit when the state
   changes. Audit payloads are metadata only; no prompts, messages, tool output,
@@ -60,8 +63,8 @@ in-daemon module.
   DMG `bin/` staging; the SwiftUI window is a normal GUI with the accepted
   `Custos` wordmark as the only ASCII art and a local diagnostics sheet.
 
-Verification: `cargo test -p vp-custos` 64 unit + 4 integration + 1 module
-governance; full workspace **4,779 Rust passed / 0 failed / 6 ignored**;
+Verification: `cargo test -p vp-custos` 66 unit + 4 integration + 1 module
+governance; full workspace **4,781 Rust passed / 0 failed / 6 ignored**;
 `cargo clippy --workspace --all-targets -- -D warnings` passes; Swift
 `xcodebuild test` **673 passed / 0 failed** with English test language; the
 Custos window is a normal SwiftUI GUI with only the wordmark as ASCII art.

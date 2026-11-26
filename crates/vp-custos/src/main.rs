@@ -45,9 +45,15 @@ struct Args {
     /// Generate a 0600 local Ed25519 vault-signing key and exit.
     #[arg(long)]
     vault_keygen: Option<PathBuf>,
+    /// Optional base64 public-key output for --vault-keygen.
+    #[arg(long)]
+    vault_public_key: Option<PathBuf>,
     /// Local Ed25519 seed used to sign a new vault manifest.
     #[arg(long)]
     signing_key: Option<PathBuf>,
+    /// Pinned base64 Ed25519 public key for release-style verification.
+    #[arg(long)]
+    vault_pinned_key: Option<PathBuf>,
     /// Verify the Custos-owned hash vault against the current installation.
     #[arg(long)]
     vault_verify: bool,
@@ -109,6 +115,9 @@ async fn main() -> Result<()> {
             bail!("--signing-key is only valid with --vault-init");
         }
         println!("{}", vault::keygen(path, true)?);
+        if let Some(public) = args.vault_public_key.as_deref() {
+            println!("{}", vault::export_public_key(path, public, true)?);
+        }
         return Ok(());
     }
     if args.vault_init || args.vault_verify || args.vault_repair {
@@ -129,6 +138,9 @@ async fn main() -> Result<()> {
                 bail!("--vault-repair requires --yes");
             }
             vault::repair(&data_dir, &paths, &binary, true)?
+        } else if let Some(key) = args.vault_pinned_key.as_deref() {
+            let public = vault::read_public_key(key)?;
+            vault::verify_pinned(&data_dir, &paths, &binary, &public)?
         } else {
             vault::verify(&data_dir, &paths, &binary)?
         };
@@ -192,6 +204,9 @@ async fn main() -> Result<()> {
     }
     if args.vault_auto_repair_binary {
         config = config.with_auto_repair_binary(true);
+    }
+    if let Some(key) = args.vault_pinned_key {
+        config = config.with_pinned_key(key);
     }
     run(config).await
 }

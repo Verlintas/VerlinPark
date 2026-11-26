@@ -13,7 +13,7 @@ VerlinPark 已经是一个可运行的 macOS 原生多 Agent 开发区：Rust da
 |---|---:|
 | Rust crates | 11（新增 `vp-custos`） |
 | ADR | 235 |
-| 最近全量 Rust 测试 | 4,779 passed / 0 failed / 6 ignored |
+| 最近全量 Rust 测试 | 4,781 passed / 0 failed / 6 ignored |
 | Swift | 673 passed，`xcodebuild test` 通过 |
 | Live provider | DeepSeek `deepseek-flash` 流式/provider-test/完整 Leader 写文件通过；小前缀 cache 97.1–97.4% |
 | 当前分支 | `m3-round`（本轮审查前不合并） |
@@ -33,7 +33,7 @@ VerlinPark 已经是一个可运行的 macOS 原生多 Agent 开发区：Rust da
 - M3.4：`vp-cli/src/main.rs` 27,823 行 → 1,160 行 parent + `cli`/`dispatch`/`render`/`rpc`/`tests` modules；CLI 行为不变。
 - M3.5：`vp-store` 8 个大模块、`vp-core` plan/memory/service-merge、`vp-daemon/main.rs` 完成二级拆分；新增 store/CLI/daemon module-governance 测试。
 - M3.6：`vp-cli/render.rs`、`vp-cli/dispatch.rs`、`vp-daemon/dispatch.rs` 按输出域/命令族/路由族拆分；行为与协议不变。
-- CUSTOS observe-only：`vp-custos` crate、`custosd`/`custos`、0600 Unix socket、只读 SQLite probe、四进程 heartbeat/launchd 安装器、只读进程 shadow 采样、本地 standard/forensic 诊断包、hash vault（显式 init/verify/repair，可选 local Ed25519，opt-in plist/binary auto-repair）+ hash-chained audit + 单向 shadow notice、普通 SwiftUI 只读窗口（仅 wordmark 为字符艺术）；notice、signed/automatic self-heal 与 L2–L4 仍未实现。
+- CUSTOS observe-only：`vp-custos` crate、`custosd`/`custos`、0600 Unix socket、只读 SQLite probe、四进程 heartbeat/launchd 安装器、只读进程 shadow 采样、本地 standard/forensic 诊断包、hash vault（显式 init/verify/repair，可选 local Ed25519 + pinned-key verification，opt-in plist/binary auto-repair）+ hash-chained audit + 单向 shadow notice、普通 SwiftUI 只读窗口（仅 wordmark 为字符艺术）；notice、signed/automatic self-heal 与 L2–L4 仍未实现。
 
 ## 4. 本轮新增
 
