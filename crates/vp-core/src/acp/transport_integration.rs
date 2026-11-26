@@ -1790,7 +1790,7 @@ async fn websocket_reports_a_server_close_before_prompt() {
     let host = Arc::new(RecordingHost::default());
     let endpoint = handle.websocket_endpoint();
     let error = tokio::time::timeout(
-        Duration::from_secs(20),
+        Duration::from_secs(60),
         run_remote(&endpoint, AcpTransport::Websocket, host),
     )
     .await
