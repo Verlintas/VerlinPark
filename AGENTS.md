@@ -147,8 +147,8 @@ is not V1 release readiness: native computer/Code Mode are not yet a
 project-level opt-in, no live tool-calling probe or live multi-Worker/soak run
 has been recorded in this workspace, Keychain/TCC first-run still needs a
 real-machine pass, Developer ID signing/notarization remains unavailable here,
-and the CUSTOS ring has not been installed/verified on a real machine. A clean
-`just release-preflight full` on 2026-11-27 reported 4,806 Rust passed / 0
+and the CUSTOS ring has not been installed/verified on a real machine. Two consecutive clean
+`just release-preflight full` runs on 2026-11-27 reported 4,806 Rust passed / 0
 failed / 6 ignored and 544 app + 132 helper Swift tests passed, plus the backup
 drill, scale/fault harness, and release binaries.
 

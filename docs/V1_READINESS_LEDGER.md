@@ -832,7 +832,7 @@ restart, or 72-hour soak evidence.
 | `vp bench fault` | PASS, 5/5 cases, 3 real fake-provider runtime cases |
 | `cargo clippy ... -D warnings` | passed |
 | `swiftformat --lint` | passed |
-| `just release-preflight full` | passed on a clean tree |
+| `just release-preflight full` | passed on a clean tree, twice consecutively |
 | `cargo test --workspace` | 4,806 passed / 0 failed / 6 ignored |
 | `xcodebuild test` | 544 app + 132 helper passed |
 | `scripts/package-release.sh` | DMG created (universal, ad-hoc signed) |
