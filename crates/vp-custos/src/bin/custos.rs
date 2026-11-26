@@ -29,6 +29,8 @@ enum Command {
     Charter,
     /// Server liveness.
     Ping,
+    /// Generate local standard + forensic diagnostic bundles.
+    Diagnostics,
 }
 
 #[tokio::main]
@@ -51,6 +53,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         Command::Health => client::health(&socket).await?,
         Command::Charter => client::charter(&socket).await?,
         Command::Ping => client::ping(&socket).await?,
+        Command::Diagnostics => client::diagnostics(&socket).await?,
     };
     if args.json {
         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -104,6 +107,12 @@ fn print_human(command: &Command, value: &Value) {
             let pid = value.get("pid").and_then(Value::as_u64).unwrap_or_default();
             let role = value.get("role").and_then(Value::as_str).unwrap_or("?");
             println!("◇CUSTOS v{version} protocol={protocol} role={role} pid={pid}");
+        }
+        Command::Diagnostics => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(value).unwrap_or_default()
+            );
         }
     }
 }

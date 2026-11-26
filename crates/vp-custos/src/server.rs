@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::charter;
+use crate::diagnostics::{self, BundleMode};
 use crate::discovery;
 use crate::probe::{self, ProbeReport};
 use crate::protocol::{
@@ -118,9 +119,31 @@ pub async fn run(config: ServerConfig) -> Result<()> {
 
     let heartbeat_state = state.clone();
     let heartbeat_task = tokio::spawn(async move {
+        let mut ticks = 0u64;
+        let mut last_attempt = std::collections::HashMap::new();
+        let paths = ring::launchd_paths(&heartbeat_state.data_dir);
+        let runner = crate::launchd::SystemLaunchctl;
         loop {
             if let Err(error) = write_core_heartbeat(&heartbeat_state).await {
                 warn!(%error, "could not write custos heartbeat");
+            }
+            ticks = ticks.saturating_add(1);
+            if ticks.is_multiple_of(5)
+                && let Some(paths) = paths.as_ref()
+            {
+                for restart in ring::restart_stale_peers(
+                    &heartbeat_state.data_dir,
+                    CustosRole::Core,
+                    paths,
+                    &runner,
+                    &mut last_attempt,
+                ) {
+                    if restart.success {
+                        info!(peer = restart.role.as_str(), "custos restarted stale peer");
+                    } else {
+                        warn!(peer = restart.role.as_str(), detail = %restart.detail, "custos peer restart failed");
+                    }
+                }
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
@@ -236,6 +259,42 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
             request.id,
             serde_json::to_value(charter::view(state.observe_only)).unwrap_or(Value::Null),
         ),
+        "diagnostics.generate" => {
+            let data_dir = state.data_dir.clone();
+            match tokio::task::spawn_blocking(move || {
+                diagnostics::generate(&data_dir, BundleMode::Both)
+            })
+            .await
+            {
+                Ok(Ok(result)) => {
+                    let value = crate::protocol::DiagnosticsBundleResult {
+                        schema: "verlinpark.custos_diagnostics/v1".to_string(),
+                        report_id: result.report_id,
+                        generated_at: result.generated_at,
+                        directory: result.directory.to_string_lossy().to_string(),
+                        standard_path: result
+                            .standard_path
+                            .map(|path| path.to_string_lossy().to_string()),
+                        forensic_path: result
+                            .forensic_path
+                            .map(|path| path.to_string_lossy().to_string()),
+                        bytes: result.bytes,
+                    };
+                    RpcResponse::ok(
+                        request.id,
+                        serde_json::to_value(value).unwrap_or(Value::Null),
+                    )
+                }
+                Ok(Err(error)) => {
+                    RpcResponse::error(request.id, "DIAGNOSTICS_FAILED", format!("{error:#}"))
+                }
+                Err(error) => RpcResponse::error(
+                    request.id,
+                    "DIAGNOSTICS_FAILED",
+                    format!("diagnostics task failed: {error}"),
+                ),
+            }
+        }
         method => RpcResponse::error(
             request.id,
             "METHOD_NOT_FOUND",

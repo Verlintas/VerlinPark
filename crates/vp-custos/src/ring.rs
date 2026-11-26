@@ -195,6 +195,57 @@ fn set_file_mode(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Minimal support-role loop for warden/anchor/sentinel. The core uses the
+/// admin server instead. This is heartbeat-only in the current slice; peer
+/// kickstart arrives with the launchd installer.
+pub async fn run_support_role(data_dir: PathBuf, role: CustosRole) -> Result<()> {
+    let started_at = vp_protocol::now_rfc3339();
+    let mut seq = 0u64;
+    let mut write = || -> Result<()> {
+        seq = seq.saturating_add(1);
+        let heartbeat = Heartbeat::new(
+            role,
+            std::process::id(),
+            started_at.clone(),
+            vp_protocol::now_rfc3339(),
+            seq,
+            crate::discovery::build_hash(),
+            crate::charter::hash(),
+            true,
+        );
+        write_heartbeat(&data_dir, &heartbeat)
+    };
+    write()?;
+    let mut last_attempt = std::collections::HashMap::new();
+    let paths = launchd_paths(&data_dir);
+    let runner = crate::launchd::SystemLaunchctl;
+    let mut ticks = 0u64;
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                if let Err(error) = write() {
+                    tracing::warn!(%error, role = role.as_str(), "custos support heartbeat failed");
+                }
+                ticks = ticks.saturating_add(1);
+                if ticks.is_multiple_of(5)
+                    && let Some(paths) = paths.as_ref()
+                {
+                    for restart in restart_stale_peers(&data_dir, role, paths, &runner, &mut last_attempt) {
+                        if restart.success {
+                            tracing::info!(peer = restart.role.as_str(), "custos restarted stale peer");
+                        } else {
+                            tracing::warn!(peer = restart.role.as_str(), detail = %restart.detail, "custos peer restart failed");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let _ = fs::remove_file(heartbeat_path(&data_dir, role));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +292,64 @@ mod tests {
         assert_eq!(snapshot.fresh, 2);
     }
 
+    struct FakeRunner {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl crate::launchd::LaunchctlRunner for FakeRunner {
+        fn run(&self, args: &[&str]) -> Result<String> {
+            self.calls.lock().unwrap().push(args.join(" "));
+            Ok(String::new())
+        }
+    }
+
+    fn paths(root: &Path) -> crate::launchd::LaunchdPaths {
+        crate::launchd::LaunchdPaths::new(
+            root.join("home"),
+            root.join("data"),
+            root.join("custosd"),
+        )
+    }
+
+    #[test]
+    fn watchdog_only_kickstarts_installed_stale_peers_once_per_cooldown() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = paths(dir.path());
+        fs::create_dir_all(&paths.agents_dir).unwrap();
+        fs::write(paths.plist_path(CustosRole::Warden), "plist").unwrap();
+        let runner = FakeRunner {
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut last = std::collections::HashMap::new();
+        let first = restart_stale_peers(dir.path(), CustosRole::Core, &paths, &runner, &mut last);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].role, CustosRole::Warden);
+        assert!(first[0].success);
+        let second = restart_stale_peers(dir.path(), CustosRole::Core, &paths, &runner, &mut last);
+        assert!(
+            second.is_empty(),
+            "cooldown must suppress a second kickstart"
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].contains("com.verlintas.custos-warden"));
+    }
+
+    #[test]
+    fn watchdog_skips_peers_without_a_plist() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = paths(dir.path());
+        fs::create_dir_all(&paths.agents_dir).unwrap();
+        let runner = FakeRunner {
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut last = std::collections::HashMap::new();
+        let restarts =
+            restart_stale_peers(dir.path(), CustosRole::Core, &paths, &runner, &mut last);
+        assert!(restarts.is_empty());
+        assert!(runner.calls.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn invalid_heartbeat_is_not_treated_as_fresh() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -259,4 +368,69 @@ mod tests {
             "invalid"
         );
     }
+}
+
+/// One best-effort peer restart attempt. The watchdog never touches a role
+/// whose plist is not installed, and never restarts itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerRestart {
+    pub role: CustosRole,
+    pub success: bool,
+    pub detail: String,
+}
+
+/// Attempt to kickstart stale/missing peers through launchd. A peer without a
+/// plist is intentionally skipped: Custos does not install agents implicitly.
+pub fn restart_stale_peers(
+    data_dir: &Path,
+    self_role: CustosRole,
+    paths: &crate::launchd::LaunchdPaths,
+    runner: &dyn crate::launchd::LaunchctlRunner,
+    last_attempt: &mut std::collections::HashMap<CustosRole, std::time::Instant>,
+) -> Vec<PeerRestart> {
+    let Ok(uid) = crate::launchd::uid() else {
+        return Vec::new();
+    };
+    let mut restarts = Vec::new();
+    for role in ALL_ROLES {
+        if role == self_role {
+            continue;
+        }
+        let stale = match read_heartbeat(data_dir, role) {
+            Ok(None) => true,
+            Ok(Some((_, age))) => age > STALE_SECS,
+            Err(_) => true,
+        };
+        if !stale {
+            continue;
+        }
+        if !paths.plist_path(role).is_file() {
+            continue;
+        }
+        if let Some(last) = last_attempt.get(&role)
+            && last.elapsed() < Duration::from_secs(30)
+        {
+            continue;
+        }
+        last_attempt.insert(role, std::time::Instant::now());
+        let target = format!("gui/{uid}/{}", crate::launchd::label(role));
+        let result = runner.run(&["kickstart", "-k", target.as_str()]);
+        restarts.push(PeerRestart {
+            role,
+            success: result.is_ok(),
+            detail: result
+                .err()
+                .map(|error| format!("{error:#}").chars().take(300).collect())
+                .unwrap_or_else(|| format!("kickstarted {}", crate::launchd::label(role))),
+        });
+    }
+    restarts
+}
+
+/// Resolve the current binary and home for a launchd watchdog. Returns None
+/// when the process cannot determine a safe absolute path.
+pub fn launchd_paths(data_dir: &Path) -> Option<crate::launchd::LaunchdPaths> {
+    let home = dirs::home_dir()?;
+    let binary = std::env::current_exe().ok()?;
+    Some(crate::launchd::LaunchdPaths::new(home, data_dir, binary))
 }

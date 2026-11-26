@@ -82,6 +82,11 @@ pub async fn charter(socket: &Path) -> Result<Value> {
     call(socket, "charter", json!({})).await
 }
 
+/// Explicit user-consented local diagnostic export. No caller-supplied path.
+pub async fn diagnostics(socket: &Path) -> Result<Value> {
+    call(socket, "diagnostics.generate", json!({})).await
+}
+
 pub async fn discovery(data_dir: &Path) -> Result<Option<CustosDiscovery>> {
     discovery::read_discovery(data_dir)
 }

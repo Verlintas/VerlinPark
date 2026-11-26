@@ -46,6 +46,27 @@ final class CustosModelTests: XCTestCase {
     }
 
     @MainActor
+    func testDiagnosticsProviderStoresLocalBundleResult() async {
+        let diagnostics = CustosDiagnosticsResult(
+            schema: "verlinpark.custos_diagnostics/v1",
+            reportID: "cdr_test",
+            generatedAt: "2026-11-26T12:00:00Z",
+            directory: "/tmp/custos",
+            standardPath: "/tmp/custos/standard.zip",
+            forensicPath: "/tmp/custos/forensic.zip",
+            bytes: ["standard": 10, "forensic": 20]
+        )
+        let model = CustosModel(
+            provider: StaticDiagnosticsProvider(diagnostics: diagnostics),
+            pollInterval: .seconds(60)
+        )
+        await model.generateDiagnostics()
+        XCTAssertEqual(model.diagnostics, diagnostics)
+        XCTAssertNil(model.diagnosticsError)
+        XCTAssertFalse(model.isGeneratingDiagnostics)
+    }
+
+    @MainActor
     func testFailureClearsPreviouslyLiveStatus() async throws {
         let status = try JSONDecoder().decode(
             CustosStatus.self,
@@ -70,6 +91,18 @@ final class CustosModelTests: XCTestCase {
 private struct FailingCustosProvider: CustosStatusProviding {
     func fetchStatus() async throws -> CustosStatus {
         throw CustosSocketError.unavailable
+    }
+}
+
+private struct StaticDiagnosticsProvider: CustosStatusProviding, CustosDiagnosticsProviding {
+    let diagnostics: CustosDiagnosticsResult
+
+    func fetchStatus() async throws -> CustosStatus {
+        throw CustosSocketError.unavailable
+    }
+
+    func generateDiagnostics() async throws -> CustosDiagnosticsResult {
+        diagnostics
     }
 }
 

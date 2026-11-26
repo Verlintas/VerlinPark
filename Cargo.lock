@@ -4049,6 +4049,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dirs",
+ "flate2",
  "fs2",
  "rusqlite",
  "serde",
@@ -4059,6 +4060,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vp-protocol",
+ "zip",
 ]
 
 [[package]]

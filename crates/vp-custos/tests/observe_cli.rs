@@ -125,3 +125,68 @@ async fn missing_database_is_reported_not_created() {
     child.kill().await.unwrap();
     let _ = child.wait().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn support_roles_write_their_heartbeat() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_custosd"))
+        .arg("--data-dir")
+        .arg(dir.path())
+        .arg("--role")
+        .arg("sentinel")
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("RUST_LOG", "error")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let path = dir.path().join("custos/ring/sentinel.json");
+    for _ in 0..100 {
+        if path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(path.exists(), "sentinel heartbeat was not written");
+    let heartbeat: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(heartbeat["role"], "sentinel");
+    assert_eq!(heartbeat["observe_only"], true);
+    child.kill().await.unwrap();
+    let _ = child.wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostics_generate_writes_both_local_bundles() {
+    let dir = tempfile::TempDir::new().unwrap();
+    seed_database(dir.path());
+    let socket = dir.path().join("custos").join("custos.sock");
+    let diagnostics_dir = dir.path().join("diagnostics");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_custosd"))
+        .arg("--data-dir")
+        .arg(dir.path())
+        .arg("--socket")
+        .arg(&socket)
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("RUST_LOG", "error")
+        .env("VERLINPARK_DIAGNOSTICS_DIR", &diagnostics_dir)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    wait_for_socket(&socket).await;
+
+    let result = vp_custos::client::diagnostics(&socket).await.unwrap();
+    assert_eq!(result["schema"], "verlinpark.custos_diagnostics/v1");
+    assert!(result["report_id"].as_str().unwrap().starts_with("cdr_"));
+    for key in ["standard_path", "forensic_path"] {
+        let path = result[key].as_str().unwrap();
+        assert!(
+            std::path::Path::new(path).is_file(),
+            "{key} missing: {path}"
+        );
+        assert!(path.ends_with(".zip"));
+    }
+    assert!(diagnostics_dir.is_dir());
+
+    child.kill().await.unwrap();
+    let _ = child.wait().await;
+}

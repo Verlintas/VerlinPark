@@ -20,24 +20,32 @@ in-daemon module.
 - Capacity formulas for RSS/children/scratch/fds from physical memory, cores,
   and disk space; pure process score with 5-run learning mode, two-family
   stop guard, recent-progress guard, and effective hard caps.
-- Role heartbeat files and quorum helper (single core in this slice).
+- Four-role heartbeat files and quorum helper; warden/anchor/sentinel support
+  loops plus a core/support peer watchdog. `custosd --install/--uninstall/
+  --agent-status` manages user LaunchAgents without sudo; the watchdog only
+  kickstarts a peer whose plist is already installed, with a 30s cooldown.
 - Read-only SQLite probes: sessions, events, leases, runs, plan tasks, merge
   queue, effects, approvals, supervised processes; `SQLITE_OPEN_READ_ONLY` +
   `PRAGMA query_only`, never `Store::open()` and never a schema write.
 - 0600 Unix socket and separate `custos/discovery.json`; methods are `status`,
-  `health`, `charter`, and `ping` only. No TCP, token, provider key, agent tool,
-  or mutation.
+  `health`, `charter`, `ping`, and the explicitly consented
+  `diagnostics.generate`. No TCP, token, provider key, agent tool, or state
+  mutation.
+- `diagnostics.generate` writes local standard + forensic ZIPs (0700 directory,
+  0600 files, 8/32 MiB caps, per-file SHA-256 manifest) with redacted
+  state/log/count metadata; it never uploads and never accepts a caller path.
 - Packaging scripts bundle `custosd`/`custos` into `Contents/Helpers` and the
   DMG `bin/` staging; the SwiftUI window is a normal GUI with the accepted
-  `Custos` wordmark as the only ASCII art.
+  `Custos` wordmark as the only ASCII art and a local diagnostics sheet.
 
-Verification: `cargo test -p vp-custos` 26 unit + 2 integration + 1 module
-governance; full workspace **4,731 Rust passed / 0 failed / 6 ignored**;
+Verification: `cargo test -p vp-custos` 53 unit + 4 integration + 1 module
+governance; full workspace **4,760 Rust passed / 0 failed / 6 ignored**;
 `cargo clippy --workspace --all-targets -- -D warnings` passes; Swift
-`xcodebuild test` **672 passed / 0 failed** with English test language; the
+`xcodebuild test` **673 passed / 0 failed** with English test language; the
 Custos window is a normal SwiftUI GUI with only the wordmark as ASCII art.
-The four-role ring, notices, live process sampling, diagnostic export, launchd
-installation, and mutation classes remain open and are not claimed.
+The four-role launchd ring is implemented but not yet installed/verified on a
+real machine; signed vault/self-heal, live process sampling/notices, and
+L2–L4 mutation classes remain open and are not claimed.
 
 ## 2026-11-26 V1 Phase 1 closure batch
 

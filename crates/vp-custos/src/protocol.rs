@@ -15,7 +15,7 @@ pub const HEALTH_SCHEMA: &str = "verlinpark.custos_health/v1";
 pub const PING_SCHEMA: &str = "verlinpark.custos_ping/v1";
 pub const RPC_SCHEMA: &str = "verlinpark.custos_rpc/v1";
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum CustosRole {
     Core,
@@ -276,4 +276,15 @@ mod tests {
         assert_eq!(response.id, Some(7));
         assert_eq!(response.error.unwrap().code, "METHOD_NOT_FOUND");
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DiagnosticsBundleResult {
+    pub schema: String,
+    pub report_id: String,
+    pub generated_at: String,
+    pub directory: String,
+    pub standard_path: Option<String>,
+    pub forensic_path: Option<String>,
+    pub bytes: BTreeMap<String, u64>,
 }

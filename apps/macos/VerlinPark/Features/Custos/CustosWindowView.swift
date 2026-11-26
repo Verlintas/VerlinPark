@@ -5,6 +5,7 @@ import SwiftUI
 /// The only character art is the wordmark logotype.
 struct CustosWindowView: View {
     @Environment(CustosModel.self) private var model
+    @State private var showDiagnostics = false
 
     var body: some View {
         ZStack {
@@ -13,10 +14,12 @@ struct CustosWindowView: View {
             VStack(spacing: 0) {
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(spacing: 0) {
-                        CustosHeaderBar(model: model)
-                            .padding(.horizontal, 34)
-                            .padding(.top, 20)
-                            .padding(.bottom, 16)
+                        CustosHeaderBar(model: model) {
+                            showDiagnostics = true
+                        }
+                        .padding(.horizontal, 34)
+                        .padding(.top, 20)
+                        .padding(.bottom, 16)
 
                         CustosRule()
 
@@ -43,6 +46,10 @@ struct CustosWindowView: View {
         .frame(minWidth: 860, minHeight: 760)
         .preferredColorScheme(.dark)
         .task { model.start() }
+        .sheet(isPresented: $showDiagnostics) {
+            CustosDiagnosticsSheet()
+                .environment(model)
+        }
         .accessibilityElement(children: .contain)
     }
 }
@@ -51,6 +58,7 @@ struct CustosWindowView: View {
 
 private struct CustosHeaderBar: View {
     let model: CustosModel
+    let onDiagnostics: () -> Void
 
     var body: some View {
         HStack(alignment: .center, spacing: 18) {
@@ -70,6 +78,12 @@ private struct CustosHeaderBar: View {
             HStack(spacing: 14) {
                 CustosHeaderDatum(label: "MODE", value: model.observeOnlyLabel)
                 CustosHeaderDatum(label: "ROLE", value: model.roleLabel)
+                Button("DIAGNOSTICS", action: onDiagnostics)
+                    .buttonStyle(.plain)
+                    .font(CustosTheme.mono(8, weight: .semibold))
+                    .tracking(0.8)
+                    .foregroundStyle(CustosTheme.iceDim)
+                    .padding(.leading, 4)
             }
         }
     }

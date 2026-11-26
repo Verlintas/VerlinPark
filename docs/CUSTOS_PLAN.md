@@ -1,8 +1,11 @@
 # ◇ CUSTOS — deterministic integrity and repair supervisor
 
-Status: **observe-only foundation implemented** (ADR-0235); mutation classes,
-the full four-role ring, notices, live process sampling, diagnostic export, and
-launchd installation remain open.  
+Status: **observe-only foundation implemented** (ADR-0235): read-only server,
+four-role launchd installer/heartbeats/watchdog, local standard/forensic
+diagnostics, and a normal SwiftUI window with only the wordmark as ASCII art.
+The ring has not been installed/verified on a real machine; notices, live
+process sampling, signed vault/self-heal, and L2–L4 mutation classes remain
+open.
 Date: 2026-11-26  
 Repository: `/Users/apple/orca/workspaces/VerlinPark/m3-round`  
 Branch: `Verlintas/m3-round`
@@ -862,23 +865,27 @@ ADR-0235 adds `crates/vp-custos` with `custosd` and `custos`:
 
 - pinned draft charter/hash and a closed v0 action catalog;
 - capacity normalization and a pure process-pressure score with learning mode;
-- role heartbeat files and quorum helper;
+- four-role heartbeat files, quorum helper, support loops, and a peer watchdog;
+- explicit user LaunchAgent install/status/uninstall without sudo;
 - read-only SQLite probes (no `Store::open`, no schema migration);
-- 0600 Unix socket: `status`, `health`, `charter`, `ping`;
+- 0600 Unix socket: `status`, `health`, `charter`, `ping`,
+  `diagnostics.generate`;
+- local standard + forensic ZIP bundles with a SHA-256 manifest, no upload, and
+  no caller-supplied path;
 - separate `custos/custos.discovery.json` (0600), not the daemon token;
 - no mutation method, token, TCP listener, agent tool, or provider key.
 
-Tests for the first slice: 26 unit + 2 integration + 1 module-governance;
-full Rust workspace 4,731 passed / 0 failed / 6 ignored; full Swift suite 672
-passed / 0 failed. The SwiftUI window is a normal GUI with the `Custos`
-wordmark as the only ASCII art: graphical diamond, seven dimension rows,
-counts, ring line, and a read-only menu-bar item that only opens/closes the
+Tests: 53 unit + 4 integration + 1 module-governance; full Rust workspace
+4,760 passed / 0 failed / 6 ignored; full Swift suite 673 passed / 0 failed.
+The SwiftUI window is a normal GUI with the `Custos` wordmark as the only ASCII
+art: graphical diamond, seven dimension rows, counts, ring line, local
+diagnostics sheet, and a read-only menu-bar item that only opens/closes the
 window.
 
 Still open before mutation authority:
 
-- install/verify the four-role launchd ring (core/warden/anchor/sentinel);
+- install/verify the four-role launchd ring on a real machine;
 - add peer-uid/token checks and the signed vault/self-heal path;
-- add live process sampling, one-way notices, and diagnostic export;
+- add live process sampling and one-way notices;
 - validate thresholds against shadow-mode evidence;
 - implement L2/L3/L4 action execution and audit chain.

@@ -17,7 +17,9 @@
 pub mod capacity;
 pub mod charter;
 pub mod client;
+pub mod diagnostics;
 pub mod discovery;
+pub mod launchd;
 pub mod probe;
 pub mod protocol;
 pub mod ring;

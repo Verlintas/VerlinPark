@@ -6,6 +6,30 @@ protocol CustosStatusProviding: Sendable {
     func fetchStatus() async throws -> CustosStatus
 }
 
+protocol CustosDiagnosticsProviding: Sendable {
+    func generateDiagnostics() async throws -> CustosDiagnosticsResult
+}
+
+struct CustosDiagnosticsResult: Decodable, Sendable, Equatable {
+    let schema: String
+    let reportID: String
+    let generatedAt: String
+    let directory: String
+    let standardPath: String?
+    let forensicPath: String?
+    let bytes: [String: Int]
+
+    enum CodingKeys: String, CodingKey {
+        case schema
+        case reportID = "report_id"
+        case generatedAt = "generated_at"
+        case directory
+        case standardPath = "standard_path"
+        case forensicPath = "forensic_path"
+        case bytes
+    }
+}
+
 enum CustosPaths {
     static func dataDirectory(
         environment: [String: String] = ProcessInfo.processInfo.environment,
@@ -92,6 +116,16 @@ struct CustosRPCEnvelope: Decodable, Sendable, Equatable {
     let error: CustosRPCError?
 }
 
+struct CustosDiagnosticsEnvelope: Decodable, Sendable, Equatable {
+    static let schema = "verlinpark.custos_rpc/v1"
+
+    let schema: String
+    let id: Int?
+    let ok: Bool
+    let result: CustosDiagnosticsResult?
+    let error: CustosRPCError?
+}
+
 enum CustosSocketError: LocalizedError, Sendable, Equatable {
     case invalidSocketPath
     case unavailable
@@ -131,9 +165,11 @@ enum CustosSocketError: LocalizedError, Sendable, Equatable {
 }
 
 /// One-shot line-delimited JSON client for `custosd`. It only knows the
-/// read-only `status` method; mutation verbs do not exist in this type.
-struct CustosUnixSocketClient: CustosStatusProviding {
+/// read-only `status` method and the explicitly consented local diagnostics
+/// export; mutation verbs do not exist in this type.
+struct CustosUnixSocketClient: CustosStatusProviding, CustosDiagnosticsProviding {
     static let statusRequestLine = #"{"id":1,"method":"status","params":{}}"# + "\n"
+    static let diagnosticsRequestLine = #"{"id":1,"method":"diagnostics.generate","params":{}}"# + "\n"
 
     let dataDirectory: URL
     let timeout: TimeInterval
@@ -158,22 +194,35 @@ struct CustosUnixSocketClient: CustosStatusProviding {
         }
     }
 
+    func generateDiagnostics() async throws -> CustosDiagnosticsResult {
+        let socketPath = CustosPaths.resolvedSocketPath(dataDirectory: dataDirectory)
+        let timeout = timeout
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                do {
+                    let result = try Self.performDiagnostics(socketPath: socketPath, timeout: timeout)
+                    continuation.resume(returning: result)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     // MARK: - Synchronous socket work
 
     private static func performStatus(socketPath: String, timeout: TimeInterval) throws -> CustosStatus {
-        let descriptor = try connect(socketPath: socketPath, timeout: timeout)
-        defer { Darwin.close(descriptor) }
-
-        try writeAll(Data(statusRequestLine.utf8), descriptor: descriptor)
-        let payload = try readLine(descriptor: descriptor)
-
+        let payload = try performRequest(
+            socketPath: socketPath,
+            requestLine: statusRequestLine,
+            timeout: timeout
+        )
         let envelope: CustosRPCEnvelope
         do {
             envelope = try JSONDecoder().decode(CustosRPCEnvelope.self, from: payload)
         } catch {
             throw CustosSocketError.malformedResponse(error.localizedDescription)
         }
-
         guard envelope.schema == CustosRPCEnvelope.schema else {
             throw CustosSocketError.unexpectedSchema(envelope.schema)
         }
@@ -187,6 +236,46 @@ struct CustosUnixSocketClient: CustosStatusProviding {
             throw CustosSocketError.malformedResponse("response had no result")
         }
         return status
+    }
+
+    private static func performDiagnostics(socketPath: String,
+                                           timeout: TimeInterval) throws -> CustosDiagnosticsResult
+    {
+        let payload = try performRequest(
+            socketPath: socketPath,
+            requestLine: diagnosticsRequestLine,
+            timeout: timeout
+        )
+        let envelope: CustosDiagnosticsEnvelope
+        do {
+            envelope = try JSONDecoder().decode(CustosDiagnosticsEnvelope.self, from: payload)
+        } catch {
+            throw CustosSocketError.malformedResponse(error.localizedDescription)
+        }
+        guard envelope.schema == CustosDiagnosticsEnvelope.schema else {
+            throw CustosSocketError.unexpectedSchema(envelope.schema)
+        }
+        guard envelope.ok else {
+            throw CustosSocketError.rpc(envelope.error?.code ?? "RPC_ERROR")
+        }
+        guard envelope.id == 1 else {
+            throw CustosSocketError.malformedResponse("response id did not match request")
+        }
+        guard let result = envelope.result else {
+            throw CustosSocketError.malformedResponse("response had no result")
+        }
+        return result
+    }
+
+    private static func performRequest(
+        socketPath: String,
+        requestLine: String,
+        timeout: TimeInterval
+    ) throws -> Data {
+        let descriptor = try connect(socketPath: socketPath, timeout: timeout)
+        defer { Darwin.close(descriptor) }
+        try writeAll(Data(requestLine.utf8), descriptor: descriptor)
+        return try readLine(descriptor: descriptor)
     }
 
     private static func connect(socketPath: String, timeout: TimeInterval) throws -> Int32 {

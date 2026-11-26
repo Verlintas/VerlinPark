@@ -33,11 +33,15 @@ The first slice implements:
 - a pinned draft charter hash and closed action catalog;
 - capacity normalization from physical memory, cores, and disk space;
 - a pure process-pressure score with learning-mode and hard-cap guards;
-- a role-heartbeat file format and quorum helper (core observed; full ring
-  later);
+- a four-role heartbeat file format, quorum helper, user LaunchAgent
+  installer/status/uninstall (`--install/--uninstall/--agent-status`), and a
+  peer watchdog that only kickstarts an already-installed plist;
 - read-only SQLite probes for sessions, events, leases, runs, tasks, merge
   queue, effects, approvals, and supervised processes;
-- a 0600 Unix-domain socket with `status`, `health`, `charter`, and `ping`;
+- a 0600 Unix-domain socket with `status`, `health`, `charter`, `ping`, and the
+  explicitly consented `diagnostics.generate`;
+- local standard + forensic ZIP bundles (0700 directory, 0600 files, SHA-256
+  manifest, 8/32 MiB caps) with no upload and no caller-supplied path;
 - a separate `<data-dir>/custos/discovery.json` (0600), not the daemon token;
 - no mutation method, no `act`, no `policy.set`, no pause/resume, no TCP
   listener, no provider key, and no agent-facing tool.
@@ -72,16 +76,19 @@ controls.
   verify `status`, `health`, `charter`, `ping`, `METHOD_NOT_FOUND` for `act`,
   and that a missing database is not created.
 - `cargo clippy --workspace --all-targets -- -D warnings` passes.
-- Full Rust workspace: 4,731 passed / 0 failed / 6 ignored.
-- Swift `xcodebuild test`: 672 passed / 0 failed, including Custos wordmark,
-  protocol decoding, and unavailable-socket model tests.
+- `cargo test -p vp-custos`: 53 unit + 4 integration + 1 module-governance.
+- Full Rust workspace: 4,760 passed / 0 failed / 6 ignored.
+- Swift `xcodebuild test`: 673 passed / 0 failed, including Custos wordmark,
+  protocol decoding, diagnostics-result decoding, and unavailable-socket model
+  tests.
 
 ## 限制
 
 - Observe-only, single core role. No L1 notice, L2 repair, L3 containment, or
   L4 recovery action is enabled.
-- No four-role launchd ring, no vault/self-heal installer, and no automatic
-  boot installation yet.
+- The four-role launchd installer and heartbeat/watchdog are implemented, but
+  the ring has not been installed/verified on a real machine; there is no
+  signed vault/self-heal installer and no automatic boot installation.
 - The socket is 0600 but peer-uid/token checks are not implemented; only
   read-only status metadata is exposed.
 - Probe coverage is bounded to the named tables and does not run a full

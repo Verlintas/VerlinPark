@@ -17,14 +17,21 @@ final class CustosModel {
     private(set) var isRefreshing = false
 
     @ObservationIgnored private let provider: any CustosStatusProviding
+    @ObservationIgnored private let diagnosticsProvider: (any CustosDiagnosticsProviding)?
     @ObservationIgnored private let pollInterval: Duration
     @ObservationIgnored private var pollTask: Task<Void, Never>?
 
+    private(set) var diagnostics: CustosDiagnosticsResult?
+    private(set) var diagnosticsError: String?
+    private(set) var isGeneratingDiagnostics = false
+
     init(
         provider: any CustosStatusProviding = CustosUnixSocketClient(),
+        diagnosticsProvider: (any CustosDiagnosticsProviding)? = nil,
         pollInterval: Duration = .seconds(2)
     ) {
         self.provider = provider
+        self.diagnosticsProvider = diagnosticsProvider ?? (provider as? any CustosDiagnosticsProviding)
         self.pollInterval = pollInterval
     }
 
@@ -106,6 +113,25 @@ final class CustosModel {
     func stop() {
         pollTask?.cancel()
         pollTask = nil
+    }
+
+    /// Explicit user-consented diagnostic export. This writes local files only;
+    /// there is no upload, network call, or caller-supplied path.
+    func generateDiagnostics() async {
+        guard !isGeneratingDiagnostics else { return }
+        guard let diagnosticsProvider else {
+            diagnosticsError = "This Custos build has no diagnostic exporter."
+            return
+        }
+        isGeneratingDiagnostics = true
+        diagnosticsError = nil
+        defer { isGeneratingDiagnostics = false }
+        do {
+            diagnostics = try await diagnosticsProvider.generateDiagnostics()
+        } catch {
+            diagnostics = nil
+            diagnosticsError = error.localizedDescription
+        }
     }
 
     /// One explicit poll. Tests use this without starting the timer.
