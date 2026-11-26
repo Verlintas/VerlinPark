@@ -784,9 +784,9 @@ four-tier path with a deliberately non-human spatial output.
 - **No packaged DMG verification.** `scripts/package-release.sh` produced a
   universal (x86_64/arm64) `0.1.0-dev` DMG with the bundled daemon, CLI,
   remote helper, and CUSTOS binaries, ad-hoc signed. `scripts/verify-dmg.sh` /
-  `just verify-dmg` verified its checksum, image, app/helper layout, and code
-  signature without installing it. This is not Developer ID signing or
-  notarization.
+  `just verify-dmg` verified its checksum, image, app/helper layout, packaged
+  `vp`/`verlinpadd`/`custos`/`custosd` entrypoints, and code signature without
+  installing it. This is not Developer ID signing or notarization.
 - **A bad project entry could not be removed.** `project.remove` /
   `vp project-remove --yes` removes only an empty project (no sessions,
   identities, workspaces, or intake tasks), refuses without explicit

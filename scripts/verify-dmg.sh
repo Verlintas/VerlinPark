@@ -56,6 +56,14 @@ for entry in bin/vp bin/verlinpadd bin/custosd bin/custos INSTALL.txt README.md 
   }
 done
 
+echo "==> packaged CLI entrypoints"
+for binary in vp verlinpadd custos custosd; do
+  "$MOUNT/bin/$binary" --help >/dev/null || {
+    echo "$binary --help failed from the DMG" >&2
+    exit 1
+  }
+done
+
 echo "==> signature"
 codesign --verify --deep --strict "$APP"
 codesign -dv --verbose=2 "$APP" 2>&1 | sed -n '1,12p'
