@@ -611,6 +611,17 @@ bounded locally:
   removes the non-fatal `packed-refs.lock: Operation not permitted` warning on
   a read-only project root.
 
+A small live smoke after the slice used a fresh temp daemon and the `PDfuji`
+project: one task `smoke-file`, a Worker `write_file` of
+`site/xeno-smoke/hello.txt`, a Verifier approval, and an Integrator merge
+(`cc3cbed` worker commit, `dcdcbc1` merge). The task completed; session cost was
+about 287k tokens, and the session reached idle after a top-up. This confirms
+the new runtime path still completes a real four-tier task; it does not
+exercise the 64k context target or a mid-run budget top-up by itself. The
+`packed-refs.lock` stderr warning still appeared even with
+`GIT_OPTIONAL_LOCKS=0`/`gc.auto=0`; it remains cosmetic here but needs a
+focused Git-ref test.
+
 Local verification after this slice: `cargo test --workspace` 4,702 passed /
 0 failed / 6 ignored; Swift `xcodebuild test` 659 passed / 0 failed;
 `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
