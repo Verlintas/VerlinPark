@@ -3883,6 +3883,128 @@ async fn rejects_cyclic_team_plans() {
 }
 
 #[tokio::test]
+async fn recovers_once_from_a_provider_output_limit_without_failing_the_task() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(ScriptedStreamProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![Err(ProviderError::Stream(
+                "provider `openai-compatible` ended the stream with finish_reason `length`: the response reached the provider max-token limit and is truncated".into(),
+            ))],
+            vec![
+                Ok(StreamEvent::TextDelta("recovered after split".into())),
+                Ok(StreamEvent::Done),
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "output limit".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service.start(&session.id, "output limit").await.unwrap();
+    let current = wait_until_idle(&engine, &session).await;
+    assert_eq!(current.status, "idle");
+    let events = engine.list_events(session.id, 0, 100).await.unwrap();
+    assert!(
+        events.iter().any(|event| {
+            event.kind == "agent.output_truncated" && event.payload["recovery"] == 1
+        })
+    );
+    assert!(!events.iter().any(|event| event.kind == "agent.failed"));
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.message"
+            && event.payload["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("recovered after split"))
+    }));
+}
+
+#[tokio::test]
+async fn coalesces_stream_deltas_into_bounded_events() {
+    let dir = TempDir::new().unwrap();
+    let mut events = Vec::new();
+    for _ in 0..1_000 {
+        events.push(Ok(StreamEvent::TextDelta("x".into())));
+    }
+    events.push(Ok(StreamEvent::Done));
+    let provider: Arc<dyn Provider> = Arc::new(ScriptedStreamProvider {
+        responses: Mutex::new(VecDeque::from(vec![events])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "delta coalescing".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service
+        .start(&session.id, "delta coalescing")
+        .await
+        .unwrap();
+    let current = wait_until_idle(&engine, &session).await;
+    assert_eq!(current.status, "idle");
+    let events = engine.list_events(session.id, 0, 100).await.unwrap();
+    let deltas = events
+        .iter()
+        .filter(|event| event.kind == "agent.message_delta")
+        .count();
+    assert!(deltas <= 5, "too many persisted delta events: {deltas}");
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.message"
+            && event.payload["text"]
+                .as_str()
+                .is_some_and(|text| text.len() == 1_000)
+    }));
+}
+
+#[tokio::test]
+async fn injects_a_finalize_nudge_before_the_turn_limit() {
+    let dir = TempDir::new().unwrap();
+    let mut responses = VecDeque::new();
+    for index in 0..8 {
+        responses.push_back(vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: format!("read_{index}"),
+                name: "read_file".into(),
+                arguments: r#"{"path":"README.md"}"#.into(),
+            }),
+            StreamEvent::Done,
+        ]);
+    }
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(responses),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    {
+        let mut config = service.config.read().unwrap().as_ref().unwrap().clone();
+        config.max_turns = 8;
+        *service.config.write().unwrap() = Some(config);
+    }
+    let session = engine
+        .create_session(project.id, "finalize nudge".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service.start(&session.id, "finalize nudge").await.unwrap();
+    let _ = wait_until_idle(&engine, &session).await;
+    let events = engine.list_events(session.id, 0, 200).await.unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "agent.finalize_nudge"
+            && event.payload["max_turns"] == 8
+            && event.payload["reserve"] == 3
+    }));
+}
+
+#[tokio::test]
 async fn stops_repeated_submit_team_plan_validation_failures() {
     let dir = TempDir::new().unwrap();
     let invalid_plan = serde_json::json!({
@@ -5977,6 +6099,51 @@ fn unlimited_flag_bypasses_budget_gates_and_can_be_revoked() {
     flag.store(false, Ordering::SeqCst);
     assert_eq!(budget.exceeded_reason(), Some("tokens"));
     assert!(budget.exhausted());
+}
+
+#[tokio::test]
+async fn fixed_budget_refreshes_from_operator_top_up_and_unlimited() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::new()),
+    });
+    let (engine, _service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "budget refresh".into(), None)
+        .await
+        .unwrap();
+    let budget = SessionBudget::new(
+        Some(100),
+        100,
+        AgentCaps {
+            managers: 1,
+            workers: 1,
+            labour: 1,
+        },
+    )
+    .with_unlimited_flag(engine.unlimited_flag(&session.id, false));
+    assert!(budget.exhausted());
+
+    let top_up = engine
+        .set_session_budget(vp_protocol::types::SetSessionBudgetParams {
+            session_id: session.id.clone(),
+            token_budget: Some(500),
+            ..vp_protocol::types::SetSessionBudgetParams::default()
+        })
+        .await
+        .unwrap();
+    budget.apply_status(&top_up.budget);
+    assert_eq!(budget.token_limit(), Some(500));
+    assert!(!budget.exhausted());
+
+    engine
+        .set_session_unlimited(&session.id, true)
+        .await
+        .unwrap();
+    let status = engine.session_budget(&session.id).await.unwrap();
+    budget.apply_status(&status);
+    assert!(budget.is_unlimited());
+    assert!(!budget.exhausted());
 }
 
 #[tokio::test]

@@ -1,5 +1,19 @@
 use super::*;
 
+/// Refresh a run-local budget from the persisted effective budget. This is
+/// intentionally called for every role: Worker/Labour/Manager/Scout runs do not
+/// own the Auto turn state machine, but they still share the session's token,
+/// cost, time, and unlimited settings.
+async fn refresh_session_budget(
+    engine: &Engine,
+    session: &Session,
+    budget: &SessionBudget,
+) -> Result<()> {
+    let status = engine.session_budget(&session.id).await?;
+    budget.apply_status(&status);
+    Ok(())
+}
+
 /// Stable provider-turn failure: the model returned neither text nor a tool
 /// call. This is a typed error rather than a successful empty answer so the run
 /// journal and session status record a failure.
@@ -621,6 +635,11 @@ pub(in crate::agent) async fn run_loop_body(
         config.max_turns
     };
     let mut tool_failure_guard = ToolFailureGuard::default();
+    // A provider output-token cap is a formatting failure, not a task failure.
+    // Give the model a bounded chance to split the same work into smaller tool
+    // calls before replaying the entire task in a new run.
+    let mut truncation_recoveries = 0u32;
+    let mut finalize_nudged = false;
 
     for turn in 0..max_turns {
         // A long plan can outlive the assignment/workspace lease taken when
@@ -672,6 +691,11 @@ pub(in crate::agent) async fn run_loop_body(
         if control.is_cancelled() {
             return Ok(LoopOutcome::Cancelled);
         }
+        // Re-read the persisted effective budget at every turn boundary for
+        // every role. Child Worker/Labour runs do not own the Auto turn state
+        // machine, so without this refresh an operator top-up or `unlimited`
+        // switch would not reach their run-start `SessionBudget` snapshot.
+        refresh_session_budget(engine, session, budget).await?;
         // Auto budget turn accounting and no-progress decisions belong to the
         // top-level Leader only. Child roles use `ensure_request_fits` below.
         if owns_turns
@@ -1042,6 +1066,39 @@ pub(in crate::agent) async fn run_loop_body(
             if let Some(message) = steering.message {
                 conversation_ids.push(Some(message.id));
             }
+        }
+        // Reserve the last few turns for a durable commit instead of letting a
+        // Worker discover the max-turn cliff after every file is already written.
+        // The message is persisted so a later resume sees the same instruction.
+        let finalize_reserve = (max_turns / 5).clamp(3, 6);
+        let can_commit = matches!(
+            spec.role,
+            AgentRole::Leader | AgentRole::Worker | AgentRole::Labour
+        );
+        if can_commit
+            && !finalize_nudged
+            && max_turns > finalize_reserve + 2
+            && turn + finalize_reserve >= max_turns
+        {
+            let notice = "RUNTIME FINALIZE WINDOW: you are near the turn limit. Stop new exploration. Preserve completed work now: run only the bounded check, commit the files you have already written inside the task write scope, and return a concise final status. Do not start a new design or another browser-testing loop.";
+            emit(
+                engine,
+                &session.id,
+                spec,
+                "agent.finalize_nudge",
+                serde_json::json!({
+                    "turn": turn + 1,
+                    "max_turns": max_turns,
+                    "reserve": finalize_reserve,
+                }),
+            )
+            .await?;
+            let stored = engine
+                .append_message(&session.id, "system", notice, serde_json::json!([]), None)
+                .await?;
+            conversation_ids.push(Some(stored.id));
+            conversation.push(ChatMessage::system(notice));
+            finalize_nudged = true;
         }
         let mut request = ChatRequest {
             model: model_name.clone(),
@@ -1671,6 +1728,36 @@ pub(in crate::agent) async fn run_loop_body(
                     }),
                 )
                 .await?;
+            }
+            if stream_turn.truncated && truncation_recoveries < 2 {
+                truncation_recoveries += 1;
+                let notice = format!(
+                    "[runtime output-limit recovery {}] The provider stopped because the \
+                     response reached its output-token limit. Do not repeat completed work. \
+                     Split the next write into smaller write_file calls (or append mode) and \
+                     keep each tool call under roughly 8k output tokens. Last error: {error:#}",
+                    truncation_recoveries
+                );
+                emit(
+                    engine,
+                    &session.id,
+                    spec,
+                    "agent.output_truncated",
+                    serde_json::json!({
+                        "recovery": truncation_recoveries,
+                        "error": format!("{error:#}").chars().take(1_000).collect::<String>(),
+                    }),
+                )
+                .await?;
+                journal
+                    .model_failed(engine, &model_step, &format!("{error:#}"))
+                    .await?;
+                let stored = engine
+                    .append_message(&session.id, "system", &notice, serde_json::json!([]), None)
+                    .await?;
+                conversation_ids.push(Some(stored.id));
+                conversation.push(ChatMessage::system(notice));
+                continue;
             }
             journal
                 .model_failed(engine, &model_step, &format!("{error:#}"))

@@ -556,6 +556,50 @@ vp --data-dir "$TEMP_DATA" provider-test
 The live runs are recorded above. They are not a substitute for the full
 Rust/Swift suites or for the remaining acceptance scenarios.
 
+### 2026-11-26 runtime efficiency P0
+
+The first live spatial run exposed four runtime costs that are now fixed or
+bounded locally:
+
+- **Budget refresh for every role.** `SessionBudget` was built from a run-start
+  session snapshot; `before_turn`/`ensure_request_fits` only applied persisted
+  top-ups while the Auto runtime was active. Fixed/unlimited Worker/Labour runs
+  could therefore keep an old limit and report `session tokens budget exhausted`
+  after an operator top-up or `unlimited`. `run_loop_body` now refreshes the
+  persisted effective limits at every turn boundary for all roles, and
+  `run_agent` applies the starting status to every role. Test:
+  `fixed_budget_refreshes_from_operator_top_up_and_unlimited`.
+- **Completion reserve cap.** The proportional reserve (default 20%) could park
+  a 4M-token session at 3.2M for 800k tokens. Token/time/cost reserves are now
+  capped at 200k tokens / 300s / $0.75, so the reserve protects the final
+  commit/verify/merge calls without blocking a healthy task. Test:
+  `large_fixed_budget_completion_reserve_is_capped`.
+- **Delta coalescing.** Provider text deltas were persisted one event per token,
+  making the SQLite event log fall minutes behind operator polling. The first
+  non-empty delta is flushed immediately for stream-start observability; later
+  deltas are coalesced at 8 KiB or 120 ms, and the final `agent.message` remains
+  complete. Test: `coalesces_stream_deltas_into_bounded_events`.
+- **Output-limit recovery.** A provider `finish_reason=length` used to fail the
+  whole task and replay its context. It is now a bounded same-run recovery:
+  the runtime emits `agent.output_truncated`, persists a split instruction, and
+  continues up to two times. Test:
+  `recovers_once_from_a_provider_output_limit_without_failing_the_task`.
+- **Bounded writes.** `write_file` rejects a single content payload above 48 KiB
+  with a typed `INVALID_ARGUMENT` split hint and supports `append:true` for
+  chunked files. Test:
+  `write_file_caps_one_call_and_append_builds_chunks`.
+- **Finalize window.** Leader/Worker/Labour runs receive one persisted
+  `agent.finalize_nudge` message during the last 3–6 turns, asking them to stop
+  exploring, run the bounded check, and commit. This is advisory; it does not
+  auto-commit. Test: `injects_a_finalize_nudge_before_the_turn_limit`.
+
+Local verification: `cargo test --workspace` 4,700 passed / 0 failed / 6
+ignored; `cargo fmt --check` and
+`cargo clippy --workspace --all-targets -- -D warnings` pass. The reserve caps
+are constants for this slice rather than project-configurable; the finalize
+nudge is not a hard finalize; event deltas still persist in SQLite but are
+bounded; and the context-budget/task-envelope work remains open.
+
 ### 2026-11-26 live DeepSeek PDfuji retry: harness fixes, partial E2E
 
 A real `deepseek-flash` run against the `PDfuji` project exposed four harness

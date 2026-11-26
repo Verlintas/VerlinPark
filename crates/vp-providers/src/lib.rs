@@ -228,6 +228,21 @@ impl ProviderError {
     pub fn is_preempted(&self) -> bool {
         matches!(self, Self::Preempted { .. })
     }
+
+    /// True when the terminal provider error is specifically an output-token
+    /// truncation. The runtime can recover this at the same turn boundary by
+    /// asking the model to split its tool call, instead of failing the whole
+    /// task and replaying the same context in a retry.
+    pub fn is_output_truncated(&self) -> bool {
+        match self {
+            Self::Stream(message) => {
+                message.contains("finish_reason `length`")
+                    || message.contains("stop_reason `max_tokens`")
+                    || message.contains("max-token limit")
+            }
+            _ => false,
+        }
+    }
 }
 
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>;

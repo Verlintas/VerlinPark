@@ -20,6 +20,19 @@ use vp_protocol::types::{
 const READINESS_CACHE_TTL: Duration = Duration::from_secs(2);
 const READINESS_CACHE_MAX_ENTRIES: usize = 64;
 
+/// Completion reserve is a protection for the final verification/commit/merge
+/// turn, not a fraction of a very large session that must be parked indefinitely.
+/// The proportional reserve is capped so a 4M-token session does not hold back
+/// 800k tokens for a small static artifact. The cap is intentionally generous
+/// for the final provider calls and the deterministic Integrator is exempt.
+const COMPLETION_RESERVE_TOKEN_CAP: f64 = 200_000.0;
+const COMPLETION_RESERVE_TIME_CAP_SECS: f64 = 300.0;
+const COMPLETION_RESERVE_COST_CAP_USD: f64 = 0.75;
+
+fn completion_reserve(hard: f64, ratio: f64, cap: f64) -> f64 {
+    (hard * ratio).min(cap).max(0.0)
+}
+
 fn readiness_cache_hit(cached: &CachedReadiness, seq: u64, now: Instant) -> bool {
     cached.seq == seq && now.saturating_duration_since(cached.cached_at) <= READINESS_CACHE_TTL
 }
@@ -1230,7 +1243,12 @@ fn resource_governor_action(inputs: &ResourceGovernorInputs<'_>) -> (String, Str
             else {
                 continue;
             };
-            let reserve = hard * inputs.completion_reserve_ratio;
+            let cap = match key {
+                "tokens" => COMPLETION_RESERVE_TOKEN_CAP,
+                "time" => COMPLETION_RESERVE_TIME_CAP_SECS,
+                _ => f64::INFINITY,
+            };
+            let reserve = completion_reserve(hard, inputs.completion_reserve_ratio, cap);
             if remaining < reserve {
                 return ("defer".to_string(), format!("completion_reserve_{key}"));
             }
@@ -1239,7 +1257,12 @@ fn resource_governor_action(inputs: &ResourceGovernorInputs<'_>) -> (String, Str
             inputs.hard_caps.cost_usd,
             resource_dimension(inputs.dimensions, "money")
                 .and_then(|dimension| dimension.remaining),
-        ) && remaining < hard * inputs.completion_reserve_ratio
+        ) && remaining
+            < completion_reserve(
+                hard,
+                inputs.completion_reserve_ratio,
+                COMPLETION_RESERVE_COST_CAP_USD,
+            )
         {
             return ("defer".to_string(), "completion_reserve_money".to_string());
         }
@@ -2292,6 +2315,30 @@ mod tests {
             .unwrap();
         assert_eq!(dispatch.action, "warn", "{dispatch:?}");
         assert_eq!(dispatch.reason, "soft_resource_limit");
+    }
+
+    #[tokio::test]
+    async fn large_fixed_budget_completion_reserve_is_capped() {
+        let (_data, _repo, engine, session) = fixture().await;
+        engine
+            .set_session_budget(SetSessionBudgetParams {
+                session_id: session.id.clone(),
+                mode: Some(BudgetMode::Fixed),
+                token_budget: Some(4_000_000),
+                ..SetSessionBudgetParams::default()
+            })
+            .await
+            .unwrap();
+        record_usage(&engine, &session.id, 3_500_000, 0).await;
+        let decision = engine
+            .resource_governor_turn_decision(&session.id)
+            .await
+            .unwrap();
+        assert_ne!(
+            decision.action, "defer",
+            "a 200k reserve cap must not park a 4M session with 500k remaining: {decision:?}"
+        );
+        assert_ne!(decision.reason, "completion_reserve_tokens");
     }
 
     #[tokio::test]

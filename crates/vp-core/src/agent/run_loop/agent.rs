@@ -72,6 +72,11 @@ pub(in crate::agent) async fn run_agent(
         config.max_workers,
         config.max_labour,
     ));
+    // Apply the persisted effective limits to every role, not only Auto. A
+    // Worker/Labour run may start from an older session snapshot and must see
+    // an operator top-up or unlimited switch that landed before its first
+    // provider call.
+    budget.apply_status(&budget_status);
     if auto_active {
         // Auto wall-clock is cumulative across runs. Seed the existing spend
         // and apply the persisted effective budgets; the loop re-reads them at

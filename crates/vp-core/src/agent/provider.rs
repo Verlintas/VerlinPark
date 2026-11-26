@@ -4,6 +4,13 @@ pub(super) const STREAM_ATTEMPTS: u32 = 3;
 
 pub(super) const STREAM_RETRY_BASE: Duration = Duration::from_millis(250);
 
+/// Provider deltas are for live UI, not audit history. Persisting one event per
+/// token makes the SQLite event log the bottleneck and leaves operator polling
+/// minutes behind. Coalesce at a bounded interval/size; the final
+/// `agent.message` still carries the complete text.
+const DELTA_FLUSH_BYTES: usize = 8 * 1024;
+const DELTA_FLUSH_INTERVAL: Duration = Duration::from_millis(120);
+
 #[derive(Default)]
 pub(super) struct StreamTurn {
     pub(super) text: String,
@@ -18,6 +25,9 @@ pub(super) struct StreamTurn {
     /// replayed.
     pub(super) preempted: Option<crate::preemption::Snapshot>,
     pub(super) error: Option<anyhow::Error>,
+    /// The provider ended on an output-token limit. The runtime may append a
+    /// split instruction and continue the same run instead of failing the task.
+    pub(super) truncated: bool,
 }
 
 /// Provider usage for one request. `input` is the provider's total input and
@@ -141,6 +151,26 @@ pub(super) async fn drain_provider_grace(
     }
 }
 
+async fn flush_message_delta(
+    engine: &Engine,
+    session_id: &str,
+    spec: &AgentSpec,
+    buffer: &mut String,
+) -> Result<()> {
+    if buffer.is_empty() {
+        return Ok(());
+    }
+    let text = std::mem::take(buffer);
+    emit(
+        engine,
+        session_id,
+        spec,
+        "agent.message_delta",
+        serde_json::json!({"text": text}),
+    )
+    .await
+}
+
 /// Consume one provider stream turn. Transient failures before any output are
 /// retried; after partial output the turn returns its error together with the
 /// text/usage received so far so the caller can persist a partial message and
@@ -158,6 +188,9 @@ pub(super) async fn consume_stream(
     let mut turn = StreamTurn::default();
     let started = Instant::now();
     let mut attempt = 0;
+    let mut delta_buffer = String::new();
+    let mut last_delta_flush = Instant::now();
+    let mut first_delta_flushed = false;
     let preempt = control.preempt.clone();
     preempt.set_phase(crate::preemption::Phase::Provider, None);
     'streams: loop {
@@ -287,14 +320,20 @@ pub(super) async fn consume_stream(
                             started.elapsed().as_millis().min(u64::MAX as u128) as u64;
                     }
                     turn.text.push_str(&delta);
-                    emit(
-                        engine,
-                        session_id,
-                        spec,
-                        "agent.message_delta",
-                        serde_json::json!({"text": delta}),
-                    )
-                    .await?;
+                    delta_buffer.push_str(&delta);
+                    // Flush the first non-empty chunk immediately so live UI
+                    // and preemption/cancellation observers see the stream
+                    // start; coalesce only the rest.
+                    if !first_delta_flushed && !delta_buffer.is_empty() {
+                        flush_message_delta(engine, session_id, spec, &mut delta_buffer).await?;
+                        first_delta_flushed = true;
+                        last_delta_flush = Instant::now();
+                    } else if delta_buffer.len() >= DELTA_FLUSH_BYTES
+                        || last_delta_flush.elapsed() >= DELTA_FLUSH_INTERVAL
+                    {
+                        flush_message_delta(engine, session_id, spec, &mut delta_buffer).await?;
+                        last_delta_flush = Instant::now();
+                    }
                 }
                 Ok(StreamEvent::ToolCall(call)) => {
                     produced = true;
@@ -325,6 +364,7 @@ pub(super) async fn consume_stream(
                     }
                     if !produced
                         && turn.usage.is_empty()
+                        && !error.is_output_truncated()
                         && stream_error_retryable(&error)
                         && attempt < STREAM_ATTEMPTS
                         && !control.is_cancelled()
@@ -349,6 +389,7 @@ pub(super) async fn consume_stream(
                         }
                         continue 'streams;
                     }
+                    turn.truncated = error.is_output_truncated();
                     turn.error = Some(anyhow!(error).context("provider stream"));
                     break 'streams;
                 }
@@ -356,5 +397,6 @@ pub(super) async fn consume_stream(
         }
         break;
     }
+    flush_message_delta(engine, session_id, spec, &mut delta_buffer).await?;
     Ok(turn)
 }

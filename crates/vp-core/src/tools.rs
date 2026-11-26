@@ -454,6 +454,10 @@ struct ListDir;
 struct Grep;
 struct EditFile;
 struct WriteFile;
+/// Bound one tool-call argument so a model that hits the provider output cap
+/// gets a typed split hint instead of a truncated turn. Files can grow through
+/// `append: true` across multiple calls.
+const MAX_WRITE_FILE_BYTES: usize = 48 * 1024;
 struct Shell;
 struct FetchUrl;
 
@@ -1513,7 +1517,7 @@ impl AgentTool for WriteFile {
     }
 
     fn description(&self) -> &'static str {
-        "Create or overwrite a UTF-8 file atomically in the worktree. Returns the content hash and a bounded diff when replacing a file."
+        "Create, overwrite, or append to a UTF-8 file atomically in the worktree. Use append:true for bounded chunks when a file is too large for one provider turn. Returns the content hash and a bounded diff."
     }
 
     fn schema(&self) -> Value {
@@ -1521,7 +1525,8 @@ impl AgentTool for WriteFile {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "Path relative to the worktree root"},
-                "content": {"type": "string", "description": "Full file content"},
+                "content": {"type": "string", "description": "Content to write; at most 48 KiB per call"},
+                "append": {"type": "boolean", "description": "Append to an existing file instead of overwriting it"},
                 "expected_sha256": {"type": "string", "description": "Reject the write if the current file hash differs"},
                 "dry_run": {"type": "boolean", "description": "Validate and return a diff without writing"}
             },
@@ -1534,10 +1539,29 @@ impl AgentTool for WriteFile {
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("path is required"))?;
-        let content = input
+        let incoming = input
             .get("content")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("content is required"))?;
+        if incoming.len() > MAX_WRITE_FILE_BYTES {
+            return Ok(ToolOutput::error_coded(
+                "write_file",
+                crate::tooling::errors::ToolErrorCode::INVALID_ARGUMENT,
+                format!(
+                    "write_file content is {} bytes; the per-call limit is {} bytes",
+                    incoming.len(),
+                    MAX_WRITE_FILE_BYTES
+                ),
+            )
+            .with_failure_evidence("write_too_large")
+            .with_failure_hint(format!(
+                "Split the file into chunks of at most {} bytes. Use append:true for each chunk after the first, or use edit_file to insert a section."
+            , MAX_WRITE_FILE_BYTES)));
+        }
+        let append = input
+            .get("append")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let dry_run = input
             .get("dry_run")
             .and_then(Value::as_bool)
@@ -1547,6 +1571,22 @@ impl AgentTool for WriteFile {
             Ok(text) => Some(text),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
+        };
+        let content = if append {
+            let Some(old) = old_content.as_deref() else {
+                return Ok(ToolOutput::error_coded(
+                    "write_file",
+                    crate::tooling::errors::ToolErrorCode::INVALID_ARGUMENT,
+                    "append:true requires an existing file",
+                )
+                .with_failure_evidence("append_target_missing")
+                .with_failure_hint(
+                    "Create the file with append:false first, then use append:true for later chunks.",
+                ));
+            };
+            format!("{old}{incoming}")
+        } else {
+            incoming.to_string()
         };
         let mut before_hash = None;
         if let Some(old) = &old_content {
@@ -1595,7 +1635,7 @@ impl AgentTool for WriteFile {
         let after_hash = sha256_hex(content.as_bytes());
         let diff = old_content
             .as_deref()
-            .map(|old| render_diff(old, content, 3))
+            .map(|old| render_diff(old, &content, 3))
             .unwrap_or_default();
         let created = old_content.is_none();
         let content_text = format!(
@@ -1611,11 +1651,12 @@ impl AgentTool for WriteFile {
                 "path": path,
                 "bytes": content.len(),
                 "created": created,
+                "appended": append,
                 "dry_run": dry_run,
                 "sha256": after_hash,
                 "before_sha256": before_hash,
                 "diff": diff,
-                "line_count": utf8_line_count(content),
+                "line_count": utf8_line_count(&content),
             }),
             false,
         ))
@@ -3466,6 +3507,47 @@ mod tests {
         assert!(structured.get("stderr").is_none());
         let rendered = serde_json::to_string(&structured).unwrap();
         assert!(!rendered.contains("secret-token=abc123"));
+    }
+
+    #[tokio::test]
+    async fn write_file_caps_one_call_and_append_builds_chunks() {
+        let (dir, context) = ctx();
+        let over = "x".repeat(MAX_WRITE_FILE_BYTES + 1);
+        let rejected = WriteFile
+            .execute(&context, json!({"path": "large.txt", "content": over}))
+            .await
+            .unwrap();
+        assert!(rejected.is_error);
+        let structured = rejected.structured.unwrap();
+        assert_eq!(structured["code"], "INVALID_ARGUMENT");
+        assert!(
+            structured["hint"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("append")
+        );
+
+        let half = MAX_WRITE_FILE_BYTES / 2;
+        let first = "a".repeat(half);
+        let second = "b".repeat(half);
+        let created = WriteFile
+            .execute(&context, json!({"path": "chunked.txt", "content": first}))
+            .await
+            .unwrap();
+        assert!(!created.is_error, "{}", created.content);
+        let appended = WriteFile
+            .execute(
+                &context,
+                json!({"path": "chunked.txt", "content": second, "append": true}),
+            )
+            .await
+            .unwrap();
+        assert!(!appended.is_error, "{}", appended.content);
+        assert_eq!(appended.structured.unwrap()["appended"], true);
+        let text = std::fs::read_to_string(dir.path().join("chunked.txt")).unwrap();
+        assert_eq!(text.len(), half * 2);
+        assert!(text.starts_with('a'));
+        assert!(text.ends_with('b'));
     }
 
     #[test]
