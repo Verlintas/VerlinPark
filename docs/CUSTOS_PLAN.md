@@ -12,6 +12,13 @@ Latest commit at write time: `2a9c0c9` (`Record runtime hardening smoke evidence
 > resident guardian with real protective power — closer to the Red Queen than
 > to an operator console. This direction supersedes the earlier
 > "operator-gated" UI assumptions in this draft; see section 13.
+>
+> **Round 4 owner direction (2026-11-26):** Custos is a role-separated ring of
+> three processes (core/warden/anchor) with a watchdog ring and signed-vault
+> self-heal, not a single daemon. Daemon restart and verified-backup restore are
+> authorized automatic L4 actions under 2-of-3 quorum. Process thresholds are
+> raised and use multi-signal `proc_pid_rusage`-based probes. The GUI is an
+> independent window inside the VerlinPark app, not a separate `.app`. See §16.
 
 This file is both the current-context handoff and the first Custos design
 proposal. It is intentionally outside the agent tool surface.
@@ -183,38 +190,30 @@ should be designed as a **control-plane supervisor**, not another agent.
 9. **Audit everything.** Append-only, hash-chained, bounded, replayable.
 10. **No infinite repair.** Attempt/fingerprint/cost/cooldown caps; escalate.
 
-## 3. Authority ladder
+## 3. Authority ladder (updated)
 
-Proposed capabilities; the actual ceiling is an open discussion item.
+The authoritative version is `docs/CUSTOS_CHARTER_V0.md`. Summary:
 
 - **L0 Observe** — read health, status, metrics, logs, DB snapshots; no writes.
-- **L1 Advise** — produce a bounded repair preview/recommendation; no action.
-- **L2 Safe repair** — deterministic, reversible state repairs:
-  - reclaim stale leases/claims;
-  - reattach interrupted runs/worktrees;
-  - replay/repair covered projections;
-  - reset stale Git optional locks? (only if proven safe);
-  - retry a transient provider/queue operation through the normal daemon path;
-  - clean daemon-owned stale temp/scratch files.
-- **L3 Containment** — freeze/quarantine:
-  - pause/cancel a stuck session through the normal cooperative RPC;
-  - quarantine a worktree/branch from merge;
-  - block dispatch/admission for a project;
-  - stop a runaway process under the existing supervisor;
-  - mark a DB/snapshot unhealthy and refuse further writes.
-- **L4 Recovery** — high-impact, operator-gated:
-  - restart the daemon;
-  - restore a verified backup/snapshot;
-  - roll back to a checkpoint/anchor;
-  - rekey/revoke? (probably separate security operator flow);
-  - break-glass kill of all sessions.
-- **L5 Never automatic** — source/policy edit, approval/security bypass,
-  merge, budget increase, identity changes, secret access, remote trust
-  changes.
+- **L1 Notify** — sealed, one-way `custos.notice`; no state mutation.
+- **L2 Safe repair** — deterministic, reversible or evidence-preserving state
+  repairs: stale leases/claims, interrupted runs, covered projection replay,
+  transient queue retry, daemon-owned scratch cleanup, policy-allowed
+  supervised process restart.
+- **L3 Containment** — pause/cancel a stuck session, stop a known process
+  group, quarantine a worktree/branch/merge entry, block project dispatch,
+  release a stale GUI lease, mark a project/session read-only.
+- **L4 Recovery** — daemon restart, verified backup restore, safe mode,
+  terminate all known sessions; only under Article 7 preconditions and 2-of-3
+  role quorum.
+- **L5 Prohibited forever** — source/policy edit, approval/Verifier/merge
+  bypass, budget/cap/model-routing change, identity change, secret access,
+  remote-trust change, foreign-process kill, LLM call, agent-facing surface.
 
-Every L3/L4 action needs an explicit policy pin, a bounded time window, an
-operator-visible reason, and a post-action verification. Some may require an
-operator confirmation/break-glass token even if Custos is allowed to act.
+There is no operator approval or break-glass token in the product. L3/L4
+actions are charter-driven, quorum-gated, and audited; the user sees a bounded
+result, not a control. The three-process ring (core/warden/anchor) is described
+in §16 and the charter.
 
 ## 4. Health model
 
@@ -249,43 +248,46 @@ every tick; schedule/sample and cap.
 
 A proposed deterministic matrix (draft; classes/thresholds to be agreed):
 
-| Failure | L0/L1 signal | L2/L3 action | Approval |
+| Failure | Signal | Action | Authority |
 |---|---|---|---|
-| provider transient/stream | error code, retry count | retry through existing provider path | auto if policy |
-| output truncation | `finish_reason=length` | same-run split recovery (already in runtime) | auto |
-| stale lease | expired heartbeat | reclaim via existing lease API | auto |
-| interrupted run | daemon restart | reattach/resume by existing policy | auto/assisted |
-| projection drift | replay mismatch | replay/repair covered projections | auto if replayable |
-| queue claim stale | next_attempt_at/age | release/retry claim | auto |
-| worktree missing | path/ref check | rehydrate/reattach or quarantine | assisted |
-| merge conflict | queue status | existing opt-in resolver | policy/operator |
-| effect unknown | receipt unknown | freeze merge, notify/reconcile | operator |
-| repeated budget pause | completion reserve/usage | preview scope/budget; no auto top-up | operator |
-| DB corruption | integrity check | freeze writes, restore verified backup | operator |
-| low disk | free space threshold | stop new dispatch, prune bounded temp/artifacts | assisted |
-| daemon crash loop | restart count/window | backoff/quarantine, operator | operator |
-| Git lock failure | stderr/lock path | retry without optional locks; quarantine refs | assisted |
+| provider transient/stream | error code, retry count | retry through existing provider path | L2 |
+| output truncation | `finish_reason=length` | same-run split recovery (already in runtime) | L2 |
+| stale lease | expired heartbeat | reclaim via existing lease API | L2 |
+| interrupted run | daemon restart | reattach/resume by existing policy | L2 |
+| projection drift | replay mismatch | replay/repair covered projections | L2 |
+| queue claim stale | next_attempt_at/age | release/retry claim | L2 |
+| worktree missing | path/ref check | rehydrate/reattach or quarantine | L3 |
+| merge conflict | queue status | existing opt-in resolver; Custos may quarantine | L3 |
+| effect unknown | receipt unknown | freeze merge; never settle | L3 |
+| repeated budget pause | completion reserve/usage | notify; no auto top-up | L1 |
+| DB corruption | integrity check | freeze writes, verified restore, safe mode | L4 |
+| low disk | free space threshold | block dispatch + bounded scratch prune | L3 + L2 |
+| daemon crash loop | restart count/window | bounded restart, then safe mode | L4 |
+| Git lock failure | stderr/lock path | retry without optional locks; quarantine refs | L2/L3 |
 | approval/security error | risk class | never auto-repair | never |
 
 Custos must not "repair" by making a failing test pass, changing policy, or
 weakening a gate. It repairs the execution environment and state transitions.
 
-## 6. Architecture options
+## 6. Architecture options (superseded by §16)
 
-### A. Separate sidecar process (recommended for discussion)
+Selected: a **role-separated user-level process ring** (core/warden/anchor),
+not an in-daemon module. The original sidecar sketch:
 
-- `custosd` runs as a separate LaunchAgent/LaunchDaemon or user process.
+### A. Separate sidecar process (selected direction, expanded to a ring)
+
+- `custosd` runs as separate LaunchAgents/user processes.
 - Talks to VerlinPark via a **dedicated local admin socket** (Unix domain
   socket, 0600, separate credential; no TCP by default).
-- VerlinPark exposes a bounded `custos.*` admin RPC surface; normal `vp` RPC
-  and agent tools do not expose it.
+- VerlinPark exposes a bounded read-only `custos.*` admin surface; normal `vp`
+  RPC and agent tools do not expose it.
 - Custos has no provider key, no model client, no arbitrary shell.
 - It can read daemon health/state through RPC and, where necessary, a
   read-only SQLite snapshot if the daemon is down.
-- If the daemon is down, Custos can inspect discovery/DB and invoke a
-  preconfigured restart/restore command with fixed argv.
-- Its own supervisor is independent (launchd KeepAlive); it cannot repair
-  itself by executing generated code.
+- If the daemon is down, the warden can invoke a preconfigured restart/restore
+  path with fixed argv after quorum.
+- Its supervisor is independent (launchd KeepAlive). Self-heal restores only
+  the signed baseline; it never executes generated code.
 
 ### B. In-daemon module
 
@@ -377,38 +379,37 @@ Action classes, caps, cooldowns, and prohibited actions are defined in
 Most earlier questions are answered by §13–15 and the charter. Remaining
 decisions for the owner:
 
-1. Process boundary: user LaunchAgent/watchdog ring vs an optional privileged
-   LaunchDaemon for stronger anti-kill (V1 currently assumes no sudo).
-2. May Custos automatically restart the daemon (REC-01), or is that
-   developer-only?
-3. May Custos automatically restore a verified backup (REC-02) when the live
-   DB is corrupt, preserving the original?
-4. Are the v0 pressure thresholds (80%/90s, 8 GiB, 300s stall) acceptable?
-5. Should the forensic bundle include normalized full paths and process argv,
-   or stay closer to the standard bundle?
-6. Is a third anchor LaunchAgent worth the extra moving part?
-7. GUI packaging: separate app/window, menu-bar extra, or sealed panel inside
-   VerlinPark?
-8. Idle-agent notices: project inbox, or drop with an audit entry?
-9. What exactly should the user see when a project is quarantined?
-10. How Custos relates to existing `OrchestrationPolicy`,
-    `IntegrationPolicy`, `EffectPolicy`, `RunContract`, and backup/anchor.
-11. Audit storage: separate SQLite + JSONL is proposed; retention/export
-    details.
-12. Naming/branding: binary name, glyph, UI language (proposed `◇CUSTOS`,
-    English UI copy for the sealed surface).
+Answered in this round: multi-process ring (yes), daemon restart (yes,
+automatic), verified restore (yes, automatic), GUI (independent window inside
+the app), thresholds (raise, multi-signal). Remaining decisions are kept in
+`docs/CUSTOS_CHARTER_V0.md` Appendix D:
+
+1. Are the new score/hard-cap constants acceptable?
+2. Three roles or add a fourth minimal liveness watchdog?
+3. Vault/app-bundle baseline vs a signed read-only disk image?
+4. Accept the same-user `kill`/`launchctl` residual, or add an optional
+   privileged `custos-guard` LaunchDaemon (one-time admin install)?
+5. Forensic bundle paths/argv and 1s stack samples?
+6. Idle-agent notices: project inbox or drop with audit?
+7. Quarantine UX: what the user sees.
+8. Relation to existing `OrchestrationPolicy`, `IntegrationPolicy`,
+   `EffectPolicy`, `RunContract`, backup/anchor.
+9. Audit storage/retention; menu-bar presence; naming/language.
 
 ## 12. Recommended first slice (for discussion)
 
-Do not start with L4. Start with:
+Do not start with L4 in production. Start with:
 
-- a read-only `custosd` sidecar over a local admin socket;
-- `CustosPolicy` in observe-only mode;
-- probes for daemon/DB/WAL/leases/runs/queues/events/backups/Git;
+- a read-only core over a local admin socket, with a single-role temporary
+  shell (the full three-role ring lands before any mutation);
+- the charter-pinned observe mode;
+- probes for daemon/DB/WAL/leases/runs/queues/events/backups/Git/known
+  processes;
 - `custos.status`/`health`/`history`;
 - shadow-mode recommendations;
 - deterministic fault-injection tests;
-- no mutations, no provider key, no agent tool, no auto-restart.
+- no mutations, no provider key, no agent tool, no auto-restart in this first
+  slice.
 
 Then add L2 safe repairs one class at a time with tests and shadow evidence.
 Only after shadow mode is boring and accurate should Custos get L3/L4 powers;
@@ -478,22 +479,21 @@ cannot command it.
 3. Does Custos have veto power over user/agent commands that threaten
    integrity? Proposed: yes for a narrow, enumerated set (corruption, unsafe
    restore, runaway process, merge-gate poisoning); it reports the veto.
-4. Can the GUI export an incident bundle? If yes, that is an operation. Maybe
-   only copy a bounded incident id, not a file/command.
+4. Can the GUI export an incident bundle? Yes: the secondary diagnostics sheet
+   generates local standard + forensic bundles; no upload, no command surface.
 5. Does the user see enough to trust Custos? The tension is deliberate:
    limited information is part of the fiction, but hiding a destructive action
    is unacceptable. Proposed: show categories and consequences, never secrets
    or raw internals.
-6. Is the GUI a separate app/window or a sealed panel inside VerlinPark?
-   Proposed: a separate ◇CUSTOS window or a read-only panel that cannot issue
-   daemon commands.
+6. GUI packaging: answered as an independent window inside the VerlinPark app,
+   like Settings, not a separate `.app` and not an embedded panel.
 7. How does Custos prove it is alive/healthy? A heartbeat/status surface and
    launchd supervision; no user ping button.
 8. Does Custos get a voice/persona? Proposed: deterministic templated lines
    only; no generative chat, no "personality model".
-9. How is Custos prevented from becoming a second root authority? Separate
-   process, no provider key, no source writes, immutable charter, signed
-   binary, OS-level custody, and a small action allowlist.
+9. How is Custos prevented from becoming a second root authority? Role-separated
+   process ring, quorum for L4, no provider key, no source writes, immutable
+   charter, signed binary, OS-level custody, and a small action allowlist.
 10. What is the minimum human-visible incident information that is ethically
     required? This needs a separate "sealed but honest" policy.
 
@@ -624,8 +624,10 @@ The Custos window must not look like a VerlinPark page. It is a sealed
 instrument: obsidian black, thin ice lines, a central `◇` sigil, coarse
 integrity rings, monospace uppercase labels, restrained glow/pulse/scanline
 effects, no cards/sidebar/tabs, no repair/restart/restore/approve/kill
-controls. Reduce Motion is honored. The only user action is opening the
-secondary diagnostics sheet and generating local bundles.
+controls. Reduce Motion is honored. It is an independent window inside the
+VerlinPark app (like the Settings window), not a separate `.app` and not a
+panel embedded in the main Stage. The only user action is opening the secondary
+diagnostics sheet and generating local bundles.
 
 ### 15.6 Self-protection is a design requirement
 
@@ -635,7 +637,11 @@ shutdown. V1 therefore needs:
 
 - boot autostart;
 - launchd `KeepAlive` supervision;
-- a watchdog ring so a dead/stopped Custos is restored quickly;
+- a role-separated three-process ring (core/warden/anchor) so one killed
+  process does not remove all authority;
+- a watchdog/heartbeat ring so a dead/stopped role is restored quickly;
+- a signed vault/app-bundle baseline with quarantine + overwrite self-heal for
+  Custos-owned files;
 - no agent tool/RPC/mailbox/model surface that addresses Custos;
 - daemon process controls that refuse foreign PIDs and never target Custos;
 - signed, hash-pinned charter/binary; no runtime policy editing.
@@ -655,3 +661,80 @@ launchd/watchdog design.
   manifest, GUI information tiers, and launchd/watchdog self-protection.
 
 These artifacts are **design drafts for review**, not implemented behavior.
+
+## 16. Round 4 direction: multi-process ring, self-heal, and conservative probes
+
+### 16.1 Multi-process Custos, not a single daemon
+
+Custos is a role-separated ring of three user LaunchAgents:
+
+- `com.verlintas.custos-core` — probes, scoring, decisions, action intents;
+- `com.verlintas.custos-warden` — executes L3 stops/quarantine/restart and L4
+  recovery after quorum;
+- `com.verlintas.custos-anchor` — self-heal, hash/plist/charter/audit-chain
+  verification, vault restore, peer restart, backup verification.
+
+Each has a separate process group, heartbeat, launchd label, and subset of
+authority. Killing one does not give an attacker the others' authority; the
+remaining roles detect the stale heartbeat and restart it. L4 actions require
+2-of-3 signed intents; L3 is core+warden with anchor audit; a hard-cap stop can
+be executed by the warden alone. A monotonic epoch lease prevents split-brain.
+
+### 16.2 Self-heal / overwrite authority
+
+Custos keeps a signed baseline in two places: the app bundle's read-only
+`Contents/Resources/Custos/` and a 0500/0400 vault under Application Support.
+On hash/signature/plist/charter/audit-chain mismatch it:
+
+1. quarantines the tampered file (0400, hash recorded);
+2. restores from the vault, verifying hash/signature;
+3. falls back to the app bundle;
+4. restarts the affected role via launchd;
+5. enters `DEGRADED_SELF` and refuses L3/L4 if both baselines are bad.
+
+The overwrite is limited to Custos-owned files. It never overwrites VerlinPark
+source, project policy, user documents, worktrees, or database rows. Audit-chain
+tamper is recorded as an explicit gap; missing entries are not fabricated.
+
+### 16.3 Daemon restart and verified restore are authorized
+
+- `REC-01` daemon restart is automatic with 2-of-3 quorum and the Article 7
+  preconditions; crash loops stop after the cap and enter safe mode.
+- `REC-02` verified backup restore is automatic with 2-of-3 quorum: DB
+  unopenable/corrupt, backup verifies, anchor generation acceptable, fresh
+  directory on the same volume, corrupt original preserved, atomic rename swap,
+  post-restore integrity check. One attempt per failure fingerprint; a second
+  failure enters safe mode.
+
+### 16.4 Conservative multi-signal process probe
+
+The old CPU-percent thresholds were too likely to hit a legitimate build. The
+new design uses macOS `proc_pid_rusage` (`rusage_info_v4`) and
+`proc_pidinfo(PROC_PIDTASKINFO)` to build a progress vector: CPU time,
+instructions/cycles, disk I/O, pageins/faults, children, output growth, and
+heartbeat. A bounded 1s `sample` can be used as evidence for a suspected stall.
+
+A 0–100 score combines resource, progress, and control families. Notice at 60,
+final notice at 80, stop at 90 **only with two independent signal families**.
+Any progress in the last 60s blocks a kill except a hard cap. Hard caps are
+raised to 12 GiB RSS, 128 children, 8 GiB scratch, 8192 open files. No-progress
+must persist 10–15 minutes. Agent-declared expected time remains advisory and
+clamped to 30s–8h; it cannot suppress progress detection or hard caps.
+
+### 16.5 GUI is an independent window, not a separate app
+
+The `◇CUSTOS` surface is a separate window scene inside the VerlinPark app, like
+the Settings window. It is not a separate `.app` and not a panel embedded in the
+main Stage. It connects to the read-only Custos admin socket, shows the sealed
+status instrument, and has the secondary diagnostics sheet. Closing it does not
+stop Custos. The window has no repair/restart/restore/approve/kill controls.
+
+### 16.6 Residual risk remains explicit
+
+The ring and self-heal make Custos kill-resistant and tamper-evident, but they
+are not a consensus system against root or an attacker who can tamper every
+baseline copy. A same-user shell can still signal processes or `launchctl
+bootout` user agents; launchd/ring restores them, and the GUI shows `SIGNAL
+LOST` during the gap. Absolute protection requires a separate OS user or a
+privileged `custos-guard` LaunchDaemon, which remains an open optional decision
+(one-time admin install), not part of the no-sudo V1 baseline.
