@@ -552,3 +552,89 @@ developer**. It is consent, not control, and it is never automatic/uploaded.
 - Signed manifest + SHA-256 + report id; developer can verify provenance.
 - The main Custos surface still has no repair/restart/restore/approve/kill
   controls.
+
+## 15. Round 3 direction: V1 process scope, advisory expectations, dual bundles, self-protection
+
+### 15.1 V1 never manages arbitrary system processes
+
+Custos V1 may inspect and act only on processes the daemon already knows and
+owns:
+
+- `supervised_processes` rows (start time + nonce + command hash verified);
+- `run_project_task` / test-cache command process groups;
+- shell-tool process groups started by an agent run;
+- daemon-launched browser/computer/LSP/MCP/ACP stdio children;
+- daemon-owned helper and sweeper processes.
+
+It must not scan and kill arbitrary high-CPU system processes. A system-wide
+guardian is an **Advanced** concept, explicitly not planned for V1. This keeps
+Custos from becoming a second, unaccountable `kill -9` authority on the user's
+machine.
+
+### 15.2 Agent-declared expected durations are advisory only
+
+Agents frequently mis-declare timeouts (for example, a one-minute test with a
+fifteen-minute timeout). Therefore:
+
+- `expected_secs` / declared timeout is one weak signal, never a kill trigger
+  by itself;
+- Custos weights observed progress (output growth, CPU-time delta, child
+  completion, heartbeat) more heavily than the declaration;
+- a declared duration can only *raise* the warning threshold within a bounded
+  clamp, not lower protection;
+- hard caps are Custos-owned constants from the signed charter, not
+  agent-supplied values.
+
+### 15.3 Notices stay one-way
+
+`custos.notice` is sealed, templated, one-way, and cannot be replied to. Agents
+have no tool, RPC, mailbox address, or model-visible channel to query, argue
+with, or configure Custos. A notice is a fact, not a conversation.
+
+### 15.4 Diagnostic export defaults to two bundles
+
+The secondary diagnostics surface generates **both** a `standard` bundle and a
+`forensic` bundle in one action, locally, with no upload. The forensic bundle
+adds detail (full paths, command lines with redacted environment, bounded raw
+logs, SQLite/WAL/schema statistics, queue and lease identifiers, process
+lineage) but still excludes provider keys, prompts, message bodies, file
+contents, screen content, cookies, and credentials. The user chooses which
+bundle to share.
+
+### 15.5 GUI is minimal, hardcore, and visibly separate
+
+The Custos window must not look like a VerlinPark page. It is a sealed
+instrument: obsidian black, thin ice lines, a central `◇` sigil, coarse
+integrity rings, monospace uppercase labels, restrained glow/pulse/scanline
+effects, no cards/sidebar/tabs, no repair/restart/restore/approve/kill
+controls. Reduce Motion is honored. The only user action is opening the
+secondary diagnostics sheet and generating local bundles.
+
+### 15.6 Self-protection is a design requirement
+
+Agents must not be able to stop, pause, suspend, reconfigure, or impersonate
+Custos through any product surface. The only accepted stop is machine
+shutdown. V1 therefore needs:
+
+- boot autostart;
+- launchd `KeepAlive` supervision;
+- a watchdog ring so a dead/stopped Custos is restored quickly;
+- no agent tool/RPC/mailbox/model surface that addresses Custos;
+- daemon process controls that refuse foreign PIDs and never target Custos;
+- signed, hash-pinned charter/binary; no runtime policy editing.
+
+The honest limit: a same-user process with arbitrary shell/`launchctl` can
+still signal or boot out a user LaunchAgent. V1 cannot mathematically prevent
+that without a separate OS user or privileged LaunchDaemon, which is
+Advanced-only. V1 must therefore be **kill-resistant and self-restoring**, and
+record the residual same-user attack as a known limit rather than claiming
+absolute invulnerability. See `docs/CUSTOS_CHARTER_V0.md` for the concrete
+launchd/watchdog design.
+
+### 15.7 Design artifacts produced from this round
+
+- `docs/CUSTOS_CHARTER_V0.md` — draft immutable charter, authority ladder,
+  action catalog, pressure/stuck matrix, notice templates, diagnostic bundle
+  manifest, GUI information tiers, and launchd/watchdog self-protection.
+
+These artifacts are **design drafts for review**, not implemented behavior.
