@@ -58,3 +58,6 @@ release-preflight:
 
 backup-drill:
     ./scripts/backup-restore-drill.sh
+
+verify-dmg:
+    ./scripts/verify-dmg.sh

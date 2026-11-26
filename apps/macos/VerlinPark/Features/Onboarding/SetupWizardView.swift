@@ -300,7 +300,7 @@ struct SetupWizardView: View {
                 Button(L10n.t("Save & test")) {
                     Task {
                         await model.saveProviderSettings()
-                        if providerReady {
+                        if model.agentInfo?.configured == true {
                             await model.probeProvider()
                         }
                     }
@@ -358,7 +358,16 @@ struct SetupWizardView: View {
                 .foregroundStyle(VPTheme.textTertiary)
 
             Button {
-                Task { await model.addProject() }
+                Task {
+                    let existing = Set(model.projects.map(\.id))
+                    await model.addProject()
+                    if let project = model.selectedProject, !existing.contains(project.id) {
+                        _ = await model.applyShellTrust(
+                            projectID: project.id,
+                            hardened: !allowShellAccess
+                        )
+                    }
+                }
             } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "folder.badge.plus")
@@ -506,6 +515,19 @@ struct SetupWizardView: View {
     }
 
     private func loadDefaults() {
+        // A daemon launched from the environment may already be configured
+        // while this client has no stored provider fields. Show the live
+        // provider so Save & test probes the same endpoint the daemon uses.
+        if let info = model.agentInfo, info.configured {
+            if model.providerModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               let configuredModel = info.model
+            {
+                model.providerModel = configuredModel
+            }
+            if let configuredBaseURL = info.baseUrl, !configuredBaseURL.isEmpty {
+                model.providerBaseURL = configuredBaseURL
+            }
+        }
         let url = model.providerBaseURL.lowercased()
         if url.contains("deepseek") {
             selectedPreset = "deepseek"

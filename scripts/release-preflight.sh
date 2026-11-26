@@ -68,6 +68,9 @@ if [[ "$MODE" == "full" ]]; then
   echo "==> backup/restore drill"
   cargo build --locked -p vp-cli -p vp-daemon
   ./scripts/backup-restore-drill.sh
+  echo "==> scale/fault harness"
+  cargo run --locked -q -p vp-cli -- bench scale
+  cargo run --locked -q -p vp-cli -- bench fault
 fi
 
 echo "==> release binaries"

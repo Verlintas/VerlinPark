@@ -492,6 +492,13 @@ pass with recorded evidence.
 - Freeze protocol, database schema, event names, and budget semantics.
 - Write/refresh architecture, migration, recovery, and known-limitations docs.
 - Run full Rust/Swift/live/fault-injection/soak suites.
+- Run `just release-preflight` on a clean tree. It checks version alignment,
+  runs fmt/clippy/full Rust tests, SwiftFormat/xcodebuild, the backup/restore
+  drill, `vp bench scale`/`fault`, and builds release binaries. It does not
+  sign or notarize; `scripts/package-release.sh` handles that when a Developer
+  ID identity and notary profile are supplied, and `just verify-dmg` checks the
+  resulting checksum, image, app/helper layout, and signature without
+  installing it.
 - Tag the V1 source release and create a source archive.
 - Optionally run the public binary release gate; public packaging is not
   allowed to delay the owner's V1 if the source tag is stable.
