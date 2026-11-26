@@ -201,6 +201,7 @@ pub struct ProcessPressure {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VaultView {
     pub state: String,
+    pub signature: String,
     pub manifest_present: bool,
     pub files_ok: u32,
     pub files_drift: u32,

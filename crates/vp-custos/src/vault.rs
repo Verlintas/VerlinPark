@@ -1,16 +1,21 @@
 //! Custos-owned baseline verification and explicit repair.
 //!
-//! This is the first self-heal foundation: a content-addressed manifest and
-//! copies of Custos-owned files. It is deliberately explicit-only in this
-//! slice (`--vault-init` / `--vault-repair --yes`); automatic repair and signed
-//! releases remain later work. It never touches VerlinPark source, worktrees,
-//! project policy, or database rows.
+//! The vault holds a content-addressed copy of Custos-owned files (the
+//! `custosd` binary and installed LaunchAgent plists), plus an optional local
+//! Ed25519 signature over the manifest body. It is deliberately explicit-only:
+//! `--vault-init` / `--vault-repair --yes`. There is no automatic repair or
+//! release signing in this slice, and it never touches VerlinPark source,
+//! worktrees, project policy, or database rows.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use rand::RngCore;
+use ring::signature::{ED25519, Ed25519KeyPair, KeyPair as _, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -29,6 +34,17 @@ pub struct VaultManifest {
     pub generated_at: String,
     pub status: String,
     pub files: BTreeMap<String, VaultFile>,
+    #[serde(default)]
+    pub signature: Option<VaultSignature>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VaultSignature {
+    pub algorithm: String,
+    pub key_id: String,
+    pub public_key_b64: String,
+    pub signature_b64: String,
+    pub signed_at: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -64,6 +80,7 @@ pub struct VaultReport {
     pub manifest_path: String,
     pub build_hash: Option<String>,
     pub charter_hash: Option<String>,
+    pub signature: String,
     pub files: Vec<VaultFileReport>,
     pub errors: Vec<String>,
 }
@@ -76,7 +93,57 @@ pub fn manifest_path(data_dir: &Path) -> PathBuf {
     vault_root(data_dir).join(MANIFEST)
 }
 
+/// Unsigned development baseline.
 pub fn init(data_dir: &Path, paths: &LaunchdPaths, binary: &Path) -> Result<VaultReport> {
+    init_inner(data_dir, paths, binary, None)
+}
+
+/// Baseline signed with a local 0600 Ed25519 seed. This is a local development
+/// signature, not a signed release.
+pub fn init_signed(
+    data_dir: &Path,
+    paths: &LaunchdPaths,
+    binary: &Path,
+    signing_key: &Path,
+) -> Result<VaultReport> {
+    let seed = read_signing_seed(signing_key)?;
+    init_inner(data_dir, paths, binary, Some(&seed))
+}
+
+/// Generate a 0600 32-byte Ed25519 seed for local vault signing.
+pub fn keygen(path: &Path, confirmed: bool) -> Result<String> {
+    if !confirmed {
+        bail!("vault key generation requires explicit confirmation");
+    }
+    if path.exists() {
+        bail!(
+            "refusing to overwrite existing signing key: {}",
+            path.display()
+        );
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+        set_mode(parent, 0o700)?;
+    }
+    let mut seed = [0u8; 32];
+    rand::rng().fill_bytes(&mut seed);
+    fs::write(path, seed).with_context(|| format!("writing {}", path.display()))?;
+    set_mode(path, 0o600)?;
+    let pair = Ed25519KeyPair::from_seed_unchecked(&seed)
+        .map_err(|_| anyhow::anyhow!("generated seed is not a valid Ed25519 seed"))?;
+    Ok(format!(
+        "ed25519 key written to {} (public key {})",
+        path.display(),
+        BASE64.encode(pair.public_key().as_ref())
+    ))
+}
+
+fn init_inner(
+    data_dir: &Path,
+    paths: &LaunchdPaths,
+    binary: &Path,
+    seed: Option<&[u8; 32]>,
+) -> Result<VaultReport> {
     if !binary.is_file() {
         bail!("custosd binary is missing: {}", binary.display());
     }
@@ -95,22 +162,78 @@ pub fn init(data_dir: &Path, paths: &LaunchdPaths, binary: &Path) -> Result<Vaul
             copy_into_vault(&root, name, &plist, "plist", &mut files)?;
         }
     }
-    let manifest = VaultManifest {
+    let mut manifest = VaultManifest {
         schema: VAULT_SCHEMA.to_string(),
         build_hash: discovery::build_hash(),
         charter_hash: charter::hash(),
         generated_at: vp_protocol::now_rfc3339(),
         status: "unsigned_dev".to_string(),
         files,
+        signature: None,
     };
+    if let Some(seed) = seed {
+        manifest.status = "local_ed25519".to_string();
+        manifest.signature = Some(sign_manifest(&manifest, seed)?);
+    }
+    write_manifest(data_dir, &manifest)?;
+    verify(data_dir, paths, binary)
+}
+
+fn write_manifest(data_dir: &Path, manifest: &VaultManifest) -> Result<()> {
+    let root = vault_root(data_dir);
+    fs::create_dir_all(&root)?;
     let path = manifest_path(data_dir);
     let tmp = root.join(".manifest.tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(&manifest)?)
+    fs::write(&tmp, serde_json::to_vec_pretty(manifest)?)
         .with_context(|| format!("writing {}", tmp.display()))?;
     set_mode(&tmp, 0o600)?;
     fs::rename(&tmp, &path).with_context(|| format!("renaming {}", path.display()))?;
     set_mode(&path, 0o400)?;
-    verify(data_dir, paths, binary)
+    Ok(())
+}
+
+fn sign_manifest(manifest: &VaultManifest, seed: &[u8; 32]) -> Result<VaultSignature> {
+    let pair = Ed25519KeyPair::from_seed_unchecked(seed)
+        .map_err(|_| anyhow::anyhow!("signing seed is not a valid Ed25519 seed"))?;
+    let public = pair.public_key().as_ref().to_vec();
+    let payload = canonical_payload(manifest)?;
+    let signature = pair.sign(&payload);
+    Ok(VaultSignature {
+        algorithm: "ed25519".to_string(),
+        key_id: key_id(&public),
+        public_key_b64: BASE64.encode(&public),
+        signature_b64: BASE64.encode(signature.as_ref()),
+        signed_at: vp_protocol::now_rfc3339(),
+    })
+}
+
+fn canonical_payload(manifest: &VaultManifest) -> Result<Vec<u8>> {
+    let mut value = serde_json::to_value(manifest)?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("signature");
+    }
+    Ok(serde_json::to_vec(&value)?)
+}
+
+fn key_id(public: &[u8]) -> String {
+    let digest = Sha256::digest(public);
+    hex(&digest)[..16].to_string()
+}
+
+fn read_signing_seed(path: &Path) -> Result<[u8; 32]> {
+    let metadata = fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            bail!("signing key must be 0600: {}", path.display());
+        }
+    }
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let seed: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("signing key must contain exactly 32 bytes"))?;
+    Ok(seed)
 }
 
 pub fn verify(data_dir: &Path, paths: &LaunchdPaths, binary: &Path) -> Result<VaultReport> {
@@ -121,6 +244,7 @@ pub fn verify(data_dir: &Path, paths: &LaunchdPaths, binary: &Path) -> Result<Va
         manifest_path: path.to_string_lossy().to_string(),
         build_hash: None,
         charter_hash: None,
+        signature: "none".to_string(),
         files: Vec::new(),
         errors: Vec::new(),
     };
@@ -154,6 +278,20 @@ pub fn verify(data_dir: &Path, paths: &LaunchdPaths, binary: &Path) -> Result<Va
             .errors
             .push("charter hash changed since vault init".to_string());
         report.state = VaultState::VaultDrift;
+    }
+    if let Some(signature) = manifest.signature.as_ref() {
+        match verify_signature(&manifest, signature) {
+            Ok(()) => report.signature = "valid_local_ed25519".to_string(),
+            Err(error) => {
+                report.signature = "invalid".to_string();
+                report
+                    .errors
+                    .push(format!("vault signature invalid: {error:#}"));
+                report.state = VaultState::VaultDrift;
+            }
+        }
+    } else {
+        report.signature = "unsigned_dev".to_string();
     }
     let root = vault_root(data_dir);
     let mut target_drift = false;
@@ -193,7 +331,7 @@ pub fn verify(data_dir: &Path, paths: &LaunchdPaths, binary: &Path) -> Result<Va
             bytes: entry.bytes,
         });
     }
-    report.state = if vault_drift {
+    report.state = if report.state == VaultState::VaultDrift || vault_drift {
         VaultState::VaultDrift
     } else if target_drift {
         VaultState::Drift
@@ -203,9 +341,32 @@ pub fn verify(data_dir: &Path, paths: &LaunchdPaths, binary: &Path) -> Result<Va
     Ok(report)
 }
 
+fn verify_signature(manifest: &VaultManifest, signature: &VaultSignature) -> Result<()> {
+    if signature.algorithm != "ed25519" {
+        bail!("unsupported signature algorithm");
+    }
+    let public = BASE64
+        .decode(signature.public_key_b64.as_bytes())
+        .context("public key is not base64")?;
+    let sig = BASE64
+        .decode(signature.signature_b64.as_bytes())
+        .context("signature is not base64")?;
+    if public.len() != 32 || sig.len() != 64 {
+        bail!("public key or signature has the wrong length");
+    }
+    if key_id(&public) != signature.key_id {
+        bail!("signature key id does not match the public key");
+    }
+    let payload = canonical_payload(manifest)?;
+    UnparsedPublicKey::new(&ED25519, public)
+        .verify(&payload, &sig)
+        .map_err(|_| anyhow::anyhow!("Ed25519 verification failed"))?;
+    Ok(())
+}
+
 /// Explicit repair of drifted/missing targets from the vault. The tampered
-/// target is quarantined first; nothing is deleted. The process must be
-/// restarted by launchd/operator after a binary repair.
+/// target is quarantined first; nothing is deleted. A binary repair requires a
+/// launchd/operator restart afterward.
 pub fn repair(
     data_dir: &Path,
     paths: &LaunchdPaths,
@@ -334,7 +495,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn fixture() -> (TempDir, TempDir, LaunchdPaths, PathBuf) {
+    fn fixture() -> (TempDir, LaunchdPaths, PathBuf) {
         let root = TempDir::new().unwrap();
         let data = root.path().join("data");
         let home = root.path().join("home");
@@ -348,15 +509,16 @@ mod tests {
             b"plist-v1",
         )
         .unwrap();
-        (root, TempDir::new().unwrap(), paths, binary)
+        (root, paths, binary)
     }
 
     #[test]
     fn init_verify_and_repair_round_trip() {
-        let (_root, _unused, paths, binary) = fixture();
+        let (_root, paths, binary) = fixture();
         let data = paths.data_dir.clone();
         let report = init(&data, &paths, &binary).unwrap();
         assert_eq!(report.state, VaultState::Ok);
+        assert_eq!(report.signature, "unsigned_dev");
         assert!(manifest_path(&data).is_file());
 
         fs::write(&binary, b"binary-v2").unwrap();
@@ -379,8 +541,29 @@ mod tests {
     }
 
     #[test]
+    fn signed_vault_verifies_and_detects_tamper() {
+        let (root, paths, binary) = fixture();
+        let data = paths.data_dir.clone();
+        let key = root.path().join("vault.key");
+        keygen(&key, true).unwrap();
+        let report = init_signed(&data, &paths, &binary, &key).unwrap();
+        assert_eq!(report.state, VaultState::Ok);
+        assert_eq!(report.signature, "valid_local_ed25519");
+
+        let path = manifest_path(&data);
+        let mut manifest: VaultManifest =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest.build_hash = "sha256:tampered".to_string();
+        set_mode(&path, 0o600).unwrap();
+        fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        let tampered = verify(&data, &paths, &binary).unwrap();
+        assert_eq!(tampered.state, VaultState::VaultDrift);
+        assert_eq!(tampered.signature, "invalid");
+    }
+
+    #[test]
     fn repair_requires_confirmation() {
-        let (_root, _unused, paths, binary) = fixture();
+        let (_root, paths, binary) = fixture();
         let data = paths.data_dir.clone();
         init(&data, &paths, &binary).unwrap();
         assert!(repair(&data, &paths, &binary, false).is_err());
@@ -388,7 +571,7 @@ mod tests {
 
     #[test]
     fn verify_without_manifest_is_not_initialized() {
-        let (_root, _unused, paths, binary) = fixture();
+        let (_root, paths, binary) = fixture();
         let report = verify(&paths.data_dir, &paths, &binary).unwrap();
         assert_eq!(report.state, VaultState::NotInitialized);
     }

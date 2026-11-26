@@ -583,6 +583,7 @@ fn vault_view(state: &AppState) -> Option<VaultView> {
     };
     let view = VaultView {
         state: vault_state_str(report.state).to_string(),
+        signature: report.signature,
         manifest_present: std::path::Path::new(&report.manifest_path).is_file(),
         files_ok,
         files_drift,

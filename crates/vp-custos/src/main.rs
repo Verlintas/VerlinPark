@@ -41,6 +41,12 @@ struct Args {
     /// Explicitly initialize the Custos-owned hash vault.
     #[arg(long)]
     vault_init: bool,
+    /// Generate a 0600 local Ed25519 vault-signing key and exit.
+    #[arg(long)]
+    vault_keygen: Option<PathBuf>,
+    /// Local Ed25519 seed used to sign a new vault manifest.
+    #[arg(long)]
+    signing_key: Option<PathBuf>,
     /// Verify the Custos-owned hash vault against the current installation.
     #[arg(long)]
     vault_verify: bool,
@@ -69,12 +75,23 @@ async fn main() -> Result<()> {
         args.vault_init,
         args.vault_verify,
         args.vault_repair,
+        args.vault_keygen.is_some(),
     ]
     .into_iter()
     .filter(|value| *value)
     .count();
     if actions > 1 {
         bail!("choose only one lifecycle or vault action");
+    }
+    if let Some(path) = args.vault_keygen.as_deref() {
+        if !args.yes {
+            bail!("--vault-keygen requires --yes");
+        }
+        if args.signing_key.is_some() {
+            bail!("--signing-key is only valid with --vault-init");
+        }
+        println!("{}", vault::keygen(path, true)?);
+        return Ok(());
     }
     if args.vault_init || args.vault_verify || args.vault_repair {
         let binary = std::env::current_exe()?;
@@ -84,7 +101,11 @@ async fn main() -> Result<()> {
             if !args.yes {
                 bail!("--vault-init requires --yes");
             }
-            vault::init(&data_dir, &paths, &binary)?
+            if let Some(key) = args.signing_key.as_deref() {
+                vault::init_signed(&data_dir, &paths, &binary, key)?
+            } else {
+                vault::init(&data_dir, &paths, &binary)?
+            }
         } else if args.vault_repair {
             if !args.yes {
                 bail!("--vault-repair requires --yes");

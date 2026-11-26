@@ -40,8 +40,9 @@ The first slice implements:
   queue, effects, approvals, and supervised processes;
 - read-only process sampling with `sysinfo` and shadow pressure/stop
   recommendations, without any signal or notice;
-- an unsigned content-addressed hash vault for Custos-owned binary/plist
-  baselines, with explicit init/verify/repair and quarantine before restore;
+- a content-addressed hash vault for Custos-owned binary/plist baselines, with
+  optional local Ed25519 signing, explicit init/verify/repair, and quarantine
+  before restore;
 - a 0600 Unix-domain socket with `status`, `health`, `charter`, `ping`, and the
   explicitly consented `diagnostics.generate`;
 - local standard + forensic ZIP bundles (0700 directory, 0600 files, SHA-256
@@ -80,8 +81,8 @@ controls.
   verify `status`, `health`, `charter`, `ping`, `METHOD_NOT_FOUND` for `act`,
   and that a missing database is not created.
 - `cargo clippy --workspace --all-targets -- -D warnings` passes.
-- `cargo test -p vp-custos`: 58 unit + 4 integration + 1 module-governance.
-- Full Rust workspace: 4,765 passed / 0 failed / 6 ignored.
+- `cargo test -p vp-custos`: 59 unit + 4 integration + 1 module-governance.
+- Full Rust workspace: 4,766 passed / 0 failed / 6 ignored.
 - Swift `xcodebuild test`: 673 passed / 0 failed, including Custos wordmark,
   protocol decoding, diagnostics-result decoding, and unavailable-socket model
   tests.
@@ -92,8 +93,9 @@ controls.
   L4 recovery action is enabled.
 - The four-role launchd installer and heartbeat/watchdog are implemented, but
   the ring has not been installed/verified on a real machine. The hash vault
-  is unsigned and explicit-repair only; no signed/automatic self-heal and no
-  automatic boot installation yet.
+  supports optional local Ed25519 but is not release-signed and is
+  explicit-repair only; no automatic self-heal or automatic boot installation
+  yet.
 - The socket is 0600 but peer-uid/token checks are not implemented; only
   read-only status metadata is exposed.
 - Probe coverage is bounded to the named tables and does not run a full

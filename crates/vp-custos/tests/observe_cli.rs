@@ -99,6 +99,7 @@ async fn observe_only_status_health_charter_and_ping() {
     assert_eq!(health["probe"]["user_version"], 1);
     assert!(!health["processes"].as_array().unwrap().is_empty());
     assert_eq!(health["vault"]["state"], "not_initialized");
+    assert_eq!(health["vault"]["signature"], "none");
 
     let charter = vp_custos::client::charter(&socket).await.unwrap();
     assert_eq!(charter["observe_only"], true);

@@ -4070,10 +4070,13 @@ name = "vp-custos"
 version = "0.1.0-dev"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "dirs",
  "flate2",
  "fs2",
+ "rand 0.9.5",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",
