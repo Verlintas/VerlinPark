@@ -449,9 +449,12 @@ drill passes; a clean local first-run cannot report false success.
 approval fail-closed, remote ACP/header handling, source rebuild reporting,
 imported repair semantics, schema guard, Git/provider/Auto-cap/New-Session
 preflights, empty-project recovery, and a scripted backup/restore drill are
-implemented. Native computer/Code Mode remain open S1 items, no live provider
-tool probe has been run in this workspace, and Keychain/TCC first-run still
-needs a real-machine pass. In-run plan revision remains open.
+implemented. A clean `just release-preflight full` reported 4,806 Rust passed /
+0 failed / 6 ignored, 544 app + 132 helper Swift tests passed, the backup drill
+and scale/fault harness passed, a universal ad-hoc DMG was built and verified,
+and release binaries built. Native computer/Code Mode remain open S1 items, no
+live provider tool probe has been run in this workspace, and Keychain/TCC
+first-run still needs a real-machine pass. In-run plan revision remains open.
 
 ### Phase 2 — Scale, coding precision, and Agent Inspector (4–6 weeks)
 

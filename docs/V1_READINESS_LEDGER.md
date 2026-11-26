@@ -832,12 +832,13 @@ restart, or 72-hour soak evidence.
 | `vp bench fault` | PASS, 5/5 cases, 3 real fake-provider runtime cases |
 | `cargo clippy ... -D warnings` | passed |
 | `swiftformat --lint` | passed |
-| `xcodebuild build` | passed |
+| `just release-preflight full` | passed on a clean tree |
+| `cargo test --workspace` | 4,806 passed / 0 failed / 6 ignored |
+| `xcodebuild test` | 544 app + 132 helper passed |
 | `scripts/package-release.sh` | DMG created (universal, ad-hoc signed) |
 | `just verify-dmg` | checksum, image, helpers, layout, signature passed |
 
-A full `cargo test --workspace` run reported 4,802 passed / 0 failed / 6
-ignored before the final empty-project-removal tests were added; those three
-tests and all touched-crate suites passed individually afterward. The run is
-not claimed as a clean final full-workspace number until it is repeated without
-concurrent cargo builds.
+The first preflight run exposed one load-sensitive ACP WebSocket timeout
+(20s) and two locale-dependent Swift assertions. The timeout was raised to 60s
+and the assertions now compare localized strings; the clean rerun above passed.
+This is still not Developer ID signing/notarization or a live soak run.
