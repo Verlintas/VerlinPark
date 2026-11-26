@@ -35,9 +35,9 @@ in-daemon module.
   local Ed25519 seed (`--vault-keygen`, `--vault-init --signing-key`), quarantine
   before explicit restore, no VerlinPark source/policy/worktree/database writes.
   The manifest is surfaced as a `vault` status dimension. `--vault-auto-repair`
-  is opt-in and repairs drifted plists only; binary drift requires explicit
-  repair and a restart. Release signing and automatic binary recovery remain
-  open.
+  is opt-in and repairs drifted plists only. `--vault-auto-repair-binary` (with
+  `--vault-auto-repair`) additionally restores a drifted binary and requests a
+  launchd restart; it never runs by default. Release signing remains open.
 - Hash-chained `custos/audit/events.jsonl` (0600) with `--audit-verify`, core
   start/stop entries, and an automatic 30s vault-state audit when the state
   changes. Audit payloads are metadata only; no prompts, messages, tool output,
@@ -66,8 +66,8 @@ governance; full workspace **4,779 Rust passed / 0 failed / 6 ignored**;
 `xcodebuild test` **673 passed / 0 failed** with English test language; the
 Custos window is a normal SwiftUI GUI with only the wordmark as ASCII art.
 The four-role launchd ring is implemented but not yet installed/verified on a
-real machine; release signing/automatic binary self-heal and L2–L4 mutation
-classes remain open and are not claimed.
+real machine; release signing and L2–L4 mutation classes remain open and are
+not claimed.
 
 ## 2026-11-26 V1 Phase 1 closure batch
 

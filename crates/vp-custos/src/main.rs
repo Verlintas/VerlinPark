@@ -57,6 +57,9 @@ struct Args {
     /// Opt in to automatic repair of drifted plists from a valid vault.
     #[arg(long)]
     vault_auto_repair: bool,
+    /// Also allow automatic binary repair and a launchd restart.
+    #[arg(long)]
+    vault_auto_repair_binary: bool,
     /// Explicitly repair drifted/missing Custos-owned targets from the vault.
     #[arg(long)]
     vault_repair: bool,
@@ -181,8 +184,14 @@ async fn main() -> Result<()> {
     if let Some(socket) = args.socket {
         config = config.with_socket(socket);
     }
+    if args.vault_auto_repair_binary && !args.vault_auto_repair {
+        bail!("--vault-auto-repair-binary requires --vault-auto-repair");
+    }
     if args.vault_auto_repair {
         config = config.with_auto_repair(true);
+    }
+    if args.vault_auto_repair_binary {
+        config = config.with_auto_repair_binary(true);
     }
     run(config).await
 }

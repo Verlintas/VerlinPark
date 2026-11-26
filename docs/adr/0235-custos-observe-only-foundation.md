@@ -41,8 +41,8 @@ The first slice implements:
 - read-only process sampling with `sysinfo` and shadow pressure/stop
   recommendations, without any signal or notice;
 - a content-addressed hash vault for Custos-owned binary/plist baselines, with
-  optional local Ed25519 signing, explicit init/verify/repair, opt-in plist
-  auto-repair, and quarantine before restore;
+  optional local Ed25519 signing, explicit init/verify/repair, opt-in
+  plist/binary auto-repair, and quarantine before restore;
 - an append-only hash-chained JSONL audit for start/stop and automatic 30s
   vault-state changes, with `--audit-verify`;
 - sealed one-way notice files drained by the agent loop at a turn boundary and
@@ -98,9 +98,8 @@ controls.
   L4 recovery action is enabled.
 - The four-role launchd installer and heartbeat/watchdog are implemented, but
   the ring has not been installed/verified on a real machine. The hash vault
-  supports optional local Ed25519 and opt-in plist auto-repair but is not
-  release-signed; binary self-heal and automatic boot installation remain
-  open.
+  supports optional local Ed25519 and opt-in plist/binary auto-repair but is
+  not release-signed; automatic boot installation remains open.
 - The socket is 0600 but peer-uid/token checks are not implemented; only
   read-only status metadata is exposed.
 - Probe coverage is bounded to the named tables and does not run a full

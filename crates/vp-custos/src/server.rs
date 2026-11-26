@@ -22,6 +22,7 @@ use crate::capacity::MachineCapacity;
 use crate::charter;
 use crate::diagnostics::{self, BundleMode};
 use crate::discovery;
+use crate::launchd::LaunchctlRunner;
 use crate::notice;
 use crate::probe::{self, ProbeReport};
 use crate::process_probe::{ProcessCache, ProcessReport};
@@ -45,6 +46,7 @@ pub struct ServerConfig {
     pub role: CustosRole,
     pub observe_only: bool,
     pub auto_repair: bool,
+    pub auto_repair_binary: bool,
 }
 
 impl ServerConfig {
@@ -56,6 +58,7 @@ impl ServerConfig {
             role,
             observe_only,
             auto_repair: false,
+            auto_repair_binary: false,
         }
     }
 
@@ -68,6 +71,11 @@ impl ServerConfig {
         self.auto_repair = auto_repair;
         self
     }
+
+    pub fn with_auto_repair_binary(mut self, auto_repair_binary: bool) -> Self {
+        self.auto_repair_binary = auto_repair_binary;
+        self
+    }
 }
 
 #[derive(Clone)]
@@ -76,6 +84,7 @@ struct AppState {
     role: CustosRole,
     observe_only: bool,
     auto_repair: bool,
+    auto_repair_binary: bool,
     started_at: Instant,
     started_at_rfc: String,
     pid: u32,
@@ -113,6 +122,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         role: config.role,
         observe_only: config.observe_only,
         auto_repair: config.auto_repair,
+        auto_repair_binary: config.auto_repair_binary,
         started_at: Instant::now(),
         started_at_rfc: started_at_rfc.clone(),
         pid: std::process::id(),
@@ -194,13 +204,14 @@ pub async fn run(config: ServerConfig) -> Result<()> {
                             "files_missing": report.files.iter().filter(|file| file.target_state == "missing").count(),
                         }),
                     );
+                    let binary_drift = report
+                        .files
+                        .iter()
+                        .any(|file| file.kind == "binary" && file.target_state != "ok");
                     if heartbeat_state.auto_repair
                         && state == "drift"
                         && report.signature != "invalid"
-                        && report
-                            .files
-                            .iter()
-                            .all(|file| file.kind != "binary" || file.target_state == "ok")
+                        && (!binary_drift || heartbeat_state.auto_repair_binary)
                     {
                         let repaired =
                             vault::repair(&heartbeat_state.data_dir, paths, &paths.binary, true);
@@ -208,13 +219,32 @@ pub async fn run(config: ServerConfig) -> Result<()> {
                             .as_ref()
                             .map(|value| vault_state_str(value.state))
                             .unwrap_or("failed");
+                        let restart = if binary_drift
+                            && repaired
+                                .as_ref()
+                                .is_ok_and(|value| value.state == VaultState::Ok)
+                        {
+                            match crate::launchd::uid() {
+                                Ok(uid) => {
+                                    let target = format!(
+                                        "gui/{uid}/{}",
+                                        crate::launchd::label(CustosRole::Core)
+                                    );
+                                    runner.run(&["kickstart", "-k", target.as_str()]).is_ok()
+                                }
+                                Err(_) => false,
+                            }
+                        } else {
+                            false
+                        };
                         let _ = audit::append(
                             &heartbeat_state.data_dir,
                             "vault.repair",
                             serde_json::json!({
                                 "before": state,
                                 "after": after,
-                                "binary_skipped": true,
+                                "binary_repaired": binary_drift,
+                                "restart_requested": restart,
                             }),
                         );
                         if let Ok(value) = repaired {
@@ -223,6 +253,13 @@ pub async fn run(config: ServerConfig) -> Result<()> {
                             last_vault_state = state;
                         }
                     } else {
+                        if binary_drift && !heartbeat_state.auto_repair_binary {
+                            let _ = audit::append(
+                                &heartbeat_state.data_dir,
+                                "vault.binary_drift",
+                                serde_json::json!({"auto_binary_repair": false}),
+                            );
+                        }
                         last_vault_state = state;
                     }
                 }
