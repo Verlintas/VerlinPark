@@ -479,3 +479,76 @@ cannot command it.
    binary, OS-level custody, and a small action allowlist.
 10. What is the minimum human-visible incident information that is ethically
     required? This needs a separate "sealed but honest" policy.
+
+## 14. Round 2 direction: sealed authority, notices, and diagnostic export
+
+### 14.1 Charter is fixed
+
+The charter is **not runtime configuration**. It ships with the signed Custos
+binary/release, is hash-pinned, and is not editable from the GUI, project
+policy, agent tools, SQLite, or environment variables. If the user can edit it,
+an agent team could eventually reach the same control surface and the guardian
+would stop being a guardian. Changing the charter requires a new signed release
+by the developer/owner, outside Custos and outside any agent.
+
+### 14.2 Authority relationship
+
+- Custos authority is **higher than and independent of the user** for
+  integrity/health protection.
+- The user has **awareness, not jurisdiction**: read-only status, limited
+  incident information, and an explicit diagnostic-export action.
+- Agents cannot call, query, configure, or impersonate Custos.
+- The user can still stop Custos at the OS level (quit/kill/uninstall/delete
+  data). That is the accepted last-resort custody, not an in-product control.
+- A normal VerlinPark user action or agent action that would damage integrity
+  may be vetoed/frozen by Custos, with a bounded notice.
+
+### 14.3 Non-destructive pressure vs stuck work
+
+Custos distinguishes:
+
+1. **Resource pressure / possible false stall** — a process or test is consuming
+   excessive CPU/memory/I/O or has exceeded a soft expected duration, but is
+   still alive and making some progress.
+   - Custos sends a one-way notice to the **responsible agent** (the agent that
+     started the process/test, resolved from the process supervisor's
+     session/task/agent ownership; daemon-internal work maps to system).
+   - The notice says: who Custos is, which process/test is over budget, the
+     observed impact, and asks it to stop or adjust.
+   - A grace window follows. No kill on the first warning.
+2. **Stuck / unresponsive** — no heartbeat/progress beyond the hard threshold,
+   process group unresponsive to the normal stop path, or a hard resource cap
+   is breached.
+   - Custos terminates the process group through the existing supervised
+     process API (TERM, bounded grace, KILL).
+   - Custos then sends a short post-action notice to the responsible agent.
+   - The notice is templated; it contains process/test identity, action, result,
+     and consequence, not raw output or secrets.
+
+The notice channel should be a **sealed `custos.notice` system message**, not a
+normal agent-to-agent coordination note. It is one-way; agents have no tool to
+reply or query Custos. It is delivered at the next safe turn boundary for a
+running agent, or to the project inbox for an idle/identity agent. Agents may
+act by using their normal process/tool controls; they cannot negotiate with
+Custos.
+
+### 14.4 User-initiated diagnostic export
+
+The GUI has one deliberate user action: **generate a diagnostic bundle for a
+developer**. It is consent, not control, and it is never automatic/uploaded.
+
+- A secondary sheet/window, not the main Custos status surface.
+- One-click generation, local save only; no network, no auto-send.
+- Bundle contains detailed device/runtime evidence: OS/hardware/app/daemon
+  versions, health snapshot, recent Custos actions, bounded logs, DB/WAL/schema
+  state, queue/lease/run summaries, worktree/ref health, crash traces, selected
+  incident timeline, redacted config.
+- It excludes provider keys, prompts, message bodies, file contents, screen
+  content, cookies, and credentials. Paths/payloads are redacted or reduced to
+  basenames by default.
+- A clear privacy notice and a standard/forensic choice; forensic may include
+  more path/state detail after an explicit warning, but still no secrets or
+  user content.
+- Signed manifest + SHA-256 + report id; developer can verify provenance.
+- The main Custos surface still has no repair/restart/restore/approve/kill
+  controls.
