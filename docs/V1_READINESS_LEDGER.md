@@ -593,12 +593,28 @@ bounded locally:
   exploring, run the bounded check, and commit. This is advisory; it does not
   auto-commit. Test: `injects_a_finalize_nudge_before_the_turn_limit`.
 
-Local verification: `cargo test --workspace` 4,700 passed / 0 failed / 6
-ignored; `cargo fmt --check` and
-`cargo clippy --workspace --all-targets -- -D warnings` pass. The reserve caps
-are constants for this slice rather than project-configurable; the finalize
-nudge is not a hard finalize; event deltas still persist in SQLite but are
-bounded; and the context-budget/task-envelope work remains open.
+- **Soft context budget.** `RoleModelConfig.context_budget` (optional) now
+  moves the compaction threshold to 90% of that soft target while the hard
+  request limit remains the model window minus output/framing reserves. This
+  lets a 1M-token model keep its capability but have Worker/Labour sessions
+  compact around 59k instead of growing a 70k active context across hundreds of
+  calls. Test:
+  `soft_context_budget_moves_threshold_not_the_hard_window`. The field is
+  optional and default-off, so operators must set it per role.
+- **Plan scope cap.** `validate_team_plan` now rejects more than 8 acceptance
+  items per task (and empty/over-300-character items); the schema advertises
+  the same bound. This prevents a single task from carrying the 22-item scope
+  that made the live T1 run so expensive. Test:
+  `rejects_plans_with_more_than_eight_acceptance_items`.
+
+Local verification after this slice: `cargo test --workspace` 4,702 passed /
+0 failed / 6 ignored; Swift `xcodebuild test` 659 passed / 0 failed;
+`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+and `swiftformat --lint` pass. The reserve caps are constants for this slice
+rather than project-configurable; the finalize nudge is not a hard finalize;
+event deltas still persist in SQLite but are bounded; and per-task tool-call
+budgets, the deterministic browser probe, and default per-role context budgets
+remain open.
 
 ### 2026-11-26 live DeepSeek PDfuji retry: harness fixes, partial E2E
 

@@ -3798,6 +3798,7 @@ struct RoleModelConfig: Codable, Hashable, Sendable {
     var cacheReadUsdPerMillion: Double? = nil
     var cacheWriteUsdPerMillion: Double? = nil
     var contextWindow: Int? = nil
+    var contextBudget: Int? = nil
 
     enum CodingKeys: String, CodingKey {
         case model
@@ -3806,6 +3807,7 @@ struct RoleModelConfig: Codable, Hashable, Sendable {
         case cacheReadUsdPerMillion = "cache_read_usd_per_million"
         case cacheWriteUsdPerMillion = "cache_write_usd_per_million"
         case contextWindow = "context_window"
+        case contextBudget = "context_budget"
     }
 }
 

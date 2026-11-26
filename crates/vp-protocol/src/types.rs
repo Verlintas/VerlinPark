@@ -2542,6 +2542,11 @@ pub struct RoleModelConfig {
     /// Optional context window for this role's model, in tokens.
     #[serde(default)]
     pub context_window: Option<u64>,
+    /// Optional early-compaction target for this role, in tokens. This is a
+    /// cost/shape budget, not a model capability: the hard request limit still
+    /// comes from `context_window`, but compaction starts at 90% of this value.
+    #[serde(default)]
+    pub context_budget: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

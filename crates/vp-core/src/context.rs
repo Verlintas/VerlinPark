@@ -59,6 +59,9 @@ pub const CONTEXT_FRAMING_SAFETY_TOKENS: u64 = 1_024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionPolicy {
     pub window: u64,
+    /// Optional early-compaction target. Present only when it is below the
+    /// model window; the hard request limit stays `window`.
+    pub context_budget: Option<u64>,
     pub output_reserve: u64,
     pub framing_safety: u64,
     pub hard_limit: u64,
@@ -69,11 +72,25 @@ pub struct CompactionPolicy {
 
 impl CompactionPolicy {
     pub fn derive(window: u64, output_reserve: u64, override_tokens: u64) -> Self {
+        Self::derive_with_budget(window, output_reserve, override_tokens, None)
+    }
+
+    /// Derive a policy with an optional soft context target. The target only
+    /// moves the compaction threshold; an explicit `compact_after_tokens`
+    /// override still wins, and the hard request limit remains the model
+    /// window minus output/framing reserves.
+    pub fn derive_with_budget(
+        window: u64,
+        output_reserve: u64,
+        override_tokens: u64,
+        context_budget: Option<u64>,
+    ) -> Self {
         let output_reserve = output_reserve.max(1);
         let framing = CONTEXT_FRAMING_SAFETY_TOKENS;
         if window == 0 {
             return Self {
                 window,
+                context_budget: None,
                 output_reserve,
                 framing_safety: framing,
                 hard_limit: u64::MAX,
@@ -85,8 +102,13 @@ impl CompactionPolicy {
         let hard_limit = window
             .saturating_sub(output_reserve.saturating_add(framing))
             .max(1_024);
-        let ratio_threshold =
-            window.saturating_mul(u64::from(DEFAULT_COMPACTION_WINDOW_RATIO_BASIS_POINTS)) / 10_000;
+        let soft = context_budget
+            .filter(|budget| *budget > 0 && *budget < window)
+            .map(|budget| budget.min(hard_limit));
+        let ratio_window = soft.unwrap_or(window);
+        let ratio_threshold = ratio_window
+            .saturating_mul(u64::from(DEFAULT_COMPACTION_WINDOW_RATIO_BASIS_POINTS))
+            / 10_000;
         let threshold = if override_tokens > 0 {
             // An explicit operator override is intentional and may be tiny in
             // tests or for a deliberately aggressive local setup. Only clamp
@@ -99,6 +121,7 @@ impl CompactionPolicy {
         };
         Self {
             window,
+            context_budget: soft,
             output_reserve,
             framing_safety: framing,
             hard_limit,
@@ -117,6 +140,8 @@ impl CompactionPolicy {
             "disabled"
         } else if self.override_tokens > 0 {
             "environment_override"
+        } else if self.context_budget.is_some() {
+            "context_budget"
         } else {
             "window_ratio"
         }
@@ -987,6 +1012,25 @@ mod compaction_policy_tests {
             policy.threshold > policy.hard_limit * 3 / 4,
             "must not compact at the old 75% default"
         );
+    }
+
+    #[test]
+    fn soft_context_budget_moves_threshold_not_the_hard_window() {
+        let policy = CompactionPolicy::derive_with_budget(1_048_576, 4_096, 0, Some(65_536));
+        assert_eq!(policy.window, 1_048_576);
+        assert_eq!(policy.context_budget, Some(65_536));
+        assert_eq!(policy.hard_limit, 1_043_456);
+        assert_eq!(policy.threshold, 58_982);
+        assert_eq!(policy.source(), "context_budget");
+
+        let overridden =
+            CompactionPolicy::derive_with_budget(1_048_576, 4_096, 10_000, Some(65_536));
+        assert_eq!(overridden.threshold, 10_000);
+        assert_eq!(overridden.source(), "environment_override");
+
+        let ignored = CompactionPolicy::derive_with_budget(1_048_576, 4_096, 0, Some(2_000_000));
+        assert_eq!(ignored.context_budget, None);
+        assert_eq!(ignored.source(), "window_ratio");
     }
 
     #[test]

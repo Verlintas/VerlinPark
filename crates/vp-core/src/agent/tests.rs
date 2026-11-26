@@ -4095,6 +4095,31 @@ fn approval_mode_updates_without_provider_reconfiguration() {
 }
 
 #[test]
+fn rejects_plans_with_more_than_eight_acceptance_items() {
+    let plan: TeamPlan = serde_json::from_value(serde_json::json!({
+        "goal": "too broad",
+        "departments": [{
+            "name": "impl",
+            "manager_title": "Implementation",
+            "profile": "coding",
+            "objective": "build"
+        }],
+        "tasks": [{
+            "id": "T1",
+            "department": "impl",
+            "title": "One task doing everything",
+            "kind": "coding",
+            "acceptance": (0..9).map(|index| format!("item {index}")).collect::<Vec<_>>()
+        }]
+    }))
+    .unwrap();
+    let error = super::plan::validate_team_plan(&plan, 5).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("at most 8"), "{message}");
+    assert!(message.contains("separate task"), "{message}");
+}
+
+#[test]
 fn rejects_verification_task_with_a_write_scope() {
     let plan: TeamPlan = serde_json::from_value(serde_json::json!({
         "goal": "verify",

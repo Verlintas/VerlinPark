@@ -147,6 +147,22 @@ pub(crate) fn validate_team_plan(plan: &TeamPlan, max_managers: usize) -> Result
         if task.acceptance.is_empty() {
             return Err(anyhow!("task '{id}' needs at least one acceptance item"));
         }
+        if task.acceptance.len() > 8 {
+            return Err(anyhow!(
+                "task '{id}' has {} acceptance items; keep at most 8 and split the remaining work into a separate task",
+                task.acceptance.len()
+            ));
+        }
+        if let Some(item) = task
+            .acceptance
+            .iter()
+            .find(|item| item.trim().is_empty() || item.chars().count() > 300)
+        {
+            return Err(anyhow!(
+                "task '{id}' has an empty or over-300-character acceptance item: {}",
+                item.chars().take(80).collect::<String>()
+            ));
+        }
         for dep in &task.deps {
             if dep == id {
                 return Err(anyhow!("task '{id}' depends on itself"));

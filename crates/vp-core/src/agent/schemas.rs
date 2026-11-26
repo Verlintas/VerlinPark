@@ -602,7 +602,7 @@ pub(super) fn tool_schemas_with_capabilities(
                                 },
                                 "deps": {"type": "array", "items": {"type": "string"}, "description": "Task ids that must finish first; must exist in this plan"},
                                 "write_scope": {"type": "array", "items": {"type": "string"}, "description": "Repo-relative paths this task may write. Leave empty for verification, research, and other read-only tasks."},
-                                "acceptance": {"type": "array", "items": {"type": "string"}, "description": "At least one concrete acceptance item"},
+                                "acceptance": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 300}, "description": "1–8 concrete acceptance items; split larger work into separate tasks"},
                                 "token_budget": {"type": "integer", "minimum": 1, "description": "Optional task token cap"},
                                 "cost_budget_usd": {"type": "number", "exclusiveMinimum": 0, "description": "Optional task USD cap"}
                             },

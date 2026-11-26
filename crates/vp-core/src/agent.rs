@@ -4227,7 +4227,17 @@ fn context_compaction_policy(
 ) -> crate::context::CompactionPolicy {
     let window = context_window_for(config, role);
     let output = u64::from(config.max_tokens.unwrap_or(4096));
-    crate::context::CompactionPolicy::derive(window, output, config.compact_after_tokens)
+    let context_budget = config
+        .role_models
+        .for_role(role.as_str())
+        .context_budget
+        .filter(|budget| *budget > 0);
+    crate::context::CompactionPolicy::derive_with_budget(
+        window,
+        output,
+        config.compact_after_tokens,
+        context_budget,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

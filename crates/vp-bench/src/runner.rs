@@ -526,6 +526,7 @@ fn role_model(model: &str, pricing: &Pricing, context_window: u64) -> RoleModelC
         cache_read_usd_per_million: Some(pricing.cache_read_usd_per_million),
         cache_write_usd_per_million: Some(pricing.cache_write_usd_per_million),
         context_window: (context_window > 0).then_some(context_window),
+        context_budget: None,
     }
 }
 
