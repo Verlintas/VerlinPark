@@ -2583,6 +2583,28 @@ mod governor_cli_tests {
     }
 
     #[test]
+    fn release_hardening_flags_parse() {
+        let cli = parse(&["vp", "provider-test", "--tools"]);
+        match cli.command {
+            Command::ProviderTest { tools } => assert!(tools),
+            other => panic!("expected provider-test, got {other:?}"),
+        }
+        let cli = parse(&["vp", "project-add", "/tmp/repo", "--hardened-shell"]);
+        match cli.command {
+            Command::ProjectAdd { hardened_shell, .. } => assert!(hardened_shell),
+            other => panic!("expected project-add, got {other:?}"),
+        }
+        let cli = parse(&["vp", "project-remove", "project-1", "--yes"]);
+        match cli.command {
+            Command::ProjectRemove { project, yes } => {
+                assert_eq!(project, "project-1");
+                assert!(yes);
+            }
+            other => panic!("expected project-remove, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn governor_commands_and_flags_parse() {
         let cli = parse(&["vp", "governor", "session-1", "--limit", "7"]);
         match cli.command {

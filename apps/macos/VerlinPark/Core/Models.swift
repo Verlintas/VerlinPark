@@ -2581,6 +2581,36 @@ struct AgentProbeResult: Codable, Sendable {
     }
 }
 
+/// Explicit provider tool-calling capability result. A text probe is not proof
+/// that the endpoint accepts tools, so this is a separate one-call check.
+struct AgentToolProbeResult: Codable, Sendable {
+    let provider: String
+    let model: String
+    let latencyMs: Int
+    let done: Bool
+    let inputTokens: Int
+    let outputTokens: Int
+    let toolCalling: Bool
+    let toolName: String?
+    let argumentsPreview: String?
+    let text: String
+    let note: String
+
+    enum CodingKeys: String, CodingKey {
+        case provider
+        case model
+        case latencyMs = "latency_ms"
+        case done
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case toolCalling = "tool_calling"
+        case toolName = "tool_name"
+        case argumentsPreview = "arguments_preview"
+        case text
+        case note
+    }
+}
+
 struct ProjectBudget: Codable, Hashable, Sendable {
     var tokenBudget: Int?
     var costBudgetUsd: Double?

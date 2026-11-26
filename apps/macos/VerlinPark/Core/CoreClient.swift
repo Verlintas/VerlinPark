@@ -2879,6 +2879,13 @@ actor CoreClient {
             .decode(AgentProbeResult.self)
     }
 
+    /// One extra provider call that verifies the model emits the expected tool
+    /// call. It never executes a local tool.
+    func probeProviderTools() async throws -> AgentToolProbeResult {
+        try await request(method: "agent.probe.tools", params: [:])
+            .decode(AgentToolProbeResult.self)
+    }
+
     func projectBudget(projectID: String) async throws -> ProjectBudgetResult {
         let params: [String: JSONValue] = ["project_id": .string(projectID)]
         return try await request(method: "project.budget.get", params: params)

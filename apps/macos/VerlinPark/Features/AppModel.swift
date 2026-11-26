@@ -760,6 +760,9 @@ final class AppModel {
     var providerProbeStatus: String?
     /// True only after a live probe succeeds for the current provider config.
     var providerProbeSucceeded = false
+    var providerToolProbeStatus: String?
+    /// `nil` means not probed; `false` means the endpoint returned no tool call.
+    var providerToolCalling: Bool?
     var planResumeBusy = false
     var cleanupOlderDaysText = "7"
     var cleanupDryRun = true
@@ -6567,6 +6570,8 @@ final class AppModel {
         }
         providerBusy = true
         providerProbeSucceeded = false
+        providerToolProbeStatus = nil
+        providerToolCalling = nil
         defer { providerBusy = false }
 
         let typedKey = providerAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -10031,8 +10036,21 @@ final class AppModel {
             }
             providerProbeStatus =
                 "\(result.provider) / \(result.model) · \(result.latencyMs) ms\(streamDetail) · \(result.text)"
+            do {
+                let tool = try await core.probeProviderTools()
+                providerToolCalling = tool.toolCalling
+                providerToolProbeStatus = tool.toolCalling
+                    ? "Tool calling supported · \(tool.toolName ?? "probe_echo")"
+                    : "Tool calling not observed · \(tool.note)"
+            } catch {
+                providerToolCalling = nil
+                providerToolProbeStatus =
+                    "Tool-calling probe failed · \(error.localizedDescription)"
+            }
         } catch {
             providerProbeSucceeded = false
+            providerToolCalling = nil
+            providerToolProbeStatus = nil
             providerProbeStatus = error.localizedDescription
             handle(error)
         }

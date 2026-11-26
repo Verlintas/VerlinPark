@@ -17,11 +17,12 @@
   `configured`; loopback endpoints remain keyless. A new
   `agent.probe.tools` / `vp provider-test --tools` sends one `probe_echo` tool
   request and reports real tool-calling capability without executing a tool.
-- First-run setup requires a project, a successful live probe, and an explicit
-  shell trust decision. Hardened mode (network deny, HOME/volume read jail) is
-  the recommended default; `vp project-add --hardened-shell` mirrors it. New
-  Session creation is blocked until a provider is configured; doctor warns
-  while a project uses permissive shell defaults.
+- First-run setup requires a project, a successful live probe, a tool-calling
+  check, and an explicit shell trust decision. Hardened mode (network deny,
+  HOME/volume read jail) is the recommended default;
+  `vp project-add --hardened-shell` mirrors it. New Session creation is blocked
+  until a provider is configured; doctor warns while a project uses permissive
+  shell defaults.
 - `scripts/backup-restore-drill.sh` / `just backup-drill` seeds a real daemon
   data directory, adds a Git project via RPC, and verifies v1 ZIP plus
   signed/encrypted repository backup, `backup-verify`, restore, and project-row

@@ -323,6 +323,20 @@ struct SetupWizardView: View {
             if let status = model.providerProbeStatus, !status.isEmpty {
                 Text(status).font(VPTheme.mono(8)).foregroundStyle(VPTheme.textTertiary)
             }
+            if let status = model.providerToolProbeStatus, !status.isEmpty {
+                Label(
+                    status,
+                    systemImage: model.providerToolCalling == true
+                        ? "wrench.and.screwdriver.fill"
+                        : "exclamationmark.triangle"
+                )
+                .font(VPTheme.mono(8))
+                .foregroundStyle(
+                    model.providerToolCalling == true
+                        ? VPTheme.success
+                        : VPTheme.warning
+                )
+            }
             if model.agentInfo?.configured == true, !model.providerProbeSucceeded {
                 Text(L10n.t("Run Save & test once so setup can verify a real response before continuing."))
                     .font(VPTheme.mono(8))
@@ -435,6 +449,19 @@ struct SetupWizardView: View {
                         ? L10n.t("Shell trust: standard access")
                         : L10n.t("Shell trust: hardened")
                 )
+                if model.providerProbeSucceeded {
+                    Text(
+                        model.providerToolCalling == true
+                            ? L10n.t("Tool calling verified")
+                            : L10n.t("Tool calling unverified — coding sessions may fail")
+                    )
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(
+                        model.providerToolCalling == true
+                            ? VPTheme.success
+                            : VPTheme.warning
+                    )
+                }
                 summaryRow(true, L10n.t("Smart approvals · Verifier gate · deterministic Integrator"))
             }
         }

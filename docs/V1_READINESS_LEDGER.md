@@ -758,7 +758,9 @@ four-tier path with a deliberately non-human spatial output.
 - **First-run setup could claim connected without a project or a probe.** The
   wizard now requires an added project, an explicit shell trust decision
   (hardened recommended), and a successful live `agent.probe` before Continue.
-  Session creation is also blocked until a provider is configured.
+  It also runs the one-call `agent.probe.tools` check and labels tool calling
+  as verified or unverified; unsupported tool calling is never silently called
+  "connected". Session creation is also blocked until a provider is configured.
 - **Wizard startup raced the daemon.** First-run now waits a bounded time for
   the local daemon, shows connection state, and provides an explicit Retry that
   cancels automatic backoff; setup controls stay disabled until connected.
