@@ -63,7 +63,16 @@ struct RootView: View {
             .animation(VPMotion.smooth, value: focusMode)
             .task {
                 guard !onboardingCompleted else { return }
-                try? await Task.sleep(for: .seconds(1.2))
+                // Give the bundled daemon a bounded head start, then show the
+                // wizard even on failure so it can display connection state and
+                // an explicit Retry action instead of a silent stalled setup.
+                for _ in 0 ..< 20 {
+                    if model.connection == .connected {
+                        break
+                    }
+                    try? await Task.sleep(for: .milliseconds(500))
+                }
+                try? await Task.sleep(for: .milliseconds(300))
                 if !onboardingCompleted {
                     showSetupWizard = true
                 }

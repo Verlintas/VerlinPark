@@ -22,6 +22,28 @@ pub(super) async fn handle(
             Ok(projects) => RpcResponse::success(id, ProjectListResult { projects }),
             Err(error) => internal_error(id, error),
         },
+        "project.remove" => {
+            match parse_params::<vp_protocol::types::RemoveProjectParams>(request.params) {
+                Ok(params) if !params.confirm => RpcResponse::error(
+                    id,
+                    RpcError::with_data(
+                        codes::INVALID_PARAMS,
+                        "project.remove requires explicit confirmation",
+                        json!({"code": "PROJECT_REMOVE_CONFIRM_REQUIRED"}),
+                    ),
+                ),
+                Ok(params) => match state.engine.remove_project(params.project_id.clone()).await {
+                    Ok(()) => RpcResponse::success(
+                        id,
+                        vp_protocol::types::RemoveProjectResult {
+                            project_id: params.project_id,
+                        },
+                    ),
+                    Err(error) => internal_error(id, error),
+                },
+                Err(response) => response_with_id(id, response),
+            }
+        }
         "host.list" => match parse_params::<HostListParams>(request.params) {
             Ok(_) => match state.engine.list_execution_hosts().await {
                 Ok(hosts) => RpcResponse::success(id, HostListResult { hosts }),

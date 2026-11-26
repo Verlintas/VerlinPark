@@ -26,6 +26,13 @@
   data directory, adds a Git project via RPC, and verifies v1 ZIP plus
   signed/encrypted repository backup, `backup-verify`, restore, and project-row
   equality. `just release-preflight` includes it.
+- An empty project entry can be removed with `project.remove` /
+  `vp project-remove --yes` or the Rail project menu. It requires explicit
+  confirmation, refuses when sessions/identities/workspaces/intake tasks exist,
+  never deletes repository files, and clears the project manifest if the last
+  project is removed.
+- First-run waits for the local daemon, shows connection state, and offers an
+  explicit Retry that cancels automatic backoff.
 - `vp bench scale` validates and completes a 100-task/10-Worker plan through the
   real TeamPlan validator and task scheduler projection; `vp bench fault` runs
   three fake-provider runtime faults (pre-output failure, truncation,

@@ -759,6 +759,9 @@ four-tier path with a deliberately non-human spatial output.
   wizard now requires an added project, an explicit shell trust decision
   (hardened recommended), and a successful live `agent.probe` before Continue.
   Session creation is also blocked until a provider is configured.
+- **Wizard startup raced the daemon.** First-run now waits a bounded time for
+  the local daemon, shows connection state, and provides an explicit Retry that
+  cancels automatic backoff; setup controls stay disabled until connected.
 - **The first-run shell decision was implicit.** The wizard offers hardened
   shell access (network deny plus HOME/volume read jail) by default and standard
   access as an explicit opt-in; `vp project-add --hardened-shell` applies the
@@ -775,6 +778,15 @@ four-tier path with a deliberately non-human spatial output.
   assignment-shaped secrets. Execution arguments, effect probes, contract
   checks, and journal fingerprints still use the real input. Tests:
   `crates/vp-core/tests/secret_redaction.rs` plus the redaction unit tests.
+- **A bad project entry could not be removed.** `project.remove` /
+  `vp project-remove --yes` removes only an empty project (no sessions,
+  identities, workspaces, or intake tasks), refuses without explicit
+  confirmation, never deletes repository files, and clears the manifest when
+  the last project is removed. The Rail project menu exposes the same action
+  with a confirmation alert. Tests:
+  `removing_an_empty_project_clears_the_manifest`,
+  `removing_a_project_with_sessions_fails_closed`, and
+  `project_remove_requires_explicit_confirmation`.
 - **No bounded scale/fault harness.** `vp bench scale` validates and completes a
   100-task/10-Worker plan through the real TeamPlan validator and task
   scheduler projection, and `vp bench fault` covers two real fake-provider

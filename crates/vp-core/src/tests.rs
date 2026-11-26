@@ -16812,3 +16812,52 @@ mod replay_integrity_tests {
         assert_eq!(runs[0].runtime_snapshot.as_ref(), Some(&snapshot));
     }
 }
+
+#[tokio::test]
+async fn removing_an_empty_project_clears_the_manifest() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("remove".into()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(engine.list_projects().await.unwrap().len(), 1);
+    engine.remove_project(project.id).await.unwrap();
+    assert!(engine.list_projects().await.unwrap().is_empty());
+    let manifest = std::fs::read_to_string(data.path().join("projects.jsonl")).unwrap();
+    assert!(
+        manifest.trim().is_empty(),
+        "manifest must not resurrect a removed project"
+    );
+}
+
+#[tokio::test]
+async fn removing_a_project_with_sessions_fails_closed() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let engine = Engine::new(Store::open(data.path()).unwrap());
+    let project = engine
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("busy".into()),
+        )
+        .await
+        .unwrap();
+    engine
+        .create_session(project.id.clone(), "keep me".into(), None)
+        .await
+        .unwrap();
+    let error = engine
+        .remove_project(project.id)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("session"), "unexpected error: {error}");
+    assert_eq!(engine.list_projects().await.unwrap().len(), 1);
+}

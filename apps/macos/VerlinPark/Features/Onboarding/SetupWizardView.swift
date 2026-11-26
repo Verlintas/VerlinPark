@@ -83,11 +83,28 @@ struct SetupWizardView: View {
     }
 
     private var providerReady: Bool {
-        model.agentInfo?.configured == true && model.providerProbeSucceeded
+        daemonConnected && model.agentInfo?.configured == true && model.providerProbeSucceeded
+    }
+
+    private var daemonConnected: Bool {
+        model.connection == .connected
+    }
+
+    private var connectionDetail: String {
+        switch model.connection {
+        case .connected:
+            L10n.t("Local daemon connected")
+        case .connecting:
+            L10n.t("Connecting to the local daemon…")
+        case let .failed(message):
+            message
+        case .idle:
+            L10n.t("Waiting for the local daemon…")
+        }
     }
 
     private var projectReady: Bool {
-        !model.projects.isEmpty
+        daemonConnected && !model.projects.isEmpty
     }
 
     var body: some View {
@@ -96,6 +113,10 @@ struct SetupWizardView: View {
         VStack(spacing: 0) {
             header
             VPHairline()
+            if !daemonConnected {
+                connectionBanner
+                VPHairline()
+            }
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
@@ -120,6 +141,32 @@ struct SetupWizardView: View {
         .frame(width: 760, height: 620)
         .background { VPCrystalBackdrop() }
         .onAppear(perform: loadDefaults)
+    }
+
+    private var connectionBanner: some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: "bolt.horizontal.circle")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(VPTheme.warning)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(L10n.t("Local daemon not ready"))
+                    .font(VPTheme.font(10.5, weight: .semibold))
+                Text(connectionDetail)
+                    .font(VPTheme.mono(8))
+                    .foregroundStyle(VPTheme.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+            Button(L10n.t("Retry")) {
+                Task { await model.retryDaemonConnection() }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(model.connection == .connecting)
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 10)
+        .background(VPTheme.warning.opacity(0.08))
     }
 
     private var header: some View {
@@ -259,7 +306,7 @@ struct SetupWizardView: View {
                     }
                 }
                 .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
-                .disabled(model.providerBusy || model.providerModel.isEmpty)
+                .disabled(model.providerBusy || model.providerModel.isEmpty || !daemonConnected)
                 if model.providerBusy || model.providerProbeBusy {
                     ProgressView().controlSize(.small)
                 }
@@ -410,7 +457,8 @@ struct SetupWizardView: View {
             }
             .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
             .disabled(
-                applyingTrust
+                !daemonConnected
+                    || applyingTrust
                     || (step == 1 && !providerReady)
                     || (step == 2 && !projectReady)
                     || (step == 3 && (!providerReady || !projectReady))

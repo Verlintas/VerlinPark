@@ -14,6 +14,11 @@ impl Engine {
         tokio::task::spawn_blocking(move || store.add_project(&root, name.as_deref())).await?
     }
 
+    pub async fn remove_project(&self, project_id: String) -> Result<()> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.remove_project(&project_id)).await?
+    }
+
     pub async fn list_projects(&self) -> Result<Vec<Project>> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.list_projects()).await?

@@ -734,6 +734,18 @@ actor CoreClient {
             .decode(Project.self)
     }
 
+    /// Remove an empty project entry. The daemon refuses when the project has
+    /// sessions, identities, workspaces, or intake tasks.
+    func removeProject(projectID: String) async throws {
+        _ = try await request(
+            method: "project.remove",
+            params: [
+                "project_id": .string(projectID),
+                "confirm": .bool(true),
+            ]
+        )
+    }
+
     func listSessions(projectID: String?) async throws -> [Session] {
         let params: [String: JSONValue] = [
             "project_id": projectID.map(JSONValue.string) ?? .null,

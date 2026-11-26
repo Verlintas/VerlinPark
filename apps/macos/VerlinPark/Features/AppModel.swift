@@ -1286,6 +1286,20 @@ final class AppModel {
         }
     }
 
+    /// Explicit retry for the first-run wizard and connection banner. It
+    /// cancels a scheduled backoff so the operator does not wait for the next
+    /// automatic attempt after fixing the daemon.
+    func retryDaemonConnection() async {
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        if connection != .connected {
+            await connectIfNeeded()
+        }
+        if connection != .connected {
+            scheduleReconnect()
+        }
+    }
+
     private func connectIfNeeded() async {
         guard started, connection != .connected else { return }
         connection = .connecting
@@ -2000,6 +2014,30 @@ final class AppModel {
                 projectID: projectID,
                 policy: hardened ? .hardened : .allow
             )
+            lastError = nil
+            return true
+        } catch {
+            handle(error)
+            return false
+        }
+    }
+
+    /// Remove an empty project entry from this client. The daemon enforces the
+    /// no-sessions/no-identities/no-workspaces rule; repository files stay.
+    func removeProject(id: String) async -> Bool {
+        guard connection == .connected else { return false }
+        isBusy = true
+        defer { isBusy = false }
+        do {
+            try await core.removeProject(projectID: id)
+            projects = try await core.listProjects()
+            if selectedProjectID == id {
+                selectedProjectID = nil
+                selectedSessionID = nil
+                sessions = []
+                events = []
+                mode = .resident
+            }
             lastError = nil
             return true
         } catch {

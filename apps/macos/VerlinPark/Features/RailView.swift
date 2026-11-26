@@ -127,6 +127,7 @@ struct RailView: View {
     @State private var hoveredAction: String?
     @State private var expandedProjects: Set<String> = []
     @State private var fullyExpandedProjects: Set<String> = []
+    @State private var projectPendingRemoval: Project?
     @AppStorage("verlinpark.rail.sort") private var sortRawValue = RailSessionSort.recent.rawValue
     @Namespace private var selectionNamespace
 
@@ -201,6 +202,30 @@ struct RailView: View {
         }
         .onChange(of: model.projects.count) { _, _ in
             Task { await refreshAllSessions() }
+        }
+        .alert(
+            L10n.t("Remove project?"),
+            isPresented: Binding(
+                get: { projectPendingRemoval != nil },
+                set: { presenting in
+                    if !presenting {
+                        projectPendingRemoval = nil
+                    }
+                }
+            ),
+            presenting: projectPendingRemoval
+        ) { project in
+            Button(L10n.t("Remove"), role: .destructive) {
+                projectPendingRemoval = nil
+                Task { await model.removeProject(id: project.id) }
+            }
+            Button(L10n.t("Cancel"), role: .cancel) {
+                projectPendingRemoval = nil
+            }
+        } message: { project in
+            Text(L10n.t(
+                "Remove \(project.name) from VerlinPark? This only works when the project has no sessions, identities, workspaces, or intake tasks. Repository files on disk are untouched."
+            ))
         }
     }
 
@@ -574,6 +599,10 @@ struct RailView: View {
                         : L10n.t("Pin Project")
                 ) {
                     pinnedStore.toggleProject(project.id)
+                }
+                Divider()
+                Button(L10n.t("Remove Project…"), role: .destructive) {
+                    projectPendingRemoval = project
                 }
             }
 

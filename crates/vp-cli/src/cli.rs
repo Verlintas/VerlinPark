@@ -846,6 +846,14 @@ pub(crate) enum Command {
         #[arg(long)]
         hardened_shell: bool,
     },
+    /// Remove a project entry that has no sessions, identities, workspaces, or
+    /// intake tasks. Repository files are never touched.
+    ProjectRemove {
+        project: String,
+        /// Confirm the removal. The daemon refuses without explicit consent.
+        #[arg(long)]
+        yes: bool,
+    },
     /// List project execution hosts (local and ssh).
     HostList,
     /// Set a project's execution host from an ExecutionHost JSON object.

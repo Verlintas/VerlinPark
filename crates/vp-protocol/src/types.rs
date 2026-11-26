@@ -2882,6 +2882,19 @@ pub struct AddProjectParams {
     pub name: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoveProjectParams {
+    pub project_id: String,
+    /// Explicit confirmation. The RPC refuses without it.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoveProjectResult {
+    pub project_id: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectListResult {
     pub projects: Vec<Project>,

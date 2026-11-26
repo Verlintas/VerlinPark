@@ -121,6 +121,7 @@ pub(crate) async fn run_command(
         | Command::McpPinReject { .. } => mcp::dispatch(command, discovery, json).await,
         Command::Projects
         | Command::ProjectAdd { .. }
+        | Command::ProjectRemove { .. }
         | Command::ProjectBudget { .. }
         | Command::ProjectUsage { .. }
         | Command::ProjectCache { .. }

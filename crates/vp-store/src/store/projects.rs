@@ -58,6 +58,62 @@ impl Store {
         Ok(project)
     }
 
+    /// Remove a project row only when it has no sessions, identities, or
+    /// workspaces. This is a recovery path for a bad project entry, not a
+    /// cascade delete of real work. Repository files are never touched.
+    pub fn remove_project(&self, project_id: &str) -> Result<()> {
+        let conn = self.lock()?;
+        let exists: Option<String> = conn
+            .query_row(
+                "SELECT id FROM projects WHERE id = ?1",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(anyhow!("project not found: {project_id}"));
+        }
+        let sessions: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        let identities: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_identities WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        let workspaces: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_workspaces WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        let intake: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM intake_tasks WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        if sessions > 0 || identities > 0 || workspaces > 0 || intake > 0 {
+            return Err(anyhow!(
+                "project has {sessions} session(s), {identities} identity(ies), {workspaces} workspace(s), and {intake} intake task(s); remove or archive that work before removing the project"
+            ));
+        }
+        conn.execute("DELETE FROM projects WHERE id = ?1", params![project_id])?;
+        drop(conn);
+        if self.list_projects()?.is_empty() {
+            let path = self.data_dir.join("projects.jsonl");
+            let _guard = self
+                .manifest_lock
+                .lock()
+                .map_err(|_| anyhow!("project manifest mutex poisoned"))?;
+            std::fs::write(&path, b"")
+                .with_context(|| format!("clearing project manifest {}", path.display()))?;
+        } else {
+            self.record_project_manifest()?;
+        }
+        Ok(())
+    }
+
     pub fn list_projects(&self) -> Result<Vec<Project>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(

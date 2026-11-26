@@ -142,6 +142,19 @@ pub(super) async fn dispatch(
             }
             project
         }
+        Command::ProjectRemove { project, yes } => {
+            if !yes {
+                bail!(
+                    "project-remove requires --yes; it only removes an empty project entry and never deletes repository files"
+                );
+            }
+            rpc(
+                &discovery,
+                "project.remove",
+                json!({"project_id": project, "confirm": true}),
+            )
+            .await?
+        }
         Command::ProjectBudget { project } => {
             rpc(
                 &discovery,
