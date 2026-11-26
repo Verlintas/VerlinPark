@@ -14,11 +14,14 @@ Latest commit at write time: `2a9c0c9` (`Record runtime hardening smoke evidence
 > "operator-gated" UI assumptions in this draft; see section 13.
 >
 > **Round 4 owner direction (2026-11-26):** Custos is a role-separated ring of
-> three processes (core/warden/anchor) with a watchdog ring and signed-vault
-> self-heal, not a single daemon. Daemon restart and verified-backup restore are
-> authorized automatic L4 actions under 2-of-3 quorum. Process thresholds are
-> raised and use multi-signal `proc_pid_rusage`-based probes. The GUI is an
-> independent window inside the VerlinPark app, not a separate `.app`. See §16.
+> processes (core/warden/anchor, plus a fourth liveness sentinel) with a
+> watchdog ring and signed-vault self-heal, not a single daemon. Daemon restart
+> and verified-backup restore are authorized automatic L4 actions under 2-of-3
+> quorum. Process thresholds are capacity-aware and use multi-signal
+> `proc_pid_rusage`-based probes. The GUI is an independent window inside the
+> VerlinPark app, not a separate `.app`. The owner declined a privileged
+> `custos-guard`; same-user residual is accepted. No stack samples or full
+> paths in diagnostics. See §16 and §17.
 
 This file is both the current-context handoff and the first Custos design
 proposal. It is intentionally outside the agent tool surface.
@@ -212,8 +215,8 @@ The authoritative version is `docs/CUSTOS_CHARTER_V0.md`. Summary:
 
 There is no operator approval or break-glass token in the product. L3/L4
 actions are charter-driven, quorum-gated, and audited; the user sees a bounded
-result, not a control. The three-process ring (core/warden/anchor) is described
-in §16 and the charter.
+result, not a control. The four-process ring (core/warden/anchor/sentinel) is
+described in §16 and the charter.
 
 ## 4. Health model
 
@@ -379,29 +382,26 @@ Action classes, caps, cooldowns, and prohibited actions are defined in
 Most earlier questions are answered by §13–15 and the charter. Remaining
 decisions for the owner:
 
-Answered in this round: multi-process ring (yes), daemon restart (yes,
-automatic), verified restore (yes, automatic), GUI (independent window inside
-the app), thresholds (raise, multi-signal). Remaining decisions are kept in
-`docs/CUSTOS_CHARTER_V0.md` Appendix D:
+Answered in this round: fourth sentinel (yes), no privileged `custos-guard`
+(accepted residual), daemon restart (yes, automatic), verified restore (yes,
+automatic), GUI (independent window inside the app), adaptive capacity
+calibration (yes), no stack samples/full paths in diagnostics. Remaining
+decisions are kept in `docs/CUSTOS_CHARTER_V0.md` Appendix D:
 
-1. Are the new score/hard-cap constants acceptable?
-2. Three roles or add a fourth minimal liveness watchdog?
-3. Vault/app-bundle baseline vs a signed read-only disk image?
-4. Accept the same-user `kill`/`launchctl` residual, or add an optional
-   privileged `custos-guard` LaunchDaemon (one-time admin install)?
-5. Forensic bundle paths/argv and 1s stack samples?
-6. Idle-agent notices: project inbox or drop with audit?
-7. Quarantine UX: what the user sees.
-8. Relation to existing `OrchestrationPolicy`, `IntegrationPolicy`,
+1. Are the capacity formulas and score weights acceptable after calibration?
+2. Vault/app-bundle baseline vs a signed read-only disk image?
+3. Idle-agent notices: project inbox or drop with audit?
+4. Quarantine UX: what the user sees.
+5. Relation to existing `OrchestrationPolicy`, `IntegrationPolicy`,
    `EffectPolicy`, `RunContract`, backup/anchor.
-9. Audit storage/retention; menu-bar presence; naming/language.
+6. Audit storage/retention; menu-bar presence; naming/language.
 
 ## 12. Recommended first slice (for discussion)
 
 Do not start with L4 in production. Start with:
 
 - a read-only core over a local admin socket, with a single-role temporary
-  shell (the full three-role ring lands before any mutation);
+  shell (the full four-role ring lands before any mutation);
 - the charter-pinned observe mode;
 - probes for daemon/DB/WAL/leases/runs/queues/events/backups/Git/known
   processes;
@@ -564,8 +564,8 @@ developer**. It is consent, not control, and it is never automatic/uploaded.
   content, cookies, and credentials. Paths/payloads are redacted or reduced to
   basenames by default.
 - A clear privacy notice and a standard/forensic choice; forensic may include
-  more path/state detail after an explicit warning, but still no secrets or
-  user content.
+  more state/log detail after an explicit warning, but still no full paths,
+  process argv values, stack samples, secrets, or user content.
 - Signed manifest + SHA-256 + report id; developer can verify provenance.
 - The main Custos surface still has no repair/restart/restore/approve/kill
   controls.
@@ -612,11 +612,11 @@ with, or configure Custos. A notice is a fact, not a conversation.
 
 The secondary diagnostics surface generates **both** a `standard` bundle and a
 `forensic` bundle in one action, locally, with no upload. The forensic bundle
-adds detail (full paths, command lines with redacted environment, bounded raw
-logs, SQLite/WAL/schema statistics, queue and lease identifiers, process
-lineage) but still excludes provider keys, prompts, message bodies, file
-contents, screen content, cookies, and credentials. The user chooses which
-bundle to share.
+adds detail (basename-level process lineage, bounded raw logs, SQLite/WAL/schema
+statistics, queue and lease identifiers, capacity/calibration profile) but
+still excludes full paths, process argv values, stack samples, provider keys,
+prompts, message bodies, file contents, screen content, cookies, and
+credentials. The user chooses which bundle to share.
 
 ### 15.5 GUI is minimal, hardcore, and visibly separate
 
@@ -637,8 +637,8 @@ shutdown. V1 therefore needs:
 
 - boot autostart;
 - launchd `KeepAlive` supervision;
-- a role-separated three-process ring (core/warden/anchor) so one killed
-  process does not remove all authority;
+- a role-separated four-process ring (core/warden/anchor/sentinel) so one
+  killed process does not remove all authority;
 - a watchdog/heartbeat ring so a dead/stopped role is restored quickly;
 - a signed vault/app-bundle baseline with quarantine + overwrite self-heal for
   Custos-owned files;
@@ -666,19 +666,22 @@ These artifacts are **design drafts for review**, not implemented behavior.
 
 ### 16.1 Multi-process Custos, not a single daemon
 
-Custos is a role-separated ring of three user LaunchAgents:
+Custos is a role-separated ring of four user LaunchAgents:
 
 - `com.verlintas.custos-core` — probes, scoring, decisions, action intents;
 - `com.verlintas.custos-warden` — executes L3 stops/quarantine/restart and L4
   recovery after quorum;
 - `com.verlintas.custos-anchor` — self-heal, hash/plist/charter/audit-chain
-  verification, vault restore, peer restart, backup verification.
+  verification, vault restore, peer restart, backup verification;
+- `com.verlintas.custos-sentinel` — liveness-only watchdog; heartbeats and
+  launchd kickstart/bootstrap of the other three, no product authority.
 
 Each has a separate process group, heartbeat, launchd label, and subset of
 authority. Killing one does not give an attacker the others' authority; the
 remaining roles detect the stale heartbeat and restart it. L4 actions require
-2-of-3 signed intents; L3 is core+warden with anchor audit; a hard-cap stop can
-be executed by the warden alone. A monotonic epoch lease prevents split-brain.
+2-of-3 signed intents from core/warden/anchor; sentinel does not vote. L3 is
+core+warden with anchor audit; a hard-cap stop can be executed by the warden
+alone. A monotonic epoch lease prevents split-brain.
 
 ### 16.2 Self-heal / overwrite authority
 
@@ -706,20 +709,34 @@ tamper is recorded as an explicit gap; missing entries are not fabricated.
   post-restore integrity check. One attempt per failure fingerprint; a second
   failure enters safe mode.
 
-### 16.4 Conservative multi-signal process probe
+### 16.4 Capacity-aware, calibration-based process probe
 
-The old CPU-percent thresholds were too likely to hit a legitimate build. The
-new design uses macOS `proc_pid_rusage` (`rusage_info_v4`) and
-`proc_pidinfo(PROC_PIDTASKINFO)` to build a progress vector: CPU time,
-instructions/cycles, disk I/O, pageins/faults, children, output growth, and
-heartbeat. A bounded 1s `sample` can be used as evidence for a suspected stall.
+The old fixed CPU-percent thresholds were both too easy to hit on a small
+machine and too high on a large one. The new design is deterministic but
+machine-aware and workload-aware:
 
-A 0–100 score combines resource, progress, and control families. Notice at 60,
-final notice at 80, stop at 90 **only with two independent signal families**.
-Any progress in the last 60s blocks a kill except a hard cap. Hard caps are
-raised to 12 GiB RSS, 128 children, 8 GiB scratch, 8192 open files. No-progress
-must persist 10–15 minutes. Agent-declared expected time remains advisory and
-clamped to 30s–8h; it cannot suppress progress detection or hard caps.
+- **Capacity profile.** Read `hw.memsize`, logical/physical/P-E cores, disk
+  free, swap, memory pressure, thermal state, low-power mode, load average, and
+  daemon latency. Derive `rss_hard = clamp(0.50×mem, 3, 24 GiB)`,
+  `children_hard = clamp(16×cores, 64, 256)`,
+  `scratch_hard = clamp(0.05×disk_free, 2, 24 GiB)`,
+  `fds_hard = clamp(1024×cores, 4096, 32768)`, and normalize CPU to
+  `cpu_share = cpu_time/wall/cores`.
+- **Workload calibration.** For each `project + tool/profile + command hash +
+  label`, keep the last 20 completed runs (duration/CPU/RSS/children/scratch).
+  After 5 samples, `expected_effective = p95 × 2` with median/MAD outlier
+  rejection, then apply a thermal/low-power capacity multiplier. Fewer than 5
+  samples fall back to the declared time; the first 5 runs are learning mode
+  (notices only, except hard caps or 15-minute no-progress + ignored TERM).
+  Agent declarations cannot override observed history.
+- **Score.** A 0–100 deterministic score combines normalized resource,
+  progress, and control families. Notice at 60, final at 80, stop at 90 with
+  two independent signal families. Any progress in the last 60s blocks a kill
+  except an effective hard cap. Hard caps are the capacity-derived values, not
+  fixed 12 GiB/128/8 GiB/8192 constants; they tighten under memory/disk
+  pressure and use hysteresis.
+- **No stack sampling.** The forensic bundle and the decision path do not use
+  `sample`, thread stacks, memory dumps, full paths, or argv values.
 
 ### 16.5 GUI is an independent window, not a separate app
 
@@ -735,6 +752,67 @@ The ring and self-heal make Custos kill-resistant and tamper-evident, but they
 are not a consensus system against root or an attacker who can tamper every
 baseline copy. A same-user shell can still signal processes or `launchctl
 bootout` user agents; launchd/ring restores them, and the GUI shows `SIGNAL
-LOST` during the gap. Absolute protection requires a separate OS user or a
-privileged `custos-guard` LaunchDaemon, which remains an open optional decision
-(one-time admin install), not part of the no-sudo V1 baseline.
+LOST` during the gap. The owner has declined an optional privileged
+`custos-guard` for V1, so this residual is accepted rather than hidden.
+Absolute protection would require a separate OS user or privileged LaunchDaemon
+and remains Advanced-only.
+
+## 17. Round 5 direction: sentinel, no privileged guard, adaptive capacity
+
+### 17.1 Fourth process: sentinel
+
+Added `com.verlintas.custos-sentinel` as a **liveness-only** fourth role. It has
+no probes, no decisions, no product actions, and no L4 vote. It only checks the
+heartbeats of core/warden/anchor and uses launchd kickstart/bootstrap to
+restore a dead role. This raises the cost of killing two roles and gives the
+ring a dedicated last-survivor restart path. If the sentinel dies, the other
+three restart it.
+
+### 17.2 No privileged guard
+
+The owner declined the optional root `custos-guard`. V1 remains a no-sudo,
+user-level ring. Same-user `kill`/`launchctl bootout` is a documented residual:
+launchd/ring restores Custos, the GUI shows `SIGNAL LOST`, and no authority is
+transferred to the attacker. Absolute protection would require a separate OS
+user or privileged LaunchDaemon and is Advanced-only.
+
+### 17.3 Adaptive capacity instead of universal constants
+
+Fixed thresholds were not intelligent enough across machines. The charter now
+defines a deterministic two-layer model:
+
+1. **Capacity normalization** — derive caps from physical memory, logical/P/E
+   cores, disk free, swap/memory pressure, thermal state, low-power mode, and
+   daemon latency. For example, `rss_hard = clamp(0.50×mem, 3, 24 GiB)` and
+   `children_hard = clamp(16×cores, 64, 256)`; CPU is normalized to
+   `cpu_share = cpu_time/wall/cores`.
+2. **Workload calibration** — for each project/tool/command fingerprint, keep
+   the last 20 completed runs and use `p95 × 2` with median/MAD outlier
+   rejection after 5 samples. Thermal/low-power states apply a bounded
+   multiplier. The first 5 runs are learning mode (notices only, except
+   effective hard caps or 15-minute no-progress + ignored TERM). Agent-declared
+   time is only a sparse-history fallback and cannot override observed history.
+
+The result is still deterministic and local-only: no LLM, no cloud, no agent
+editing. It adapts to an 8 GiB laptop, a 64 GiB workstation, a cold cache, and
+a thermally throttled run without letting a bad baseline hide a real stall.
+Caps use hysteresis and tighten under current memory/disk pressure.
+
+### 17.4 Diagnostics stay basename/metadata-only
+
+The forensic bundle no longer includes stack samples, thread stacks, memory
+dumps, full absolute paths, or process argv values. It adds basename-level
+process lineage, bounded raw logs, SQLite/WAL/schema stats, queue/lease ids,
+launchd/watchdog history, and aggregate calibration p50/p95. The decision path
+also does not use `sample`; it relies on `proc_pid_rusage`,
+`proc_pidinfo`, output/heartbeat progress, and capacity calibration.
+
+### 17.5 Remaining review questions
+
+- Are the capacity formulas and score weights acceptable?
+- Is the 0500/0400 vault + app-bundle baseline enough for self-heal?
+- Idle-agent notices: inbox or drop with audit?
+- Quarantine UX and menu-bar presence.
+- Audit-chain tamper handling.
+- How calibration should distinguish a permanently slow machine from a real
+  stall without letting a poisoned baseline hide regressions.

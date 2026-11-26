@@ -58,8 +58,8 @@
 | **Current** | [adr/0233-non-destructive-provider-reconnect.md](adr/0233-non-destructive-provider-reconnect.md) | 非破坏性 provider reconnect：daemon 未配置或 provider identity 完全匹配时才自动应用客户端设置；不匹配必须由 Settings 显式保存替换 |
 | **Current** | [adr/0234-run-contract-and-anytime-execution.md](adr/0234-run-contract-and-anytime-execution.md) | Run Contract + anytime execution：多资源治理（钱/时间/注意力/风险/上下文/容量/质量/进展）、profile、收尾 reserve、证据驱动停止、partial delivery；P0 + R1 + R2a + R2b 已实现（lean turn pause/resume、token/cost/time child request-fit、attention batch prompt、explicit partial delivery、rescue reserve/allocation preview、readiness snapshot cache、macOS top-up/pause banner/project policy editor） |
 | **Current** | [RUN_CONTRACT_AND_RESOURCE_GOVERNOR_PLAN.md](RUN_CONTRACT_AND_RESOURCE_GOVERNOR_PLAN.md) | R1–R4 实施计划：resource math、profiles、run contract、governor、anytime delivery、attention/trust、metareasoning、RPC/CLI/UI、测试矩阵；R2b 完成：project RunPolicy + attention batch prompt + explicit partial delivery + rescue reserve/allocation preview + readiness snapshot cache + macOS operator surfaces；R3 per-task envelope/automatic reallocation 与 R4 开放 |
-| **Design** | [CUSTOS_PLAN.md](CUSTOS_PLAN.md) | ◇CUSTOS 讨论与 handoff：确定性三进程守护环（core/warden/anchor）、固定宪章、只读独立窗口、单向下发 notice、双诊断包、launchd/watchdog 与 signed-vault 自愈；尚未实现 |
-| **Design** | [CUSTOS_CHARTER_V0.md](CUSTOS_CHARTER_V0.md) | ◇CUSTOS Charter v0 草案：L0–L5 权力、多信号进程评分、动作目录、notice 模板、诊断包清单、GUI 信息层级、三进程自保/自愈与残余风险；未签名、未实现 |
+| **Design** | [CUSTOS_PLAN.md](CUSTOS_PLAN.md) | ◇CUSTOS 讨论与 handoff：确定性四进程守护环（core/warden/anchor/sentinel）、固定宪章、只读独立窗口、单向下发 notice、双诊断包、容量自适应/负载校准、launchd/watchdog 与 signed-vault 自愈；尚未实现 |
+| **Design** | [CUSTOS_CHARTER_V0.md](CUSTOS_CHARTER_V0.md) | ◇CUSTOS Charter v0 草案：L0–L5 权力、容量归一化与工作负载校准评分、动作目录、notice 模板、无完整路径/stack sample 的诊断包、GUI 信息层级、四进程自保/自愈与残余风险；未签名、未实现 |
 | **Reference** | [OBSCURA_ASSESSMENT.md](OBSCURA_ASSESSMENT.md) | Obscura（Rust/V8/CDP/MCP headless browser）评估：适用场景、安全约束、三种集成方案、结论为 cache 轮之后再做可选外部网页后端 |
 | **Reference** | [PRIDE_FLAGS.md](PRIDE_FLAGS.md) | Pride flag 资产来源与许可 |
 | **Reference** | [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | FlagKit 等第三方资产许可 |

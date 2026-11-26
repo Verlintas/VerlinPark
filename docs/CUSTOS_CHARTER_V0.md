@@ -252,19 +252,18 @@ Supporting probes:
 - `proc_listchildpids`: aggregate the process group and count live children;
 - supervisor output growth (stdout/stderr bytes), child-exit events;
 - run/task/lease heartbeat sequence;
-- bounded `sample` (1 second, top frames only) for a suspected stall, used as
-  evidence only, never as the sole kill trigger;
 - daemon event-loop latency, queue backlog, memory pressure, free disk, load
   average, and scratch/temp growth caused by the process;
 - declared `expected_secs`/timeout (advisory, clamped);
-- charter hard caps;
+- capacity-normalized hard caps (see 5.3);
 - response to a cooperative stop request;
 - repeated restarts/crash loop.
 
 Agent-declared expected time is **advisory**. Agents commonly over-declare (a
 one-minute test with a fifteen-minute timeout), so a declaration may raise a
 warning threshold within a clamp but can never lower a hard cap or disable
-progress-based detection.
+progress-based detection. Historical observations of the same workload
+fingerprint are a stronger signal than a declaration.
 
 **Progress vector P** (sampled every 5s over a 60s window) is any positive
 delta in: output bytes, CPU time, instructions/cycles, disk I/O, child exit
@@ -272,31 +271,106 @@ count, or heartbeat sequence. A process is `progressing` if any P component
 moved in the last 60s. A process is `flat` only when every P component is
 unchanged for the stated duration.
 
-### 5.3 Deterministic pressure score
+### 5.3 Machine capacity profile (deterministic normalization)
+
+Absolute thresholds do not transfer across an 8 GiB laptop and a 64 GiB
+workstation. At startup and every 60s Custos reads a local capacity profile:
+
+- `hw.memsize`, `hw.logicalcpu`, `hw.physicalcpu`, P/E core split where
+  available;
+- `hw.model` and CPU brand (profile label only, never a model input);
+- total/free disk, `vm.swapusage`, `host_statistics64` memory pressure,
+  `kern.memorystatus_vm_pressure_level`;
+- `ProcessInfo.thermalState`, `isLowPowerModeEnabled`, load average;
+- daemon event-loop latency and event backlog.
+
+Derived values:
+
+| Value | Formula | 8 GiB / 8c | 16 GiB / 10c | 32 GiB / 12c | 64 GiB / 16c |
+|---|---|---:|---:|---:|---:|
+| `rss_hard` | `clamp(0.50 × mem_gib, 3, 24)` | 4 GiB | 8 GiB | 16 GiB | 24 GiB |
+| `children_hard` | `clamp(16 × cores, 64, 256)` | 128 | 160 | 192 | 256 |
+| `scratch_hard` | `clamp(0.05 × disk_free_gib, 2, 24)` | disk-dependent | disk-dependent | disk-dependent | disk-dependent |
+| `fds_hard` | `clamp(1024 × cores, 4096, 32768)` | 8192 | 10240 | 12288 | 16384 |
+| `cpu_share` | `(user+system delta) / wall / cores` | 0–1 | 0–1 | 0–1 | 0–1 |
+| `rss_ratio` | `rss / mem_gib` | 0–1 | 0–1 | 0–1 | 0–1 |
+
+Effective caps are tightened by current machine pressure:
+
+- `rss_hard_effective = min(rss_hard, max(1 GiB, available_memory × 1.5))`
+  when memory pressure is warning/critical;
+- `scratch_hard_effective = min(scratch_hard, disk_free × 0.10)`;
+- `children_hard_effective` and `fds_hard_effective` are reduced by 25% when
+  memory pressure is critical or the daemon event loop is degraded;
+- `capacity_multiplier = 1.0 + 0.25×low_power + 0.25×thermal_serious +
+  0.50×thermal_critical`, capped at 2.0. It extends the expected-time budget,
+  not the hard caps.
+
+Caps use hysteresis: a new cap is adopted only after two consecutive samples
+and is clamped to a ±20% change from the previous value, so the governor does
+not oscillate. All values are deterministic and derived locally; no model or
+agent supplies them.
+
+### 5.4 Workload calibration (bounded, local, poison-resistant)
+
+Custos keeps a bounded per-machine, per-project history keyed by a workload
+fingerprint:
+
+`project + tool/profile + command hash + process label`
+
+For each fingerprint it stores the last 20 completed runs: duration, CPU time,
+peak RSS, peak child count, and peak scratch growth. After at least 5 samples:
+
+- `expected_effective = clamp(p95_duration × 2, 30s, 8h)`;
+- the p95 is computed after discarding samples beyond 3× the median absolute
+  deviation (MAD), so one pathological run cannot poison the baseline;
+- `capacity_multiplier` is applied to `expected_effective` (thermal/low-power
+  slowdowns extend the budget);
+- with fewer than 5 samples, fall back to the agent declaration clamped to
+  `[30s, 8h]`; with no declaration, use 10 minutes but never stop before the
+  no-progress bands below.
+
+The first 5 runs of a fingerprint are **learning mode**: notices only; no L3
+stop except an effective hard cap or TERM ignored after 15 minutes of no
+progress. This prevents a new project or a cold cache from being killed during
+its first legitimate long run.
+
+Calibration is stored in Custos-owned state (`custos_capacity_profile`), cannot
+be edited by an agent or project policy, and is local-only. A signed release may
+change the formula; a run cannot.
+
+### 5.5 Normalized pressure score
 
 Custos computes a bounded score (0–100) from independent signal families:
 **resource** (CPU/memory/disk/children/fds), **progress** (P flat), and
-**control** (heartbeat, TERM response, declared expectation).
+**control** (heartbeat, TERM response, expected-time ratio).
 
 | Signal | Points |
 |---|---:|
-| CPU ≥ 95% for 180s | +20 |
-| RSS ≥ 6 GiB | +20 |
-| RSS growth ≥ 1 GiB/min for 3 min | +30 |
-| disk write ≥ 1 GiB/min for 5 min | +25 |
-| process-group children ≥ 128 | +25 |
-| open files ≥ 8192 | +15 |
+| `cpu_share` ≥ 0.50 for 180s | +20 |
+| `cpu_share` ≥ 0.80 for 300s | +25 |
+| `rss_ratio` ≥ 0.25 | +15 |
+| `rss_ratio` ≥ 0.40 | +25 |
+| `rss_ratio` ≥ 0.50 | +35 |
+| RSS growth ≥ 5% of physical memory/min for 3 min | +30 |
+| scratch growth ≥ 50% of `scratch_hard` within 10 min | +20 |
+| children ≥ 75% of `children_hard` | +20 |
+| children ≥ `children_hard` | +40 |
+| open files ≥ 75% of `fds_hard` | +15 |
 | no progress for 5 min | +20 |
 | no progress for 10 min | +35 |
 | no progress for 15 min | +45 |
 | heartbeat gap > 3× interval | +30 |
-| declared expected exceeded + no output 3 min | +10 |
+| expected ratio ≥ 1.5× + no progress 3 min | +10 |
+| expected ratio ≥ 2× + no progress 3 min | +15 |
+| expected ratio ≥ 4× + no progress 3 min | +20 |
 | TERM ignored for 30s | +40 |
-| bounded stack sample shows all threads blocked | +10 |
+| memory pressure critical while RSS is growing | +20 |
+| thermal serious/critical while CPU-heavy | +10 |
 
-The no-progress rows are bands: apply only the highest matching duration, not
-all three. Resource signals may stack because they are independent. Score is
-capped at 100. Actions:
+Bands: apply only the highest matching `cpu_share`, `rss_ratio`, `children`,
+and no-progress row; do not sum the bands. Independent families may stack. Score
+is capped at 100. Actions:
 
 | State | Condition | Action | Notice |
 |---|---|---|---|
@@ -306,7 +380,7 @@ capped at 100. Actions:
 | `suspected_stall` | 80–89, no progress ≥ 5 min | L1 final | final notice, grace 120s |
 | `stalled` | score ≥ 90, no progress ≥ 10 min, **and** ≥ 2 signal families | L3 stop | post-action |
 | `runaway` | score ≥ 90 with memory/disk/children growth, **and** ≥ 2 signal families | L3 stop | final notice 30s, then post-action |
-| `hard_cap` | RSS > 12 GiB, children > 128, scratch > 8 GiB, or open files > 8192 | L3 stop immediately | post-action |
+| `hard_cap` | `rss_hard_effective`, `children_hard_effective`, `scratch_hard_effective`, or `fds_hard_effective` exceeded | L3 stop | 30s notice; immediate under critical memory/disk pressure or >20% over cap |
 | `crash_loop` | same known process restarts ≥ 5 times in 15 minutes | L3 disable restart + notify | post-action |
 | `exited` | process exited; exit code recorded | none | none |
 
@@ -316,16 +390,18 @@ Kill guards:
   resource + progress, or progress + control). A single high CPU number is not
   enough.
 - Any progress in the last 60s blocks a kill; the maximum action is a notice,
-  except for a hard cap.
+  except for an effective hard cap.
 - A process that exits on TERM is never sent KILL.
 - A legitimate long build is protected by instructions/CPU-time progress even
   with no stdout.
-- The declared expected time can only raise a threshold within the clamp
-  `[30s, 8h]`; it cannot suppress progress detection or hard caps.
-- Thresholds and weights are charter constants for v0, tunable only by a
-  signed release.
+- Agent-declared time is only a fallback when calibration is sparse; it cannot
+  override observed p95, suppress progress detection, or raise a hard cap.
+- The first 5 runs of a workload fingerprint are learning mode (notices only),
+  except effective hard caps and 15-minute no-progress + ignored TERM.
+- Thresholds, weights, and formulas are charter constants for v0, tunable only
+  by a signed release.
 
-### 5.4 Process stop sequence
+### 5.6 Process stop sequence
 
 1. Verify known-process identity (pid + start time + nonce/command hash).
 2. Verify the target is not Custos, its peers, launchd, the daemon, the GUI, or a
@@ -514,19 +590,24 @@ Contains enough to triage a bug without user content:
 
 ### 8.3 Forensic bundle
 
-Adds detail for developer diagnosis, still no secrets or user content:
+Adds detail for developer diagnosis, still no secrets or user content and still
+no full absolute paths:
 
-- full normalized paths (home replaced with `~`);
-- known-process tree with argv and env **names** only (values redacted);
-- bounded raw logs up to 16 MiB per file, secret-scrubbed;
+- project/worktree **basenames** and branch labels; no absolute paths;
+- known-process tree with role/label, pid, start time, resource counters, and
+  program basename; no full argv or environment values;
+- bounded raw logs up to 16 MiB per file, secret- and path-scrubbed to
+  basenames;
 - SQLite schema, `PRAGMA quick_check`, WAL/frame stats, index/table stats;
 - event type counts per session and bounded event metadata (kind, timestamp,
   ids; no payload bodies);
 - task/merge/lease rows with ids/status/timestamps (no prompts/tool output);
-- Git refs, worktree heads, lock files, optional-lock diagnostics;
+- Git refs, worktree head labels, lock-file names, optional-lock diagnostics;
 - bounded timeline of Custos probes/actions and daemon lifecycle;
 - launchd label state, plist hashes, watchdog heartbeat history;
-- thread/process sample of known processes only (no memory dumps).
+- capacity profile (cores, memory, disk class, thermal/pressure states) and
+  calibrated p50/p95 durations;
+- no stack samples, thread stacks, memory dumps, or process argv values.
 
 ### 8.4 Hard exclusions (both bundles)
 
@@ -538,13 +619,16 @@ Never collected:
 - screen captures, browser DOM/text, accessibility text, clipboard;
 - user documents outside daemon-owned state;
 - full environment values (names only);
-- raw database rows containing user/agent content.
+- raw database rows containing user/agent content;
+- full absolute paths, process argv values, stack samples, thread stacks, and
+  memory dumps.
 
 ### 8.5 Redaction and caps
 
 - Key-name and value-pattern scrub for tokens/keys/passwords/credentials.
 - URL userinfo stripped; query strings hashed or removed.
-- Standard paths reduced to basenames; forensic paths normalized to `~`.
+- Both bundles reduce paths to project/worktree/file basenames; no absolute
+  paths in either bundle.
 - Standard ≤ 8 MiB; forensic ≤ 32 MiB; per-file caps recorded in manifest.
 - Bundles can be deleted by the user; Custos keeps no copy after generation
   except the audit entry (report id, sizes, hashes; no contents).
@@ -611,14 +695,18 @@ authority, so killing one process does not decapitate the guardian:
 |---|---|---|---|
 | **core** | `com.verlintas.custos-core` | probes, scoring, decision state machine, action intents, read-only admin socket | execute signals, restore backup, edit its own binary |
 | **warden** | `com.verlintas.custos-warden` | execute approved L3 stops, session pause/cancel, quarantine, daemon restart, backup restore | invent policy, change thresholds, approve gates |
-| **anchor** | `com.verlintas.custos-anchor` | self-heal, hash/plist/charter/audit-chain verification, vault restore, peer restart, backup verification, watchdog ring | decide containment, approve actions, read secrets |
+| **anchor** | `com.verlintas.custos-anchor` | self-heal, hash/plist/charter/audit-chain verification, vault restore, peer restart, backup verification | decide containment, approve actions, read secrets |
+| **sentinel** | `com.verlintas.custos-sentinel` | liveness-only: heartbeat checks, launchd kickstart/bootstrap of the three roles | probe project state, decide containment, vote on L4, restore files |
 
 Rules:
 
 - No role is a single point of authority. A compromised or killed core leaves
   existing containment in place and the warden/anchor restore it; a killed
   warden leaves decisions but no new stops until restored; a killed anchor
-  loses self-heal but core/warden restore it.
+  loses self-heal but core/warden restore it; a killed sentinel is restored by
+  the other three.
+- The sentinel is a **fourth liveness watchdog**, not a fourth voter. It raises
+  the cost of killing two roles but cannot decide or execute a product action.
 - Roles communicate over 0600 Unix domain sockets in a 0700 runtime directory,
   with peer uid/gid/pid checks and a sealed per-install token. There is no TCP
   listener by default.
@@ -637,35 +725,36 @@ Rules:
 
 ### 10.2 Boot autostart and launchd supervision
 
-Three user LaunchAgents (V1, no sudo):
+Four user LaunchAgents (V1, no sudo):
 
 - `com.verlintas.custos-core`;
 - `com.verlintas.custos-warden`;
-- `com.verlintas.custos-anchor`.
+- `com.verlintas.custos-anchor`;
+- `com.verlintas.custos-sentinel`.
 
 All use `RunAtLoad=true`, `KeepAlive=true`, a bounded `ThrottleInterval`, 0600
 stdout/stderr logs, separate process groups, and
 `LimitLoadToSessionType=Aqua`. They start at login and are restarted by launchd
-after a crash or signal. The anchor starts first and waits for the other
-heartbeats; the core and warden retry their sockets until the ring is ready.
+after a crash or signal. Anchor and sentinel start first; core and warden retry
+their sockets until the ring is ready.
 
 ### 10.3 Watchdog ring
 
 - Each role writes an atomic heartbeat every 2s:
   `{role, pid, start_time, build_hash, charter_hash, epoch, seq, timestamp,
   state_hash}` in a 0700 directory with 0600 files.
-- Each role checks the other two every 2s. A stale heartbeat (> 10s), missing
-  pid, start-time mismatch, or hash mismatch triggers a bounded
-  `launchctl kickstart -k` of the peer label.
+- Each of the four roles checks the other three every 2s. A stale heartbeat
+  (> 10s), missing pid, start-time mismatch, or hash mismatch triggers a
+  bounded `launchctl kickstart -k` of the peer label.
 - If kickstart fails, the peer attempts a bounded `bootstrap` from the signed
   plist copy in the vault. A restart request is idempotent and logged.
-- If one role is alive and two are dead, the survivor may restart both; this is
-  the last-survivor path, not a normal authority.
-- If all three die, launchd restarts them. If the labels are booted out, the
-  GUI shows `SIGNAL LOST`; this is the documented same-user residual.
-- A fourth optional `com.verlintas.custos-anchor-check` timer may run every 60s
-  to verify all three labels and re-bootstrap a missing one. It is optional
-  because it adds another moving part, not because the ring needs it.
+- The sentinel is the dedicated liveness checker: it has no product authority,
+  but it can restart any of the three authority roles. If the sentinel dies,
+  the other three restart it.
+- If one role is alive and the others are dead, the survivor may restart them;
+  this is the last-survivor path, not a normal authority.
+- If all four die, launchd restarts them. If the labels are booted out, the GUI
+  shows `SIGNAL LOST`; this is the documented same-user residual.
 
 ### 10.4 Anti-tamper and self-heal (overwrite of Custos-owned files)
 
@@ -719,11 +808,13 @@ database rows; database recovery is only REC-02.
   unavailable, the warden may execute a hard-cap stop alone and record it for
   quorum audit; it may not start discretionary containment.
 - **L4 recovery (daemon restart, verified restore):** 2-of-3 signed intents
-  (core + warden + anchor) with all Article 7 preconditions. If quorum is not
-  reached, no action; enter safe mode and notify the audit.
+  (core + warden + anchor) with all Article 7 preconditions. The sentinel does
+  not vote. If quorum is not reached, no action; enter safe mode and notify the
+  audit.
 - **Self-heal:** anchor may restore a tampered Custos-owned file and restart a
   peer without quorum, because it is restoring the baseline, not exercising
-  product authority. It may not use self-heal to change policy or erase audit.
+  product authority. The sentinel may restart a dead peer but cannot restore
+  files or change policy. Neither may use self-heal to erase audit.
 - Actions are idempotent by `(action, target, evidence_hash, epoch)`; a stale
   epoch or duplicate intent is rejected.
 - The epoch lease is monotonic; a restarted core gets a higher epoch, and old
@@ -735,7 +826,8 @@ database rows; database recovery is only REC-02.
 |---|---|---|
 | Agent calls Custos | no tool/RPC/mailbox/prompt surface | none in product surface |
 | Agent kills one Custos role | ring detects stale heartbeat and restarts it; authority is split | a same-user shell may signal; brief availability loss |
-| Agent kills all three | launchd restarts; anchor/last survivor re-bootstraps | repeated kills cause availability loss, not authority takeover |
+| Agent kills two authority roles | sentinel/last survivor restarts them; L4 quorum is unavailable until two return | brief loss of containment/self-heal; no authority takeover |
+| Agent kills all four | launchd restarts; sentinel/last survivor re-bootstraps | repeated kills cause availability loss, not authority takeover |
 | Agent edits Custos binary/plist | hash/signature check; quarantine + vault/app-bundle restore | a same-user writer can tamper the vault too |
 | Agent boots out launchd labels | anchor/peer re-bootstrap from signed plist | same-user `launchctl` can boot out labels; no root without Advanced |
 | Agent starts a fake role | sealed socket token, peer creds, epoch lease, role separation | same-user can read a 0600 token if they have shell |
@@ -751,8 +843,9 @@ when an intact copy exists.
 
 **V1 non-guarantee:** absolute invulnerability to an arbitrary same-user process
 with shell and `launchctl`, or to an attacker who can tamper every baseline copy.
-That requires a separate OS user or privileged LaunchDaemon, which is
-Advanced-only and not planned for V1. This is recorded, not hidden.
+The owner has explicitly declined a privileged `custos-guard` for V1, so this
+residual is accepted rather than hidden. Absolute protection would require a
+separate OS user or privileged LaunchDaemon, which remains Advanced-only.
 
 ## Article 11 — Audit and evidence
 
@@ -801,19 +894,20 @@ Advanced-only and not planned for V1. This is recorded, not hidden.
 7. GUI is read-only; the user cannot repair, restart, restore, or approve.
 8. L4 restore is limited to verified backups and a fresh target; it is not a
    general rollback tool.
-9. Threshold constants are v0 and may need calibration from shadow-mode data;
-   the score model is deliberately conservative and still heuristic.
+9. Capacity formulas and score weights are v0 and may need calibration from
+   shadow-mode data; the model is deterministic but still a policy, not a
+   physical measurement.
 10. The GUI is an independent window inside the VerlinPark app, not a separate
     app and not a panel embedded in the main Stage.
-11. The multi-process ring improves availability and prevents single-process
+11. The four-process ring improves availability and prevents single-process
     decapitation, but it is not a consensus system against root or an attacker
     who can tamper every baseline copy.
 12. Self-heal overwrites only Custos-owned files. It cannot recover audit
     entries that were deleted before detection; it records an explicit gap.
 13. Process probes are macOS-specific (`proc_pid_rusage`/`proc_pidinfo`); a
     portable fallback is not part of V1.
-14. Stack sampling is evidence only, bounded to 1s and top frames; it is not a
-    memory dump and never includes user content.
+14. No stack sampling, thread stacks, memory dumps, full paths, or argv values
+    are used in the decision path or diagnostic bundles.
 
 ## Appendix A — Action catalog (v0)
 
@@ -877,8 +971,8 @@ catalog is closed; Custos cannot invent an action.
 | Effects | unknown/intent | none | 1 unknown | unknown blocking merge |
 | Worktrees | path/ref/clean/locks | clean | dirty/lock | missing/corrupt/ref lost |
 | Backup | verify/anchor/generation | valid/fresh | old | invalid/anchor fail |
-| Processes | identity + `proc_pid_rusage` progress vector + score + optional 1s sample | score < 40 | score 40–79 | score ≥ 90 / hard cap |
-| Custos ring | role heartbeat/pid/start/hash, epoch lease | all 3 fresh | 1 stale/restarted | 2+ stale / baseline invalid |
+| Processes | identity + `proc_pid_rusage` progress vector + normalized score | score < 40 | score 40–79 | score ≥ 90 / effective hard cap |
+| Custos ring | role heartbeat/pid/start/hash, epoch lease | all 4 fresh | 1 stale/restarted | 2+ stale / baseline invalid |
 | GUI | lease/helper | healthy | stale | unavailable |
 
 ## Appendix C — Diagnostic manifest (minimum fields)
@@ -905,33 +999,34 @@ catalog is closed; Custos cannot invent an action.
 
 ## Appendix D — Review questions for the owner
 
-Answered in this round: daemon restart (yes, automatic), verified restore (yes,
-automatic), multi-process ring (yes), GUI (independent window inside the app),
-threshold caution (raised, multi-signal score). Remaining:
+Answered in this round: fourth sentinel (yes), no privileged `custos-guard`
+(accepted residual), daemon restart (yes, automatic), verified restore (yes,
+automatic), adaptive capacity calibration (yes), no stack samples or full paths
+in diagnostics. Remaining:
 
-1. Are the new score/threshold constants acceptable? Proposed: notice at 60,
-   final notice at 80, stop at 90 with two signal families; hard caps 12 GiB
-   RSS / 128 children / 8 GiB scratch / 8192 fds; no-progress 10–15 min.
-2. Is a three-role ring enough, or should there be a fourth minimal liveness
-   watchdog (no authority) to raise the cost of killing two roles?
-3. Is the 0500/0400 vault plus app-bundle baseline enough for self-heal, or
+1. Are the capacity formulas and score weights acceptable? Proposed:
+   `rss_hard = clamp(0.50×mem, 3, 24 GiB)`,
+   `children_hard = clamp(16×cores, 64, 256)`,
+   `scratch_hard = clamp(0.05×disk_free, 2, 24 GiB)`,
+   `fds_hard = clamp(1024×cores, 4096, 32768)`;
+   notice at 60, final at 80, stop at 90 with two signal families; first 5 runs
+   per workload fingerprint are learning mode.
+2. Is the 0500/0400 vault plus app-bundle baseline enough for self-heal, or
    should the baseline be a signed read-only disk image / notarized helper?
-4. Do we accept the same-user `kill`/`launchctl` residual for V1, or add an
-   optional privileged `custos-guard` LaunchDaemon (one-time admin install)?
-5. Should the forensic bundle include normalized full paths and process argv,
-   or stay closer to the standard bundle for privacy?
-6. Should idle-agent notices go to the project inbox, or be dropped with an
+3. Should idle-agent notices go to the project inbox, or be dropped with an
    audit entry if no agent is running?
-7. Should a stack sample (1s, top frames) be included in the forensic bundle
-   for a suspected stall, or only in the developer-signed audit?
-8. What should the user see when Custos quarantines a project? Proposed:
+4. What should the user see when Custos quarantines a project? Proposed:
    project name, category, consequence, and a “diagnostics” path only.
-9. Should Custos have a menu-bar status dot in addition to the independent
+5. Should Custos have a menu-bar status dot in addition to the independent
    window, or only the window?
-10. Should audit-chain tamper restore the head from anchor memory and mark a
-    gap, or only flag the gap without writing a new head? Proposed: preserve
-    the tampered file, write a `tamper_detected` gap marker, never fabricate
-    missing entries.
+6. Should audit-chain tamper restore the head from anchor memory and mark a
+   gap, or only flag the gap without writing a new head? Proposed: preserve
+   the tampered file, write a `tamper_detected` gap marker, never fabricate
+   missing entries.
+7. How should capacity calibration handle a permanently slow machine or a
+   thermal-throttled run without letting a bad baseline hide a real stall?
+8. Should calibration data be included in the forensic bundle as aggregate
+   p50/p95 (no raw samples), or only as counts?
 
 ---
 
