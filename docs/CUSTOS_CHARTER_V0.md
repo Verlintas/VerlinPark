@@ -643,17 +643,18 @@ A sealed instrument, not a dashboard. It is an **independent window owned by
 the VerlinPark app** (like the Settings window), not a separate `.app` and not
 a panel embedded in the main Stage:
 
-- obsidian black background, thin ice lines, one central `◇` sigil;
-- `◇ CUSTOS` and `SEALED GUARDIAN` in mono uppercase;
+- obsidian black background, thin ice lines, a drawn ASCII diamond mark at the
+  left of the name (see `docs/CUSTOS_WORDMARK_ASCII.md`);
+- `CUSTOS` and `SEALED GUARDIAN` in mono uppercase, diamond before the word;
 - one state word: `HEALTHY / WATCH / DEGRADED / CRITICAL / QUARANTINED`;
 - 5–7 integrity rings or bars: RUNTIME, DATA, LEASES, QUEUES, WORKTREES,
   BACKUP, SIGNAL;
 - one deterministic sentence of state;
-- a fixed-width ASCII/box-drawing layer (monospaced, state-colored, no unique
+- a fixed-width pure-ASCII art layer (monospaced, state-colored, no unique
   information that is not also in text);
 - a bounded log of the last 8–12 actions: time, category, target label, result;
 - `PROTECTION ACTIVE`, `CONTAINED {n}`, `LAST ACTION ...`;
-- a small `◇` menu-bar status item that mirrors state and opens/closes the
+- a small diamond menu-bar status item that mirrors state and opens/closes the
   window; it has no repair/restart/restore/approve/kill action;
 - no buttons, no text field, no chat, no repair/restart/restore/approve/kill
   control, no policy editor.
@@ -673,7 +674,7 @@ a panel embedded in the main Stage:
 - distinct from VerlinPark pages: no sidebar, cards, tabs, rounded panels, or
   glass dashboard;
 - mono type, wide tracking, 1px rules, restrained glow/pulse/scanline;
-- ASCII/box-drawing art is a first-class layer: fixed-width, monospaced, no
+- pure-ASCII art is a first-class layer: fixed-width, monospaced, no
   proportional fallback, no ligatures, no essential information only in art;
 - character animation runs at 8–12 fps, never faster than 1.2s per pulse and
   4s per scan; no flashing above 3 Hz;
@@ -1014,11 +1015,12 @@ catalog is closed; Custos cannot invent an action.
 
 Answered in this round: capacity formulas and 5-run learning mode (yes), vault
 + app-bundle baseline (enough), idle notices to project inbox (yes), quarantine
-UX (project/task label, category, consequence, diagnostics entry), menu-bar `◇`
-status item (yes), no stack samples/full paths. Remaining:
+UX (project/task label, category, consequence, diagnostics entry), menu-bar
+diamond status item (yes), no stack samples/full paths. Remaining:
 
-1. Which ASCII/box-drawing visual direction to use; see
-   `docs/CUSTOS_GUI_ASCII.md` for variants and animation frames.
+1. Which pure-ASCII wordmark to use; see
+   `docs/CUSTOS_WORDMARK_ASCII.md` for the five lockups and animation frames.
+   Window-layout concepts remain in `docs/CUSTOS_GUI_ASCII.md`.
 2. Should audit-chain tamper restore the head from anchor memory and mark a
    gap, or only flag the gap without writing a new head? Proposed: preserve
    the tampered file, write a `tamper_detected` gap marker, never fabricate
@@ -1030,8 +1032,8 @@ status item (yes), no stack samples/full paths. Remaining:
 4. Should calibration data appear in the forensic bundle as aggregate p50/p95
    (no raw samples), or only as counts? Proposed: aggregate p50/p95 plus sample
    count, no raw rows.
-5. Should the menu-bar `◇` item show only state color, or also a tiny numeric
-   `CONTAINED` count? Proposed: state color + count when non-zero.
+5. Should the menu-bar diamond item show only state color, or also a tiny
+   numeric `CONTAINED` count? Proposed: state color + count when non-zero.
 
 ---
 

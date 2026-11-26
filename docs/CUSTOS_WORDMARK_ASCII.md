@@ -1,229 +1,168 @@
-# ◇ CUSTOS — ASCII wordmark studies
+# CUSTOS — pure-ASCII wordmark studies
 
 Status: **design draft, no implementation**  
 Date: 2026-11-26  
 Companion: `docs/CUSTOS_CHARTER_V0.md`, `docs/CUSTOS_PLAN.md`
 
-This file is the **CUSTOS name itself**, not the window layout. The earlier
-`docs/CUSTOS_GUI_ASCII.md` contains layout studies; this one is the wordmark /
-sigil lockup.
+This is the **CUSTOS name itself**. The first attempt used Unicode block and
+box-drawing glyphs and did not render reliably; this version is **pure ASCII**
+and draws the diamond mark explicitly with `/` and `\`, placed before the word.
 
 ## Rules
 
-- Fixed-width monospace; no proportional fallback, no ligatures.
-- The static frame must be recognizable without animation.
-- Animation is character-based: scanline rows, node travel, glitch jitter, or
-  core pulse. 8–12 fps, pulse ≥ 1.2s, scan ≥ 4s, no flashing > 3 Hz.
-- State color changes the ink/glow, not the letterforms. `HEALTHY` ice cyan,
-  `WATCH` amber, `CRITICAL` red, `QUARANTINED` near-black + red rim, `SIGNAL
-  LOST` dim grey.
-- The wordmark never contains an essential status that is absent from text.
-- Reduce Motion freezes the static frame.
-- No `sample`, stack, path, or user content in the art itself.
+- Only ASCII characters: letters, digits, space, `# + - | / \ _ = * . :`.
+- No Unicode box drawing, block elements, or diamond glyphs.
+- Fixed-width monospace; the static frame must read without animation.
+- The diamond is drawn, not typed as a glyph.
+- Animation is character-based; 8–12 fps; no flashing above 3 Hz.
+- State color changes ink/glow, not letterforms.
+- The art is `accessibilityHidden`; status text carries the accessible meaning.
 
 ---
 
-## 1. SEALED SLAB
+## 1. DIAMOND / PIXEL
 
-Concept: heavy slab letters with cut corners; the most "hardcore" static
-option. Reads well at small sizes and in monochrome.
+The cleanest option: a four-row diamond and four-row pixel letters. Reads well
+small, survives monochrome, and has enough negative space to feel sealed.
 
-```
-        ◇
-▄▄▄▄▄▄  █    █  ▄▄▄▄▄▄  ▄▄▄▄▄▄  ▄▄▄▄▄▄  ▄▄▄▄▄▄
-█       █    █  █         ██    █    █  █
-█       █    █  ▀▀▀▀▀▄    ██    █    █  ▀▀▀▀▀▄
-█       █    █       █    ██    █    █       █
-█       █    █  ▄▄▄▄▄▀    ██    █    █  ▄▄▄▄▄▀
-▀▀▀▀▀▀  ▀▀▀▀▀▀  ▀▀▀▀▀▀    ██    ▀▀▀▀▀▀  ▀▀▀▀▀▀
+```text
+  /\      ###  #   #  ###  #####  ###   ###
+ /  \    #     #   # #       #   #   # #
+ \  /    #     #   #  ##     #   #   #  ##
+  \/      ###   ###  ###     #    ###  ###
 ```
 
-Scanline frame (one row becomes `▓`, then moves up/down):
+Animation options:
 
-```
-        ◇
-▄▄▄▄▄▄  █    █  ▄▄▄▄▄▄  ▄▄▄▄▄▄  ▄▄▄▄▄▄  ▄▄▄▄▄▄
-█       █    █  █         ██    █    █  █
-█       █    █  ▀▀▀▀▀▄    ██    █    █  ▀▀▀▀▀▄
-▓▓▓▓▓▓  ▓▓▓▓▓▓  ▓▓▓▓▓▓  ▓▓▓▓▓▓  ▓▓▓▓▓▓  ▓▓▓▓▓▓
-█       █    █  ▄▄▄▄▄▀    ██    █    █  ▄▄▄▄▄▀
-▀▀▀▀▀▀  ▀▀▀▀▀▀  ▀▀▀▀▀▀    ██    ▀▀▀▀▀▀  ▀▀▀▀▀▀
-```
+- a `+` appears at the diamond center for one frame, then disappears;
+- a single `-` scan row crosses the word once every 4 seconds;
+- the diamond can blink between `/\` and `<>` once on state change.
 
-Core pulse: replace the top `◇` with `◆` for one frame, then back. The
-letterforms do not move.
-
-Best for: main header, boot frame, monochrome fallback.
+Best for: primary wordmark, main header, compact boot frame.
 
 ---
 
-## 2. THIN CIRCUIT
+## 2. DIAMOND / SLAB
 
-Concept: box-drawing letters, almost a circuit trace. Lighter and more
-"instrument" than SEALED SLAB; the node travel is the animation.
+Heavier letters, five rows. More weight than PIXEL; the diamond is larger and
+the word feels engraved.
 
-```
-                    ◇
-   ┌────  │   │  ┌────  ─────  ┌───┐  ┌────
-   │      │   │  │        │    │   │  │
-   │      │   │  └───┐    │    │   │  └───┐
-   │      │   │      │    │    │   │      │
-   └────  └───┘  ────┘    │    └───┘  ────┘
-```
-
-Node travel (a `◇` moves along the top rule; three frames):
-
-```
-   ┌◇───  │   │  ┌────  ─────  ┌───┐  ┌────
-   ┌─◇──  │   │  ┌────  ─────  ┌───┐  ┌────
-   ┌──◇─  │   │  ┌────  ─────  ┌───┐  ┌────
+```text
+   /\      ####  ##  ##  ####  ######  ####   ####
+  /  \    ##     ##  ## ##       ##   ##  ## ##
+ /    \   ##     ##  ##  ###     ##   ##  ##  ###
+  \  /    ##     ##  ##    ##    ##   ##  ##    ##
+   \/      ####   ####  ####     ##    ####  ####
 ```
 
-Pulse: the top `◇` becomes `◆` for one frame. The traces stay still.
+Animation options:
 
-Best for: a lighter main header or a settings-adjacent panel. Less brutal than
-SEALED SLAB, more "sealed system".
+- a `:` scan row moves up/down through the slab;
+- the diamond center holds a single `*` for one frame;
+- no letter movement; the slab stays fixed.
+
+Best for: boot/identity plate, a heavier main header, or a title card.
 
 ---
 
-## 3. TERMINAL
+## 3. DIAMOND / WIRE
 
-Concept: pure ASCII `#`, no Unicode box drawing. The most terminal-native and
-the best glitch animation. It also degrades safely if a font lacks box glyphs.
+Thin `+ - |` letters. It looks like an instrument panel or a circuit trace,
+not a logo. The diamond is the only closed shape.
 
-```
-              ◇
-  ####  #   #   ####  #####   ###    ####
- #      #   #  #        #    #   #  #
- #      #   #   ###     #    #   #   ###
- #      #   #      #    #    #   #      #
-  ####   ###   ####     #     ###   ####
-```
-
-Glitch frame A — one-column jitter:
-
-```
-               ◇
-   ####  #   #   ####  #####   ###    ####
-  #      #   #  #        #    #   #  #
-  #      #   #   ###     #    #   #   ###
-  #      #   #      #    #    #   #      #
-   ####   ###   ####     #     ###   ####
+```text
+   /\     +----  |   |  +----  +----+  +---+  +----
+  /  \    |      |   |  |         |    |   |  |
+ /    \   |      |   |  +---+     |    |   |  +---+
+  \  /    |      |   |      |     |    |   |      |
+   \/     +----  +---+  +----     |    +---+  +----
 ```
 
-Glitch frame B — one scan row becomes `▒`, then restores:
+Animation options:
 
-```
-              ◇
-  ####  #   #   ####  #####   ###    ####
- #      #   #  #        #    #   #  #
- ▒▒▒▒   ▒   ▒   ▒▒▒     ▒    ▒   ▒   ▒▒▒
- #      #   #      #    #    #   #      #
-  ####   ###   ####     #     ###   ####
-```
+- a `*` node travels along the top `+----` rule;
+- the diamond outline stays fixed;
+- one frame every 4 seconds, no continuous motion.
 
-Best for: menu-bar popover, low-color mode, or a deliberately raw boot frame.
+Best for: a quieter secondary header, diagnostics-adjacent panels, or a
+large-but-light main window.
 
 ---
 
-## 4. ANSI SHADOW
+## 4. DIAMOND / TERMINAL
 
-Concept: gothic block letters with a hard diagonal cut. The most "sealed
-artifact"; reads like an engraved plate. Use a slow scanline overlay rather than
-changing the letterforms.
+Pure `#` letters, five rows. The rawest option; looks like it was printed by a
+terminal, not designed in a graphics tool.
 
-```
-        ◇
-  ██████╗██╗   ██╗███████╗████████╗ ██████╗ ███████╗
- ██╔════╝██║   ██║██╔════╝╚══██╔══╝██╔═══██╗██╔════╝
- ██║     ██║   ██║███████╗   ██║   ██║   ██║███████╗
- ██║     ██║   ██║╚════██║   ██║   ██║   ██║╚════██║
- ╚██████╗╚██████╔╝███████║   ██║   ╚██████╔╝███████║
-  ╚═════╝ ╚═════╝ ╚══════╝   ╚═╝    ╚═════╝ ╚══════╝
+```text
+   /\      ####  #   #   ####  #####   ###    ####
+  /  \    #      #   #  #        #    #   #  #
+ /    \   #      #   #   ###     #    #   #   ###
+  \  /    #      #   #      #    #    #   #      #
+   \/      ####   ###   ####     #     ###   ####
 ```
 
-Scanline overlay (moves across the plate, never replaces a letter):
+Animation options:
 
-```
-  ────────────────────────────────────────────────────────
-```
+- one-row glitch: shift the word one column for a single frame;
+- one row becomes `====` for a scanline frame, then restores;
+- the diamond stays fixed.
 
-Core pulse: the top `◇` alternates `◇`/`◆`; the plate stays fixed.
-
-Best for: boot splash, About/Custos identity, static "sealed release" frame.
-Slightly less readable at small sizes than SEALED SLAB.
-
----
-
-## 5. MONOLITH LOCKUP
-
-Concept: SEALED SLAB inside a thin frame, with a tagline. The strongest
-"this is a separate sealed program" lockup; best as the main window header or
+Best for: menu-bar popover, raw/terminal mode, or a deliberately unpolished
 boot frame.
 
-```
-        ◇
-╔══════════════════════════════════════════════════╗
-║                                                  ║
-║  ▄▄▄▄▄▄  █    █  ▄▄▄▄▄▄  ▄▄▄▄▄▄  ▄▄▄▄▄▄  ▄▄▄▄▄▄  ║
-║  █       █    █  █         ██    █    █  █       ║
-║  █       █    █  ▀▀▀▀▀▄    ██    █    █  ▀▀▀▀▀▄  ║
-║  █       █    █       █    ██    █    █       █  ║
-║  █       █    █  ▄▄▄▄▄▀    ██    █    █  ▄▄▄▄▄▀  ║
-║  ▀▀▀▀▀▀  ▀▀▀▀▀▀  ▀▀▀▀▀▀    ██    ▀▀▀▀▀▀  ▀▀▀▀▀▀  ║
-║                                                  ║
-╚══════════════════════════════════════════════════╝
-        ◇
-   S E A L E D   G U A R D I A N
+---
+
+## 5. DIAMOND / CUSTOS
+
+Mixed-case `Custos` in a four-row terminal face, with the four-row diamond
+before it. More elegant and less brutal; closer to a hacker-tool nameplate.
+
+```text
+  /\       ___  _   _  ___  _    ___   ___
+ /  \     / __| | | | | / __| | |_ / _ \ / __|
+ \  /    | (__  | |_| | \__ \ | __| | (_) | \__ \
+  \/      \___|  \__,_| |___/  \__| \___/ |___/
 ```
 
-Orbit frame: the top/bottom `◇` moves to the left/right edge of the frame for
-one cycle; the inner wordmark does not move:
+Animation options:
 
-```
-◇       ╔══════════════════════════════════════════════╗
-        ║  ...                                         ║
-        ╚══════════════════════════════════════════════╝
-                                                       ◇
-```
+- a `*` pulses inside the diamond;
+- a `-` scanline crosses the word once per 6 seconds;
+- no letter movement.
 
-Best for: primary identity, boot, and the main window header. The frame is
-thin enough to stay quiet; the slab is heavy enough to feel sealed.
+Best for: a softer identity variant, documentation header, or About panel.
+Less "sealed guardian" than PIXEL/SLAB.
 
 ---
 
 ## Comparison
 
-| Variant | Static | Motion | Readability | Best use |
+| Variant | Weight | Static readability | Motion | Best use |
 |---|---|---|---|---|
-| SEALED SLAB | heavy slab | scan row + core pulse | strongest | main header / monochrome |
-| THIN CIRCUIT | box traces | node travel | high | lighter header |
-| TERMINAL | pure `#` | jitter + `▒` scan | high | menu popover / raw mode |
-| ANSI SHADOW | engraved gothic | scanline + core pulse | medium | boot / identity plate |
-| MONOLITH LOCKUP | slab in frame | orbit + core pulse | strongest | primary lockup / boot |
+| DIAMOND / PIXEL | medium | strongest | center pulse / scan row | primary header |
+| DIAMOND / SLAB | heavy | strong | scan row | boot/identity plate |
+| DIAMOND / WIRE | light | high | node travel | quiet secondary header |
+| DIAMOND / TERMINAL | medium | high | glitch / `=` row | menu popover |
+| DIAMOND / CUSTOS | light-medium | high | diamond pulse | docs/About |
 
 ## Recommendation
 
-- **Primary:** MONOLITH LOCKUP. It reads as a separate sealed program, not a
-  VerlinPark page, and the frame gives the ASCII art a physical boundary.
-- **Compact header:** SEALED SLAB without the outer frame, when vertical space
-  is tight.
-- **Menu-bar popover:** TERMINAL, three rows:
-  `◇ CUSTOS`, state word, contained count.
-- **Boot:** MONOLITH LOCKUP static frame fading to the main window; no glitch
-  on boot (glitch is for incidents, not startup).
-- **Incident/containment:** keep the same lockup but switch the ink to red and
-  run the `▒` scan row once. Do not switch wordmark styles mid-session; the
-  identity stays stable.
+- **Primary:** DIAMOND / PIXEL. It is the best balance of hardcore, legible,
+  pure ASCII, and animation-safe.
+- **Boot / large identity:** DIAMOND / SLAB.
+- **Menu-bar popover:** DIAMOND / TERMINAL, at three lines:
+  `CUSTOS`, state word, contained count.
+- **Quiet secondary header:** DIAMOND / WIRE.
+- **About/docs:** DIAMOND / CUSTOS.
 
-The final choice can mix a static lockup with one motion language. Do not
-combine scan, orbit, and glitch in the same window; one motion language is the
-hardcore rule.
+The chosen variant should keep the diamond at the left of the word, never above
+it, and should use one motion language only. Do not mix scan, node, and glitch
+in the same window.
 
 ## Implementation note
 
 Render as a `Text` layer with a fixed-width monospaced font and explicit
-`lineSpacing`. The box-drawing and block glyphs must be measured with the same
-font; if a glyph is missing, fall back to pure ASCII `#`/`+`/`-` rather than a
-proportional substitute. The wordmark is `accessibilityHidden`; the state word
-and log carry the accessible information.
+`lineSpacing`. The diamond and letters must be measured in the same font. If a
+glyph is missing, fall back to ASCII `#`/`+`/`-`; never substitute a proportional
+symbol. The wordmark is `accessibilityHidden`.
