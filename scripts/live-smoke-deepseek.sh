@@ -11,9 +11,10 @@
 #   SMOKE_TIMEOUT_SECS (default: 300)
 #
 # It builds the local binaries, runs the provider stream test, a deliberately
-# small live cache-bench, and a full temporary Leader -> write_file -> idle
-# session. It never fakes a pass: a non-idle session, wrong file content, or
-# provider error exits nonzero.
+# small live cache-bench, the explicit provider tool-calling probe, and a full
+# temporary Leader -> write_file -> idle session. It never fakes a pass: a
+# non-idle session, wrong file content, missing tool calling, or provider error
+# exits nonzero.
 
 set -euo pipefail
 
@@ -106,6 +107,30 @@ if [[ ! -f "$DATA/run/daemon.json" ]]; then
     tail -40 "$DATA/daemon.log" >&2 || true
     exit 1
 fi
+
+echo "== provider probe + tool calling =="
+PROBE_JSON=$("$VP" --data-dir "$DATA" --json provider-test --tools)
+printf '%s' "$PROBE_JSON" > "$DATA/provider-probe.json"
+python3 - "$DATA/provider-probe.json" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1]))
+connection = data["connection"]
+tools = data["tools"]
+assert connection.get("text"), connection
+assert tools.get("tool_calling") is True, tools
+assert tools.get("tool_name") == "probe_echo", tools
+print(
+    "probe provider=%s model=%s latency_ms=%s first_token_ms=%s tool_calling=%s tool=%s"
+    % (
+        tools.get("provider"),
+        tools.get("model"),
+        tools.get("latency_ms"),
+        tools.get("first_token_ms"),
+        tools.get("tool_calling"),
+        tools.get("tool_name"),
+    )
+)
+PY
 
 PROJECT_JSON=$("$VP" --data-dir "$DATA" --json project-add "$REPO" --name live-smoke)
 PROJECT=$(printf '%s' "$PROJECT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')

@@ -144,13 +144,16 @@ covers three fake-provider runtime faults plus two explicitly labeled harness
 models. `scripts/verify-dmg.sh` / `just verify-dmg` checks a packaged DMG's
 checksum, image, app/helper layout, and signature without installing it. This
 is not V1 release readiness: native computer/Code Mode are not yet a
-project-level opt-in, no live tool-calling probe or live multi-Worker/soak run
-has been recorded in this workspace, Keychain/TCC first-run still needs a
-real-machine pass, Developer ID signing/notarization remains unavailable here,
-and the CUSTOS ring has not been installed/verified on a real machine. Two consecutive clean
-`just release-preflight full` runs on 2026-11-27 reported 4,806 Rust passed / 0
-failed / 6 ignored and 544 app + 132 helper Swift tests passed, plus the backup
-drill, scale/fault harness, and release binaries.
+project-level opt-in, a live DeepSeek probe and small E2E session passed but no
+live multi-Worker/soak run has been recorded in this workspace, Keychain/TCC
+first-run still needs a real-machine pass, Developer ID signing/notarization
+remains unavailable here, and the CUSTOS ring has not been installed/verified
+on a real machine. Two consecutive clean `just release-preflight full` runs on
+2026-11-27 reported 4,806 Rust passed / 0 failed / 6 ignored and 544 app + 132
+helper Swift tests passed, plus the backup drill, scale/fault harness, and
+release binaries. Live DeepSeek validation (environment-only key) returned
+`tool_calling=true`/`probe_echo` at 411 ms and a 5-call Leader→`write_file`→idle
+session at 93.85% cache hit.
 
 ## Commands
 

@@ -50,15 +50,22 @@
 Remaining honest gaps: redaction is payload-scoped and pattern/key based (legacy
 rows, conversation messages, artifacts/sources, file content, and
 journal/effect inputs are not rewritten); native computer/Code Mode are not yet
-a project-level opt-in; no live tool-calling probe or live
-multi-Worker/merge-conflict/daemon-restart/soak run has been recorded in this
-workspace; Keychain/TCC first-run still needs a real-machine pass; and release
-signing/notarization plus a real CUSTOS ring install remain open.
+a project-level opt-in; the live DeepSeek run is one small session, not live
+multi-Worker/merge-conflict/daemon-restart/soak evidence; Keychain/TCC
+first-run still needs a real-machine pass; and release signing/notarization plus
+a real CUSTOS ring install remain open.
 
 Two consecutive clean `just release-preflight full` runs on 2026-11-27:
 4,806 Rust passed / 0 failed / 6 ignored; 544 app + 132 helper Swift tests
 passed; backup/restore drill, `vp bench scale`, `vp bench fault`, and release
 binaries passed.
+
+Live DeepSeek validation on 2026-11-27 (environment-only key, never written to
+the repository): `vp provider-test --tools` returned `tool_calling=true` /
+`probe_echo` at 411 ms; the full Leader→`write_file`→idle session finished
+idle with correct `LIVE_SMOKE.md` content, 5 calls, 64,919 input / 1,275 output
+/ 60,928 cache-read tokens, and 93.85% cache hit. The small live cache-bench
+reported 95.07–96.83% hit; it is not the long-prefix 99.5% acceptance run.
 
 ---
 

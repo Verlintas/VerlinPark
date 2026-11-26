@@ -750,8 +750,9 @@ four-tier path with a deliberately non-human spatial output.
   `vp provider-test --tools` sends one explicit `probe_echo` tool request and
   reports whether the model emitted the expected call. It performs no local
   tool execution. Tests: `tool_probe_requires_the_expected_tool_call` and
-  `tool_probe_reports_text_only_providers`. This is a live capability check, not
-  evidence that a specific real endpoint was probed in this workspace.
+  `tool_probe_reports_text_only_providers`. Live DeepSeek validation
+  (2026-11-27) returned `tool_calling=true`, `tool_name=probe_echo`, 411 ms;
+  the key came from the environment and was never written to disk.
 - **Doctor lacked Git and shell-trust readiness checks.** `server.doctor` now
   reports `git projects` and `shell trust` rows; the latter warns while a
   project still uses the permissive default (`network=allow`, no read jail).
@@ -811,17 +812,17 @@ filtered, so a secret echoed into those surfaces can still persist. Matching is
 pattern/key based, not entropy detection. Native computer and Code Mode are not
 yet a project-level explicit opt-in (computer remains helper/TCC-gated and Code
 Mode remains capability-limited, but both are still advertised by default);
-Keychain/TCC first-run needs a real-machine pass; the provider tool probe has
-not yet been run against a live endpoint in this workspace; automatic project
-creation from non-GUI clients does not force a shell trust decision; and the
-scale/fault harness does not replace live multi-Worker, merge-conflict, daemon
-restart, or 72-hour soak evidence.
+Keychain/TCC first-run needs a real-machine pass; automatic project creation
+from non-GUI clients does not force a shell trust decision; and the scale/fault
+harness does not replace live multi-Worker, merge-conflict, daemon restart, or
+72-hour soak evidence. The live DeepSeek run is one small session, not that
+scale/soak evidence.
 
 ### Evidence run (2026-11-27)
 
 | Check | Result |
 |---|---|
-| `cargo test -p vp-core --lib` | 2,723 passed / 0 failed / 2 ignored |
+| `cargo test -p vp-core --lib` | 2,725 passed / 0 failed / 2 ignored |
 | `cargo test -p vp-core --test secret_redaction` | 3 passed |
 | `cargo test -p vp-bench` | 164 passed / 1 ignored |
 | `cargo test -p vp-cli` | unit + integration suites passed |
@@ -837,8 +838,26 @@ restart, or 72-hour soak evidence.
 | `xcodebuild test` | 544 app + 132 helper passed |
 | `scripts/package-release.sh` | DMG created (universal, ad-hoc signed) |
 | `just verify-dmg` | checksum, image, helpers, layout, signature passed |
+| live DeepSeek smoke | provider probe + `tool_calling=true`; full E2E idle; 93.85% cache hit |
 
 The first preflight run exposed one load-sensitive ACP WebSocket timeout
 (20s) and two locale-dependent Swift assertions. The timeout was raised to 60s
 and the assertions now compare localized strings; the clean rerun above passed.
 This is still not Developer ID signing/notarization or a live soak run.
+
+### Live DeepSeek validation (2026-11-27)
+
+Environment-only key; no key was written to the repository, events, logs, UI,
+or this document. `scripts/live-smoke-deepseek.sh` now also runs the explicit
+tool-calling probe.
+
+- Provider stream and full Leader→`write_file`→idle session passed.
+- `vp provider-test --tools`: `tool_calling=true`, `tool_name=probe_echo`,
+  latency 411 ms, first token 411 ms.
+- Small live cache-bench (4 turns, ~4.7k–4.9k input tokens): 95.07–96.83% hit;
+  this is a small-prefix smoke, not the 99.5% long-prefix acceptance target.
+- Full session usage: 5 calls, 64,919 input, 1,275 output, 60,928 cache-read
+  tokens, **93.85%** cache hit; final status `idle`; `LIVE_SMOKE.md` matched
+  `live provider smoke ok`.
+- The small cache-bench was capped at $0.05; the full session used the script's
+  120k token / 300s budget.

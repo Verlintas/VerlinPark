@@ -452,9 +452,12 @@ preflights, empty-project recovery, and a scripted backup/restore drill are
 implemented. A clean `just release-preflight full` reported 4,806 Rust passed /
 0 failed / 6 ignored, 544 app + 132 helper Swift tests passed, the backup drill
 and scale/fault harness passed, a universal ad-hoc DMG was built and verified,
-and release binaries built. Native computer/Code Mode remain open S1 items, no
-live provider tool probe has been run in this workspace, and Keychain/TCC
-first-run still needs a real-machine pass. In-run plan revision remains open.
+and release binaries built. Live DeepSeek validation on 2026-11-27 confirmed
+the provider text stream, `tool_calling=true` for `probe_echo`, a full
+Leader→`write_file`→idle session (5 calls, 93.85% cache hit), and a small
+cache-bench; the key was environment-only. Native computer/Code Mode remain open
+S1 items, the live run is not a 10-Worker/soak proof, and Keychain/TCC first-run
+still needs a real-machine pass. In-run plan revision remains open.
 
 ### Phase 2 — Scale, coding precision, and Agent Inspector (4–6 weeks)
 
