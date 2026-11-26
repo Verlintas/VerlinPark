@@ -122,6 +122,33 @@ Agent tooling now includes, on top of the original seven file/shell tools and th
 
 **CUSTOS observe-only foundation (2026-11-26, ADR-0235).** `crates/vp-custos` adds `custosd` (observe-only core/support roles) and `custos` (read-only CLI). It uses a 0600 Unix socket (`status`, `health`, `charter`, `ping`, explicit `diagnostics.generate`), `SQLITE_OPEN_READ_ONLY` probes, and a separate `custos/discovery.json`; it never calls `Store::open()`, never mutates VerlinPark state, and has no agent tool/provider key/TCP listener. User LaunchAgent install/status/uninstall and a peer watchdog exist, but the ring has not been installed/verified on a real machine. The SwiftUI `CUSTOS` window is a normal GUI with only the `Custos` wordmark as ASCII art; the central diamond and dimensions are normal SwiftUI. Diagnostic bundles are local standard/forensic ZIPs with no upload. Process sampling is read-only shadow pressure/stop evidence; it never signals. A Custos-owned hash vault supports explicit init/verify/repair with quarantine and an optional local Ed25519 seed; `--vault-pinned-key` supports release-style pinned verification, but no release key is shipped. `--vault-auto-repair` is opt-in and repairs drifted plists; `--vault-auto-repair-binary` additionally restores a drifted binary and requests a launchd restart (off by default). A hash-chained JSONL audit records start/stop and automatic 30s vault-state changes; `--audit-verify` checks the chain. Sealed one-way notices now drain from `custos/notices/outbox` at an agent turn boundary as persisted system messages (no reply path); `supervised_process_owners` routes new process notices to the owning agent/task, with Leader fallback for legacy/unowned processes. L2–L4 actions remain unimplemented. Tests: 4,781 Rust passed / 0 failed / 6 ignored; 673 Swift passed.
 
+**V1 release hardening (2026-11-27).** `project.add` now requires a canonical
+non-empty Git repository with configured `user.name`/`user.email`, and
+`server.doctor` reports `git projects`, `shell trust`, and per-project root
+health. First-run setup requires a project, a successful live text probe, a
+separate one-call `agent.probe.tools` tool-calling check, and an explicit shell
+trust decision (hardened by default; standard is opt-in); it shows daemon
+connection state with a Retry that cancels backoff. `vp provider-test --tools`
+exposes the same capability check. An empty project entry can be removed with
+`project.remove` / `vp project-remove --yes` or the Rail menu; it refuses when
+sessions, identities, workspaces, or intake tasks exist and never deletes
+repository files. A deterministic persistence-boundary redactor removes
+secret-like tool/approval payload values without changing execution inputs.
+`scripts/backup-restore-drill.sh` / `just backup-drill` proves v1 ZIP and
+signed/encrypted repository restore through the CLI, and
+`scripts/release-preflight.sh` / `just release-preflight` runs version, fmt,
+clippy, full Rust tests, SwiftFormat/xcodebuild, the backup drill, and
+`vp bench scale`/`fault`. `vp bench scale` drives a 100-task/10-Worker plan
+through the real plan validator and task scheduler projection; `vp bench fault`
+covers three fake-provider runtime faults plus two explicitly labeled harness
+models. `scripts/verify-dmg.sh` / `just verify-dmg` checks a packaged DMG's
+checksum, image, app/helper layout, and signature without installing it. This
+is not V1 release readiness: native computer/Code Mode are not yet a
+project-level opt-in, no live tool-calling probe or live multi-Worker/soak run
+has been recorded in this workspace, Keychain/TCC first-run still needs a
+real-machine pass, Developer ID signing/notarization remains unavailable here,
+and the CUSTOS ring has not been installed/verified on a real machine.
+
 ## Commands
 
 ```bash

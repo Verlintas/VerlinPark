@@ -32,6 +32,10 @@
   confirmation, refuses when sessions/identities/workspaces/intake tasks exist,
   never deletes repository files, and clears the project manifest if the last
   project is removed.
+- `scripts/package-release.sh` produced a universal `0.1.0-dev` DMG with the
+  daemon, CLI, remote helper, and CUSTOS binaries; `scripts/verify-dmg.sh` /
+  `just verify-dmg` verified its checksum, image, app/helper layout, and
+  signature. It remains ad-hoc signed and not notarized.
 - First-run waits for the local daemon, shows connection state, and offers an
   explicit Retry that cancels automatic backoff.
 - `vp bench scale` validates and completes a 100-task/10-Worker plan through the

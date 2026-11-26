@@ -781,6 +781,12 @@ four-tier path with a deliberately non-human spatial output.
   assignment-shaped secrets. Execution arguments, effect probes, contract
   checks, and journal fingerprints still use the real input. Tests:
   `crates/vp-core/tests/secret_redaction.rs` plus the redaction unit tests.
+- **No packaged DMG verification.** `scripts/package-release.sh` produced a
+  universal (x86_64/arm64) `0.1.0-dev` DMG with the bundled daemon, CLI,
+  remote helper, and CUSTOS binaries, ad-hoc signed. `scripts/verify-dmg.sh` /
+  `just verify-dmg` verified its checksum, image, app/helper layout, and code
+  signature without installing it. This is not Developer ID signing or
+  notarization.
 - **A bad project entry could not be removed.** `project.remove` /
   `vp project-remove --yes` removes only an empty project (no sessions,
   identities, workspaces, or intake tasks), refuses without explicit
@@ -823,6 +829,8 @@ restart, or 72-hour soak evidence.
 | `cargo clippy ... -D warnings` | passed |
 | `swiftformat --lint` | passed |
 | `xcodebuild build` | passed |
+| `scripts/package-release.sh` | DMG created (universal, ad-hoc signed) |
+| `just verify-dmg` | checksum, image, helpers, layout, signature passed |
 
 A full `cargo test --workspace` run reported 4,802 passed / 0 failed / 6
 ignored before the final empty-project-removal tests were added; those three
