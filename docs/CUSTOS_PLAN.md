@@ -6,6 +6,13 @@ Repository: `/Users/apple/orca/workspaces/VerlinPark/m3-round`
 Branch: `Verlintas/m3-round`  
 Latest commit at write time: `2a9c0c9` (`Record runtime hardening smoke evidence`)
 
+> **Round 1 owner direction (2026-11-26):** Custos may have a GUI, but the
+> user must have **no operational authority** in it. The GUI is a sealed,
+> read-only observatory with deliberately limited information. Custos is a
+> resident guardian with real protective power — closer to the Red Queen than
+> to an operator console. This direction supersedes the earlier
+> "operator-gated" UI assumptions in this draft; see section 13.
+
 This file is both the current-context handoff and the first Custos design
 proposal. It is intentionally outside the agent tool surface.
 
@@ -394,3 +401,81 @@ Only after shadow mode is boring and accurate should Custos get L3/L4 powers.
 over *state and process health*, not over *truth, policy, security, or code*.
 It should be the system that keeps the game fair and running, not a player
 that can rewrite the rules.
+
+## 13. Round 1 direction: a sealed resident guardian
+
+The owner's vision is not an admin console. It is closer to the Red Queen in
+Resident Evil or the Relic in Cyberpunk 2077: a resident, autonomous guardian
+that belongs to the system, watches it, and can act to preserve it. The human
+can see that Custos exists and see a deliberately limited status surface, but
+cannot command it.
+
+### Design consequences
+
+- **GUI is read-only.** No start/stop/repair/restore/kill/approve buttons and
+  no command palette. The human cannot configure Custos or ask it to act.
+- **Limited information.** The GUI shows high-level state, integrity rings,
+  current protection mode, bounded incident summaries, and action categories.
+  It does not expose raw prompts, tool bodies, file contents, paths, SQL,
+  provider payloads, stack traces, secrets, or the full audit.
+- **Custos is a resident process, not a VerlinPark feature.** It has its own
+  binary, launchd supervision, local sealed control channel, and lifecycle.
+- **The user is an observer, not an operator.** The only human "override"
+  is OS-level custody (quit/disable/uninstall/delete data), outside the product
+  GUI. If Custos is wrong, the owner can still stop it at the OS level; the
+  product does not provide a polite in-app veto.
+- **Custos has real authority.** It may freeze/quarantine/stop/restart/restore
+  according to its immutable charter and policies. It does not ask the GUI for
+  permission for L2/L3 actions.
+- **Custos is deterministic and LLM-distrusting.** No model calls, no API key,
+  no natural-language planning, no dynamic code generation. Its messages are
+  templated from state.
+- **Agents cannot see or call Custos.** It is absent from the agent tool
+  surface, model prompts, and task contracts.
+- **Immutable charter.** The rules that grant Custos authority are shipped with
+  the signed binary/release, not editable from the GUI or by an agent. Policy
+  changes require a new signed release and developer review.
+- **Custos cannot modify VerlinPark source or policy.** It protects the game;
+  it does not rewrite the rules.
+- **Custos does not replace truth gates.** It never approves approvals,
+  verifies work, merges branches, changes budgets, or edits identities. It can
+  stop an unsafe process; it cannot certify correctness.
+
+### What the GUI could show
+
+- a single ◇CUSTOS sigil and a sealed state (`healthy / watch / degraded /
+  critical / quarantined`);
+- 5–7 integrity dimensions with coarse states (runtime, database, leases,
+  queues, worktrees, backups, event freshness);
+- a short, bounded "Custos log" of decisions (time, category, action class,
+  result) without raw internals;
+- a "protection active" indicator and a count of contained incidents;
+- a static, deterministic persona line (no chat, no prompt box, no controls).
+
+### Hard questions introduced by this direction
+
+1. If the user cannot operate Custos, who can update its charter? Proposed:
+   only a signed release; no runtime UI/agent policy editing.
+2. If Custos wrongly quarantines the system, is OS-level kill/uninstall the
+   only recourse? Proposed: yes for V1; document it honestly.
+3. Does Custos have veto power over user/agent commands that threaten
+   integrity? Proposed: yes for a narrow, enumerated set (corruption, unsafe
+   restore, runaway process, merge-gate poisoning); it reports the veto.
+4. Can the GUI export an incident bundle? If yes, that is an operation. Maybe
+   only copy a bounded incident id, not a file/command.
+5. Does the user see enough to trust Custos? The tension is deliberate:
+   limited information is part of the fiction, but hiding a destructive action
+   is unacceptable. Proposed: show categories and consequences, never secrets
+   or raw internals.
+6. Is the GUI a separate app/window or a sealed panel inside VerlinPark?
+   Proposed: a separate ◇CUSTOS window or a read-only panel that cannot issue
+   daemon commands.
+7. How does Custos prove it is alive/healthy? A heartbeat/status surface and
+   launchd supervision; no user ping button.
+8. Does Custos get a voice/persona? Proposed: deterministic templated lines
+   only; no generative chat, no "personality model".
+9. How is Custos prevented from becoming a second root authority? Separate
+   process, no provider key, no source writes, immutable charter, signed
+   binary, OS-level custody, and a small action allowlist.
+10. What is the minimum human-visible incident information that is ethically
+    required? This needs a separate "sealed but honest" policy.
