@@ -678,14 +678,14 @@ a panel embedded in the main Stage:
 - pure-ASCII art is a first-class layer: fixed-width, monospaced, no
   proportional fallback, no ligatures, no essential information only in art;
 - character animation runs at 8–12 fps; the wordmark boot reveal is 8 frames,
-  the idle carrier loops every 6s, and the critical jitter is 7 frames (~700ms,
+  the idle is glow-only, and the critical jitter is 7 frames (~580ms at 12 fps,
   max two cycles); no flashing above 3 Hz and no scanline;
 - the wordmark uses an 8-frame print-head reveal, then static letters with a
-  baseline carrier and glow; `CRITICAL` adds the multi-frame jitter;
+  soft glow breath; `CRITICAL` adds the multi-frame jitter;
 - state colors: ice (healthy), amber (watch/degraded), red (critical),
   near-black (quarantined);
-- Reduce Motion freezes the static frame and disables pulse, carrier, glow, and
-  jitter; Reduce Transparency removes blur;
+- Reduce Motion freezes the static frame and disables glow and jitter; Reduce
+  Transparency removes blur;
 - VoiceOver reads the status text, not the art; the art layer is
   `accessibilityHidden`;
 - all text is deterministic; no generated copy.
@@ -1022,10 +1022,10 @@ Answered in this round: capacity formulas and 5-run learning mode (yes), vault
 UX (project/task label, category, consequence, diagnostics entry), menu-bar
 diamond status item (yes), no stack samples/full paths. Remaining:
 
-1. Which idle wordmark motion to use: the baseline carrier + glow, or glow-only.
-   Boot is now an 8-frame print-head reveal; `CRITICAL` is a 7-frame jitter with
-   no scanline. See `docs/CUSTOS_WORDMARK_ASCII.md`. The wordmark itself has no
-   small diamond; the large diamond belongs to the window center.
+1. Idle wordmark motion is now glow-only, with no line/cursor/scan; the boot is
+   an 8-frame print-head reveal and `CRITICAL` is a 7-frame (~580ms) jitter.
+   See `docs/CUSTOS_WORDMARK_ASCII.md`. The wordmark itself has no small
+   diamond; the large diamond belongs to the window center.
 2. Should audit-chain tamper restore the head from anchor memory and mark a
    gap, or only flag the gap without writing a new head? Proposed: preserve
    the tampered file, write a `tamper_detected` gap marker, never fabricate

@@ -24,10 +24,12 @@ This file is pure ASCII. No Unicode box drawing, block glyphs, `◇`, or scanlin
 The wordmark is an identity, not a loading spinner. The letters never morph,
 rotate, or bounce. Motion is split into three moments:
 
-1. **boot** — a print head writes the word left to right (more frames, not a
+1. **boot** — a print head writes the word left to right (8 frames, not a
    single flash);
-2. **idle** — static letters, a slow baseline carrier, and a soft glow breath;
-3. **critical** — a short multi-frame jitter, then static. No scanline.
+2. **idle** — completely static letters with a soft glow breath; no line, no
+   cursor, no character movement;
+3. **critical** — a short multi-frame jitter (~500–600 ms), then static. No
+   scanline.
 
 ---
 
@@ -122,70 +124,33 @@ If boot is interrupted, show frame 8, not a half-written logo.
 
 ---
 
-## 2. Idle: baseline carrier + glow
+## 2. Idle: glow only
 
-The wordmark is static. A 27-character baseline carries a 3-character `===`
-segment from left to right every 6 seconds. A soft glow breathes ±8% over the
-same 6-second cycle, offset by 3 seconds.
+The wordmark is completely static. There is no line, cursor, scan, or character
+movement. The only idle motion is a soft glow breath:
 
-Carrier frame A:
-
-```text
-  ___         _
- / __|_  _ __| |_ ___ ___
-| (__| || (_-<  _/ _ (_-<
- \___|\_,_/__/\__\___/__/
- ===------------------------
-```
-
-Carrier frame B:
+- brightness ±8% over a 6-second sine-like cycle;
+- a slight outer bloom, never enough to blur the letter edges;
+- `WATCH` shortens the cycle to 4s; `DEGRADED` to 3s;
+- `CRITICAL` stops the glow during the jitter, then resumes at 2s;
+- `QUARANTINED` and `SIGNAL LOST` have no glow.
 
 ```text
   ___         _
  / __|_  _ __| |_ ___ ___
 | (__| || (_-<  _/ _ (_-<
  \___|\_,_/__/\__\___/__/
- --------===----------------
 ```
 
-Carrier frame C:
-
-```text
-  ___         _
- / __|_  _ __| |_ ___ ___
-| (__| || (_-<  _/ _ (_-<
- \___|\_,_/__/\__\___/__/
- ----------------===--------
-```
-
-Carrier frame D:
-
-```text
-  ___         _
- / __|_  _ __| |_ ___ ___
-| (__| || (_-<  _/ _ (_-<
- \___|\_,_/__/\__\___/__/
- ------------------------===
-```
-
-Rules:
-
-- the carrier is a **signal line**, not a progress bar; it never has a border,
-  percentage, or label;
-- the wordmark never moves during idle;
-- `WATCH` shortens the carrier loop to 4s; `DEGRADED` to 3s;
-- `CRITICAL` pauses the carrier during the jitter, then resumes at 2s;
-- `QUARANTINED` and `SIGNAL LOST` stop the carrier and the glow.
-
-This replaces the blinking cursor. If the carrier feels like too much, the
-fallback is **glow only**: same wordmark, no character motion, ±8% breathing.
+No ASCII frame changes; the animation is entirely ink/opacity. This avoids the
+"loading bar" look and keeps the wordmark readable at all times.
 
 ---
 
 ## 3. CRITICAL: multi-frame jitter
 
-The jitter is a short controlled fracture, not a loop. 7 frames at 10 fps
-(~700 ms), then static. At most two cycles per incident.
+The jitter is a short controlled fracture, not a loop. 7 frames at 12 fps
+(~580 ms), then static. At most two cycles per incident.
 
 ### Frame 1 — normal
 
@@ -258,20 +223,20 @@ Do not add a scanline. The jitter is the entire critical animation.
 
 | State | Boot | Idle | Critical |
 |---|---|---|---|
-| `HEALTHY` | 8-frame print head | carrier 6s + glow | — |
-| `WATCH` | same | carrier 4s + glow | — |
-| `DEGRADED` | same | carrier 3s + glow | — |
-| `CRITICAL` | same | carrier paused during jitter, then 2s | 7-frame jitter, max 2 cycles |
+| `HEALTHY` | 8-frame print head | glow 6s | — |
+| `WATCH` | same | glow 4s | — |
+| `DEGRADED` | same | glow 3s | — |
+| `CRITICAL` | same | glow paused during jitter, then 2s | 7-frame jitter (~580ms), max 2 cycles |
 | `QUARANTINED` | static frame | none | none |
 | `SIGNAL LOST` | static frame | none | none |
 
-Reduce Motion: static wordmark, no carrier, no glow, no jitter. State color is
-the only difference.
+Reduce Motion: static wordmark, no glow, no jitter. State color is the only
+difference.
 
 ## Implementation note
 
 Render as a `Text` layer with a fixed-width monospaced font and explicit
-`lineSpacing`. The boot reveal is a width mask over the final string; the idle
-carrier is a separate baseline row; the critical jitter is a precomputed list of
-six alternate strings. The wordmark is `accessibilityHidden`; the status word
+`lineSpacing`. The boot reveal is a width mask over the final string; idle is a
+brightness/bloom animation only; the critical jitter is a precomputed list of
+seven alternate strings. The wordmark is `accessibilityHidden`; the status word
 and log carry the accessible meaning.

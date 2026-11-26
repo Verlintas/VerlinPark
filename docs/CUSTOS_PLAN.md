@@ -816,8 +816,8 @@ diamond status item; no stack samples/full paths.
 
 Remaining:
 
-- Wordmark animation: baseline carrier + glow (recommended) vs glow-only
-  fallback; see `docs/CUSTOS_WORDMARK_ASCII.md`.
+- Wordmark animation: idle is glow-only; see
+  `docs/CUSTOS_WORDMARK_ASCII.md`.
 - Audit-chain tamper handling: gap marker vs restored head.
 - Calibration drift: distinguish a permanently slow machine from a real stall
   without letting a poisoned baseline hide regressions.
@@ -845,12 +845,12 @@ implementation. `docs/CUSTOS_WORDMARK_ASCII.md` holds the accepted four-row
 wordmark and its animation:
 
 - boot: an 8-frame print-head reveal, not a single flash;
-- idle: static letters, a slow 27-character baseline carrier (`===` segment),
-  and a ±8% glow breath; no blinking cursor;
-- `CRITICAL`: a 7-frame multi-row jitter (~700 ms), at most two cycles, with no
-  scanline;
-- `QUARANTINED` / `SIGNAL LOST`: static, no carrier, no glow.
+- idle: completely static letters with a ±8% glow breath; no line, no cursor,
+  no character movement;
+- `CRITICAL`: a 7-frame multi-row jitter (~580 ms at 12 fps), at most two
+  cycles, with no scanline;
+- `QUARANTINED` / `SIGNAL LOST`: static, no glow.
 
-The fallback is glow-only if the carrier feels too active. The selection is a
-design choice, not a runtime policy; the wordmark will be implemented as a
-monospaced text layer with a static fallback, not as an image asset.
+The selection is a design choice, not a runtime policy; the wordmark will be
+implemented as a monospaced text layer with a static fallback, not as an image
+asset.

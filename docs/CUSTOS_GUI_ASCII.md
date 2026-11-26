@@ -10,11 +10,11 @@ These are fixed-width character studies for the sealed Custos **window layout**
 mockups and not final assets. The chosen direction will be rendered as a
 monospaced text layer with a static fallback, not as an image.
 
-> **Motion note (2026-11-26):** scanline is not part of the implemented Custos
-> motion language. The layout studies below still mention it as a concept, but
-> the final wordmark and critical animation use an 8-frame print-head reveal, a
-> baseline carrier + glow, and a 7-frame jitter. Treat scanline references here
-> as discarded exploration.
+> **Motion note (2026-11-26):** scanline and baseline carrier are not part of
+> the implemented Custos motion language. The layout studies below still mention
+> them as concepts, but the final wordmark uses an 8-frame print-head reveal,
+> glow-only idle, and a 7-frame (~580ms) critical jitter. Treat scanline/carrier
+> references here as discarded exploration.
 
 ## Rules
 
