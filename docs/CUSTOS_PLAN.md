@@ -300,45 +300,52 @@ launchd/process reliability proves insufficient.
 Open: should Custos be a user LaunchAgent (same user as daemon) or a
 root/LaunchDaemon with a dedicated service user? V1 likely user-level, no sudo.
 
-## 7. Policy, authority, and break-glass
+## 7. Policy and authority (superseded by §13–15 and the charter)
 
-- Policy is a signed/hashed file or SQLite row, pinned by hash; Custos logs
-  the hash it used.
-- `CustosPolicy` fields (draft): enabled, allowed actions/classes, max
-  actions per hour/day, cooldowns, max duration, max disk/DB growth, restart
-  limits, backup generation requirements, escalation channels, dry-run mode,
-  operator approval requirements, retention.
-- High-risk actions use a **break-glass grant**: short-lived signed token,
-  one action, one target, reason, expiry; logged.
-- A kill switch must stop all automatic actions immediately.
-- Custos never has a generic "run this command" capability.
-- The operator can always downgrade to observe-only.
+The earlier "operator policy / break-glass grant" proposal is superseded. The
+current direction is:
+
+- the charter is a fixed, signed release artifact pinned by hash, not runtime
+  policy;
+- there is no GUI/RPC/agent `policy.set`, no admin mode, and no in-product
+  break-glass grant;
+- the human can only observe and export diagnostics; the final override is
+  OS-level quit/kill/uninstall/delete-data outside the product;
+- Custos never has a generic "run this command" capability;
+- Custos may always be downgraded by shipping a new signed release, not by a
+  runtime switch.
+
+Action classes, caps, cooldowns, and prohibited actions are defined in
+`docs/CUSTOS_CHARTER_V0.md`, which is the authoritative draft.
 
 ## 8. Audit and evidence
 
 - Append-only local `custos_events`/JSONL with hash chain.
-- Each action: action id, policy hash, precondition snapshot, evidence
-  pointers, dry-run, result, postcondition, rollback/stop, duration, operator
-  grant id if any.
+- Each action: action id, charter hash, precondition snapshot, evidence
+  pointers, dry-run, result, postcondition, rollback/stop, duration, notice id
+  (no operator grant; there is no in-product operator authority).
 - No prompts, tool bodies, secrets, model keys, or screen content.
 - Bounded retention; export/verify tool.
 - Custos actions should be replayable as a state machine; a replay must not
   re-execute side effects.
 
-## 9. Interfaces
+## 9. Interfaces (updated for sealed authority)
 
-Proposed:
-
-- `custos.status` — health, state, policy, version, last probes
-- `custos.health` — detailed dimensions/evidence
-- `custos.preview` — action plan/cost/risk, no side effects
-- `custos.act` — execute a bounded action with grant/approval
-- `custos.history` — bounded audit
-- `custos.policy.get/set` — operator-only, signed/pinned
-- `custos.pause/resume` — global kill switch
-- CLI `vp custos ...` and/or separate `custos` binary
-- GUI: a read-only Custos card plus preview/act for L3/L4
-- Agent tool bundle: **none**. Agents cannot call Custos.
+- `custos.status` — health, state, build/charter hash, last probes
+- `custos.health` — bounded dimensions/evidence codes
+- `custos.history` — bounded, redacted audit
+- `custos.diagnostics.generate` — the single user-consented local export action
+  (standard + forensic), never upload
+- `custos.preview` — internal/developer-only dry-run for testing, not a user
+  command surface
+- no `custos.act`, `custos.policy.set`, `custos.pause/resume` in the product
+  RPC/CLI/GUI; actions are charter-driven and internal
+- admin RPC is exposed only on a 0600 Unix domain socket with peer-uid checks
+  and a sealed token; normal `vp` RPC/discovery/agent/MCP do not see it
+- CLI: a separate read-only `custos`/`◇CUSTOS` binary or a developer
+  `custos-status` command; no repair verbs
+- GUI: sealed read-only main window plus the secondary diagnostics sheet
+- Agent tool bundle: **none**. Agents cannot call, query, or configure Custos.
 
 ## 10. Testing and rollout
 
@@ -354,33 +361,42 @@ Proposed:
    - daemon crash loop
    - Git lock/ref failure
    - backup verification/anchor rollback
-2. Shadow mode: Custos observes and emits recommendations; no actions.
-3. Assisted mode: operator sees preview and applies.
-4. Auto mode only for L2 safe classes with tight caps.
-5. L3/L4 always operator-gated initially.
-6. No live auto-repair until shadow-mode recommendations match operator
-   decisions on a recorded corpus.
+2. Shadow mode: Custos observes and emits sealed recommendations to the audit
+   log only; no actions, no user apply.
+3. L2 auto mode only for safe classes with tight caps, after fault-injection
+   fixtures and shadow evidence agree.
+4. L3 containment after shadow evidence; L4 recovery only under the narrow
+   charter preconditions.
+5. There is no "assisted operator apply" mode; the user has no jurisdiction.
+   Developer review happens through signed releases and recorded evidence.
+6. No live auto-repair until deterministic fault-injection and replay
+   comparisons pass on a recorded corpus.
 
-## 11. Open questions for the next discussions
+## 11. Open questions (remaining)
 
-1. Process boundary: sidecar vs in-daemon; user LaunchAgent vs LaunchDaemon.
-2. Authority ceiling: may Custos restart the daemon? restore a backup?
-   quarantine a project? kill all sessions? Which of these are L3 vs L4?
-3. Break-glass UX: local GUI confirmation, signed file, OS keychain, or a
-   separate admin token? How to prevent a compromised agent from obtaining it?
-4. Is Custos allowed to call existing daemon RPCs only, or read SQLite
-   directly when the daemon is down? What is the read-only snapshot protocol?
-5. Policy authorship: static signed file, SQLite + signature, or per-project
-   policy? How to rotate/verify?
-6. Health thresholds and probe budgets: what is "degraded" vs "critical"?
-7. Repair actions that are *not* allowed even at L4.
-8. Audit storage: separate SQLite, JSONL, or both; retention and export.
-9. How to prevent oscillation/false positives and repair-vs-repair loops.
+Most earlier questions are answered by §13–15 and the charter. Remaining
+decisions for the owner:
+
+1. Process boundary: user LaunchAgent/watchdog ring vs an optional privileged
+   LaunchDaemon for stronger anti-kill (V1 currently assumes no sudo).
+2. May Custos automatically restart the daemon (REC-01), or is that
+   developer-only?
+3. May Custos automatically restore a verified backup (REC-02) when the live
+   DB is corrupt, preserving the original?
+4. Are the v0 pressure thresholds (80%/90s, 8 GiB, 300s stall) acceptable?
+5. Should the forensic bundle include normalized full paths and process argv,
+   or stay closer to the standard bundle?
+6. Is a third anchor LaunchAgent worth the extra moving part?
+7. GUI packaging: separate app/window, menu-bar extra, or sealed panel inside
+   VerlinPark?
+8. Idle-agent notices: project inbox, or drop with an audit entry?
+9. What exactly should the user see when a project is quarantined?
 10. How Custos relates to existing `OrchestrationPolicy`,
     `IntegrationPolicy`, `EffectPolicy`, `RunContract`, and backup/anchor.
-11. Does Custos ever repair *itself*? Recommendation: no; launchd restarts
-    it, and a human redeploys a verified build.
-12. Naming/branding: `CUSTOS`, `◇CUSTOS`, binary name, glyph, UI language.
+11. Audit storage: separate SQLite + JSONL is proposed; retention/export
+    details.
+12. Naming/branding: binary name, glyph, UI language (proposed `◇CUSTOS`,
+    English UI copy for the sealed surface).
 
 ## 12. Recommended first slice (for discussion)
 
@@ -394,8 +410,9 @@ Do not start with L4. Start with:
 - deterministic fault-injection tests;
 - no mutations, no provider key, no agent tool, no auto-restart.
 
-Then add L2 safe repairs one class at a time with tests and operator preview.
-Only after shadow mode is boring and accurate should Custos get L3/L4 powers.
+Then add L2 safe repairs one class at a time with tests and shadow evidence.
+Only after shadow mode is boring and accurate should Custos get L3/L4 powers;
+the user still has no apply/approve control.
 
 **Thesis:** VerlinPark should have a powerful Custos, but its power should be
 over *state and process health*, not over *truth, policy, security, or code*.
