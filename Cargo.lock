@@ -4043,6 +4043,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "vp-custos"
+version = "0.1.0-dev"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dirs",
+ "fs2",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "vp-protocol",
+]
+
+[[package]]
 name = "vp-daemon"
 version = "0.1.0-dev"
 dependencies = [

@@ -150,7 +150,7 @@ No ASCII frame changes; the animation is entirely ink/opacity. This avoids the
 ## 3. CRITICAL: multi-frame jitter
 
 The jitter is a short controlled fracture, not a loop. 7 frames at 12 fps
-(~580 ms), then static. At most two cycles per incident.
+(~580 ms), then static. One cycle per incident; no loop.
 
 ### Frame 1 — normal
 
@@ -226,7 +226,7 @@ Do not add a scanline. The jitter is the entire critical animation.
 | `HEALTHY` | 8-frame print head | glow 6s | — |
 | `WATCH` | same | glow 4s | — |
 | `DEGRADED` | same | glow 3s | — |
-| `CRITICAL` | same | glow paused during jitter, then 2s | 7-frame jitter (~580ms), max 2 cycles |
+| `CRITICAL` | same | glow paused during jitter, then 2s | 7-frame jitter (~580ms), one cycle |
 | `QUARANTINED` | static frame | none | none |
 | `SIGNAL LOST` | static frame | none | none |
 

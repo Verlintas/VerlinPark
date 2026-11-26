@@ -5,10 +5,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP="${1:-$ROOT/apps/macos/build/Build/Products/Debug/VerlinPark.app}"
 HELPER_DIR="$APP/Contents/Helpers"
 
-cargo build --manifest-path "$ROOT/Cargo.toml" -p vp-daemon -p vp-remote-agent
+cargo build --manifest-path "$ROOT/Cargo.toml" -p vp-daemon -p vp-remote-agent -p vp-custos
 mkdir -p "$HELPER_DIR"
 cp "$ROOT/target/debug/verlinpadd" "$HELPER_DIR/verlinpadd"
 chmod +x "$HELPER_DIR/verlinpadd"
+cp "$ROOT/target/debug/custosd" "$HELPER_DIR/custosd"
+cp "$ROOT/target/debug/custos" "$HELPER_DIR/custos"
+chmod +x "$HELPER_DIR/custosd" "$HELPER_DIR/custos"
 
 # The remote workspace helper is launched by the daemon over ssh or stdio.
 # It is a separate binary so it can be copied to a remote host.

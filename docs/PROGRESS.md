@@ -8,6 +8,37 @@
 
 ---
 
+## 2026-11-26 CUSTOS observe-only foundation
+
+ADR-0235 starts the deterministic guardian as a separate crate rather than an
+in-daemon module.
+
+- New `crates/vp-custos` with `custosd` (observe-only core) and `custos`
+  (read-only CLI).
+- Pinned draft charter hash and a closed v0 action catalog; observe-only mode
+  enables only the three OBS rows and rejects `act`/`policy.set`/pause/resume.
+- Capacity formulas for RSS/children/scratch/fds from physical memory, cores,
+  and disk space; pure process score with 5-run learning mode, two-family
+  stop guard, recent-progress guard, and effective hard caps.
+- Role heartbeat files and quorum helper (single core in this slice).
+- Read-only SQLite probes: sessions, events, leases, runs, plan tasks, merge
+  queue, effects, approvals, supervised processes; `SQLITE_OPEN_READ_ONLY` +
+  `PRAGMA query_only`, never `Store::open()` and never a schema write.
+- 0600 Unix socket and separate `custos/discovery.json`; methods are `status`,
+  `health`, `charter`, and `ping` only. No TCP, token, provider key, agent tool,
+  or mutation.
+- Packaging scripts bundle `custosd`/`custos` into `Contents/Helpers` and the
+  DMG `bin/` staging; the SwiftUI window is a normal GUI with the accepted
+  `Custos` wordmark as the only ASCII art.
+
+Verification: `cargo test -p vp-custos` 26 unit + 2 integration + 1 module
+governance; full workspace **4,731 Rust passed / 0 failed / 6 ignored**;
+`cargo clippy --workspace --all-targets -- -D warnings` passes; Swift
+`xcodebuild test` **672 passed / 0 failed** with English test language; the
+Custos window is a normal SwiftUI GUI with only the wordmark as ASCII art.
+The four-role ring, notices, live process sampling, diagnostic export, launchd
+installation, and mutation classes remain open and are not claimed.
+
 ## 2026-11-26 V1 Phase 1 closure batch
 
 按 `V1_FINAL_PLAN.md` Phase 1 gate 先关闭一组本地可验证的 S0/S1：

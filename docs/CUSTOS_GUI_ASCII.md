@@ -1,20 +1,20 @@
-# ◇ CUSTOS — ASCII / box-drawing visual studies
+# ◇ CUSTOS — discarded ASCII window-layout exploration
 
-Status: **design draft, no implementation**  
+Status: **discarded — do not implement this layout**  
 Date: 2026-11-26  
 Companion: `docs/CUSTOS_CHARTER_V0.md`, `docs/CUSTOS_PLAN.md`
 
-These are fixed-width character studies for the sealed Custos **window layout**
-(sigil, rings, status). They are not the CUSTOS wordmark itself; see
-`docs/CUSTOS_WORDMARK_ASCII.md` for the name/logo studies. They are not pixel
-mockups and not final assets. The chosen direction will be rendered as a
-monospaced text layer with a static fallback, not as an image.
+> **Owner correction (2026-11-26):** Custos is a **normal SwiftUI GUI window**.
+> Only the `Custos` wordmark is ASCII/character art as an artistic logotype.
+> The central diamond, integrity dimensions, counts, and logs must be normal
+> graphical/textual SwiftUI elements, not ASCII art.
+>
+> This file is kept only as discarded visual exploration. Do not use these
+> ASCII boxes, rings, or scanlines as the window implementation. The wordmark
+> studies remain in `docs/CUSTOS_WORDMARK_ASCII.md`.
 
-> **Motion note (2026-11-26):** scanline and baseline carrier are not part of
-> the implemented Custos motion language. The layout studies below still mention
-> them as concepts, but the final wordmark uses an 8-frame print-head reveal,
-> glow-only idle, and a 7-frame (~580ms) critical jitter. Treat scanline/carrier
-> references here as discarded exploration.
+The original notes below were layout sketches for a hypothetical all-ASCII
+instrument. They are not the product GUI.
 
 ## Rules
 

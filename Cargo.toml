@@ -11,6 +11,7 @@ members = [
     "crates/vp-daemon",
     "crates/vp-cli",
     "crates/vp-bench",
+    "crates/vp-custos",
 ]
 
 [workspace.package]

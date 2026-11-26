@@ -10,6 +10,7 @@ struct VerlinParkApp: App {
     @State private var layoutStore = WorkspaceLayoutStore()
     @State private var pinnedStore = PinnedItemsStore()
     @State private var commandRouter = WorkspaceCommandRouter()
+    @State private var custosModel = CustosModel()
 
     var body: some Scene {
         WindowGroup {
@@ -25,6 +26,7 @@ struct VerlinParkApp: App {
                 .environment(\.locale, language.locale)
                 .task {
                     memory.start()
+                    custosModel.start()
                     await model.start()
                 }
         }
@@ -101,6 +103,8 @@ struct VerlinParkApp: App {
                 }
                 .keyboardShortcut("r", modifiers: [.command])
             }
+
+            CustosCommands()
         }
 
         Settings {
@@ -111,5 +115,20 @@ struct VerlinParkApp: App {
                 .environment(layoutStore)
                 .environment(\.locale, language.locale)
         }
+
+        Window("CUSTOS", id: "custos") {
+            CustosWindowView()
+                .environment(custosModel)
+        }
+        .defaultSize(width: 920, height: 840)
+
+        MenuBarExtra {
+            CustosMenuBarMenu()
+                .environment(custosModel)
+        } label: {
+            CustosMenuBarLabel()
+                .environment(custosModel)
+        }
+        .menuBarExtraStyle(.menu)
     }
 }

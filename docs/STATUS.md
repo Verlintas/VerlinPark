@@ -1,7 +1,7 @@
 # VerlinPark Status
 
-> 最后更新：2026-11-22
-> 当前主线：C1–C12 代码落地（C11 为 loopback + card-only，尚无 inbound 执行桥）；M3.1–M3.6 结构治理完成（store/core/CLI/daemon 入口、领域模块与 dispatch 路由）；下一阶段为生产化与分布式边界。
+> 最后更新：2026-11-26
+> 当前主线：C1–C12 代码落地（C11 为 loopback + card-only，尚无 inbound 执行桥）；M3.1–M3.6 结构治理完成；CUSTOS observe-only 基础已实现（ADR-0235）；下一阶段为生产化与分布式边界。
 
 ## 1. 一句话
 
@@ -11,10 +11,10 @@ VerlinPark 已经是一个可运行的 macOS 原生多 Agent 开发区：Rust da
 
 | 项 | 当前值 |
 |---|---:|
-| Rust crates | 10（新增 `vp-a2a`） |
-| ADR | 226 |
-| 最近全量 Rust 测试 | 4,534 passed / 0 failed / 6 ignored |
-| Swift | 474 app + 132 helper passed，`xcodebuild test` 通过 |
+| Rust crates | 11（新增 `vp-custos`） |
+| ADR | 235 |
+| 最近全量 Rust 测试 | 4,731 passed / 0 failed / 6 ignored |
+| Swift | 672 passed，`xcodebuild test` 通过 |
 | Live provider | DeepSeek `deepseek-flash` 流式/provider-test/完整 Leader 写文件通过；小前缀 cache 97.1–97.4% |
 | 当前分支 | `m3-round`（本轮审查前不合并） |
 
@@ -33,6 +33,7 @@ VerlinPark 已经是一个可运行的 macOS 原生多 Agent 开发区：Rust da
 - M3.4：`vp-cli/src/main.rs` 27,823 行 → 1,160 行 parent + `cli`/`dispatch`/`render`/`rpc`/`tests` modules；CLI 行为不变。
 - M3.5：`vp-store` 8 个大模块、`vp-core` plan/memory/service-merge、`vp-daemon/main.rs` 完成二级拆分；新增 store/CLI/daemon module-governance 测试。
 - M3.6：`vp-cli/render.rs`、`vp-cli/dispatch.rs`、`vp-daemon/dispatch.rs` 按输出域/命令族/路由族拆分；行为与协议不变。
+- CUSTOS observe-only：`vp-custos` crate、`custosd`/`custos`、0600 Unix socket、只读 SQLite probe、普通 SwiftUI 只读窗口（仅 wordmark 为字符艺术）；四进程环、notice、诊断包与 L2–L4 仍未实现。
 
 ## 4. 本轮新增
 

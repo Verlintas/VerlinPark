@@ -1,10 +1,11 @@
 # ◇ CUSTOS — deterministic integrity and repair supervisor
 
-Status: **discussion draft, no implementation yet**  
+Status: **observe-only foundation implemented** (ADR-0235); mutation classes,
+the full four-role ring, notices, live process sampling, diagnostic export, and
+launchd installation remain open.  
 Date: 2026-11-26  
 Repository: `/Users/apple/orca/workspaces/VerlinPark/m3-round`  
-Branch: `Verlintas/m3-round`  
-Latest commit at write time: `2a9c0c9` (`Record runtime hardening smoke evidence`)
+Branch: `Verlintas/m3-round`
 
 > **Round 1 owner direction (2026-11-26):** Custos may have a GUI, but the
 > user must have **no operational authority** in it. The GUI is a sealed,
@@ -824,33 +825,60 @@ Remaining:
 - Whether calibration p50/p95 appears in the forensic bundle as aggregates.
 - Whether the menu-bar diamond shows a `CONTAINED` count.
 
-## 18. Round 6 direction: accepted calibration and ASCII visual language
+## 18. Round 6 direction: accepted calibration and wordmark art
 
 The owner accepted the capacity model, the 5-run learning window, the
 vault/app-bundle self-heal baseline, and inbox delivery for idle-agent notices.
 The quarantine display and menu-bar diamond status item are also accepted.
 
-The main window now treats **fixed-width pure-ASCII art** as a first-class
-layer, but the identity is split cleanly:
+**Custos is a normal GUI window.** Only the `Custos` wordmark is ASCII/character
+art; everything else is ordinary SwiftUI:
 
-- the **large diamond** lives in the center of the window; it is the only
-  diamond;
-- the **`Custos` wordmark** stands alone, with no small diamond before it;
-- character animation at 8–12 fps, a static frame that is still readable, and
-  no essential information that exists only in the art.
+- the **large diamond** is a drawn SwiftUI shape at the center of the window,
+  not an ASCII diagram;
+- the **`Custos` wordmark** is the only monospaced character-art element, with
+  no small diamond before it;
+- integrity dimensions, counts, ring state, and the bounded log use normal
+  labels/indicators, not box drawing or ASCII bars;
+- the window has no operational controls.
 
-`docs/CUSTOS_GUI_ASCII.md` holds the window-layout studies. It still uses
-box-drawing characters for concept and will be normalized to pure ASCII before
-implementation. `docs/CUSTOS_WORDMARK_ASCII.md` holds the accepted four-row
+`docs/CUSTOS_GUI_ASCII.md` is **discarded exploration** and must not be
+implemented. `docs/CUSTOS_WORDMARK_ASCII.md` holds the accepted four-row
 wordmark and its animation:
 
 - boot: an 8-frame print-head reveal, not a single flash;
 - idle: completely static letters with a ±8% glow breath; no line, no cursor,
   no character movement;
 - `CRITICAL`: a 7-frame multi-row jitter (~580 ms at 12 fps), at most two
-  cycles, with no scanline;
+  cycle, with no scanline;
 - `QUARANTINED` / `SIGNAL LOST`: static, no glow.
 
-The selection is a design choice, not a runtime policy; the wordmark will be
-implemented as a monospaced text layer with a static fallback, not as an image
-asset.
+The wordmark is implemented as a monospaced text layer with a static fallback,
+not as an image asset. The rest of the window is normal SwiftUI.
+
+## 19. Implementation status: observe-only slice
+
+ADR-0235 adds `crates/vp-custos` with `custosd` and `custos`:
+
+- pinned draft charter/hash and a closed v0 action catalog;
+- capacity normalization and a pure process-pressure score with learning mode;
+- role heartbeat files and quorum helper;
+- read-only SQLite probes (no `Store::open`, no schema migration);
+- 0600 Unix socket: `status`, `health`, `charter`, `ping`;
+- separate `custos/custos.discovery.json` (0600), not the daemon token;
+- no mutation method, token, TCP listener, agent tool, or provider key.
+
+Tests for the first slice: 26 unit + 2 integration + 1 module-governance;
+full Rust workspace 4,731 passed / 0 failed / 6 ignored; full Swift suite 672
+passed / 0 failed. The SwiftUI window is a normal GUI with the `Custos`
+wordmark as the only ASCII art: graphical diamond, seven dimension rows,
+counts, ring line, and a read-only menu-bar item that only opens/closes the
+window.
+
+Still open before mutation authority:
+
+- install/verify the four-role launchd ring (core/warden/anchor/sentinel);
+- add peer-uid/token checks and the signed vault/self-heal path;
+- add live process sampling, one-way notices, and diagnostic export;
+- validate thresholds against shadow-mode evidence;
+- implement L2/L3/L4 action execution and audit chain.

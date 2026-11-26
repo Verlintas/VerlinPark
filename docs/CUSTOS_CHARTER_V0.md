@@ -643,16 +643,16 @@ A sealed instrument, not a dashboard. It is an **independent window owned by
 the VerlinPark app** (like the Settings window), not a separate `.app` and not
 a panel embedded in the main Stage:
 
-- obsidian black background, thin ice lines, one large ASCII diamond at the
-  center of the window; it is the only diamond in the main surface;
-- the `Custos` wordmark stands alone, with no small diamond before it;
+- obsidian black background, thin ice lines, one large **graphical** diamond
+  (SwiftUI shape) at the center of the window; it is the only diamond in the
+  main surface;
+- the `Custos` wordmark is the **only** ASCII/character art, standing alone with
+  no small diamond before it;
 - `SEALED GUARDIAN` in mono uppercase below or above the wordmark;
 - one state word: `HEALTHY / WATCH / DEGRADED / CRITICAL / QUARANTINED`;
-- 5–7 integrity rings or bars: RUNTIME, DATA, LEASES, QUEUES, WORKTREES,
-  BACKUP, SIGNAL;
+- 5–7 integrity dimensions as normal labels/indicators: RUNTIME, DATA, LEASES,
+  QUEUES, WORKTREES, BACKUP, SIGNAL;
 - one deterministic sentence of state;
-- a fixed-width pure-ASCII art layer (monospaced, state-colored, no unique
-  information that is not also in text);
 - a bounded log of the last 8–12 actions: time, category, target label, result;
 - `PROTECTION ACTIVE`, `CONTAINED {n}`, `LAST ACTION ...`;
 - a small diamond menu-bar status item that mirrors state and opens/closes the
@@ -675,11 +675,13 @@ a panel embedded in the main Stage:
 - distinct from VerlinPark pages: no sidebar, cards, tabs, rounded panels, or
   glass dashboard;
 - mono type, wide tracking, 1px rules, restrained glow/pulse;
-- pure-ASCII art is a first-class layer: fixed-width, monospaced, no
+- the `Custos` wordmark is the only ASCII art: fixed-width, monospaced, no
   proportional fallback, no ligatures, no essential information only in art;
+- the central diamond, dimensions, counts, and log are normal SwiftUI
+  graphics/text, not ASCII layout;
 - character animation runs at 8–12 fps; the wordmark boot reveal is 8 frames,
   the idle is glow-only, and the critical jitter is 7 frames (~580ms at 12 fps,
-  max two cycles); no flashing above 3 Hz and no scanline;
+  one cycle); no flashing above 3 Hz and no scanline;
 - the wordmark uses an 8-frame print-head reveal, then static letters with a
   soft glow breath; `CRITICAL` adds the multi-frame jitter;
 - state colors: ice (healthy), amber (watch/degraded), red (critical),
