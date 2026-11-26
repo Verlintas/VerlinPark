@@ -44,6 +44,7 @@ pub struct ServerConfig {
     pub socket_path: PathBuf,
     pub role: CustosRole,
     pub observe_only: bool,
+    pub auto_repair: bool,
 }
 
 impl ServerConfig {
@@ -54,11 +55,17 @@ impl ServerConfig {
             socket_path,
             role,
             observe_only,
+            auto_repair: false,
         }
     }
 
     pub fn with_socket(mut self, socket_path: PathBuf) -> Self {
         self.socket_path = socket_path;
+        self
+    }
+
+    pub fn with_auto_repair(mut self, auto_repair: bool) -> Self {
+        self.auto_repair = auto_repair;
         self
     }
 }
@@ -68,6 +75,7 @@ struct AppState {
     data_dir: PathBuf,
     role: CustosRole,
     observe_only: bool,
+    auto_repair: bool,
     started_at: Instant,
     started_at_rfc: String,
     pid: u32,
@@ -104,6 +112,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         data_dir: config.data_dir.clone(),
         role: config.role,
         observe_only: config.observe_only,
+        auto_repair: config.auto_repair,
         started_at: Instant::now(),
         started_at_rfc: started_at_rfc.clone(),
         pid: std::process::id(),
@@ -185,7 +194,37 @@ pub async fn run(config: ServerConfig) -> Result<()> {
                             "files_missing": report.files.iter().filter(|file| file.target_state == "missing").count(),
                         }),
                     );
-                    last_vault_state = state;
+                    if heartbeat_state.auto_repair
+                        && state == "drift"
+                        && report.signature != "invalid"
+                        && report
+                            .files
+                            .iter()
+                            .all(|file| file.kind != "binary" || file.target_state == "ok")
+                    {
+                        let repaired =
+                            vault::repair(&heartbeat_state.data_dir, paths, &paths.binary, true);
+                        let after = repaired
+                            .as_ref()
+                            .map(|value| vault_state_str(value.state))
+                            .unwrap_or("failed");
+                        let _ = audit::append(
+                            &heartbeat_state.data_dir,
+                            "vault.repair",
+                            serde_json::json!({
+                                "before": state,
+                                "after": after,
+                                "binary_skipped": true,
+                            }),
+                        );
+                        if let Ok(value) = repaired {
+                            last_vault_state = vault_state_str(value.state).to_string();
+                        } else {
+                            last_vault_state = state;
+                        }
+                    } else {
+                        last_vault_state = state;
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_secs(2)).await;

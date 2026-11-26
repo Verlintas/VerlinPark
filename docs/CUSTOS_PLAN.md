@@ -4,10 +4,11 @@ Status: **observe-only foundation implemented** (ADR-0235): read-only server,
 four-role launchd installer/heartbeats/watchdog, local standard/forensic
 diagnostics, and a normal SwiftUI window with only the wordmark as ASCII art.
 The ring has not been installed/verified on a real machine; release
-signing/automatic self-heal and L2–L4 mutation classes remain open. Process
-sampling is read-only shadow evidence and never signals; sealed one-way notices
-are delivered to the session Leader at turn boundaries; the hash vault supports
-optional local Ed25519 signing but remains explicit-repair only.
+signing/automatic binary self-heal and L2–L4 mutation classes remain open.
+Process sampling is read-only shadow evidence and never signals; sealed one-way
+notices are delivered to the session Leader at turn boundaries; the hash vault
+supports optional local Ed25519 and opt-in plist auto-repair, but binary repair
+remains explicit/restart-bound.
 Date: 2026-11-26  
 Repository: `/Users/apple/orca/workspaces/VerlinPark/m3-round`  
 Branch: `Verlintas/m3-round`
@@ -876,7 +877,8 @@ ADR-0235 adds `crates/vp-custos` with `custosd` and `custos`:
   `diagnostics.generate`;
 - content-addressed vault: `--vault-init`, `--vault-verify`,
   `--vault-repair --yes`, optional local Ed25519 (`--vault-keygen`,
-  `--vault-init --signing-key`), with quarantine before restore;
+  `--vault-init --signing-key`), opt-in `--vault-auto-repair` for plists, with
+  quarantine before restore;
 - hash-chained JSONL audit (`--audit-verify`) for start/stop and automatic 30s
   vault-state changes; metadata only;
 - sealed one-way notice outbox and turn-boundary agent delivery, with
@@ -898,7 +900,7 @@ Still open before mutation authority:
 - install/verify the four-role launchd ring on a real machine;
 - add peer-uid/token checks and the signed/automatic self-heal path;
 - extend notice ownership beyond the session Leader once process ownership is persisted;
-- implement release signing and automatic self-heal (the current vault supports
-  optional local Ed25519 and explicit repair only);
+- implement release signing and automatic binary self-heal (the current vault
+  supports optional local Ed25519 and opt-in plist repair only);
 - validate thresholds against shadow-mode evidence;
 - implement L2/L3/L4 action execution and audit chain.

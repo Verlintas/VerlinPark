@@ -54,6 +54,9 @@ struct Args {
     /// Verify the Custos audit hash chain.
     #[arg(long)]
     audit_verify: bool,
+    /// Opt in to automatic repair of drifted plists from a valid vault.
+    #[arg(long)]
+    vault_auto_repair: bool,
     /// Explicitly repair drifted/missing Custos-owned targets from the vault.
     #[arg(long)]
     vault_repair: bool,
@@ -177,6 +180,9 @@ async fn main() -> Result<()> {
     let mut config = ServerConfig::new(data_dir, role, true);
     if let Some(socket) = args.socket {
         config = config.with_socket(socket);
+    }
+    if args.vault_auto_repair {
+        config = config.with_auto_repair(true);
     }
     run(config).await
 }
