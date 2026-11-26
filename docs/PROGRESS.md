@@ -36,6 +36,10 @@ in-daemon module.
   before explicit restore, no VerlinPark source/policy/worktree/database writes.
   The manifest is surfaced as a `vault` status dimension; automatic repair and
   release signing remain open.
+- Hash-chained `custos/audit/events.jsonl` (0600) with `--audit-verify`, core
+  start/stop entries, and an automatic 30s vault-state audit when the state
+  changes. Audit payloads are metadata only; no prompts, messages, tool output,
+  file contents, screen data, or secrets.
 - 0600 Unix socket and separate `custos/discovery.json`; methods are `status`,
   `health`, `charter`, `ping`, and the explicitly consented
   `diagnostics.generate`. No TCP, token, provider key, agent tool, or state
@@ -47,8 +51,8 @@ in-daemon module.
   DMG `bin/` staging; the SwiftUI window is a normal GUI with the accepted
   `Custos` wordmark as the only ASCII art and a local diagnostics sheet.
 
-Verification: `cargo test -p vp-custos` 59 unit + 4 integration + 1 module
-governance; full workspace **4,766 Rust passed / 0 failed / 6 ignored**;
+Verification: `cargo test -p vp-custos` 62 unit + 4 integration + 1 module
+governance; full workspace **4,769 Rust passed / 0 failed / 6 ignored**;
 `cargo clippy --workspace --all-targets -- -D warnings` passes; Swift
 `xcodebuild test` **673 passed / 0 failed** with English test language; the
 Custos window is a normal SwiftUI GUI with only the wordmark as ASCII art.

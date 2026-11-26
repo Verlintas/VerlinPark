@@ -876,13 +876,15 @@ ADR-0235 adds `crates/vp-custos` with `custosd` and `custos`:
 - content-addressed vault: `--vault-init`, `--vault-verify`,
   `--vault-repair --yes`, optional local Ed25519 (`--vault-keygen`,
   `--vault-init --signing-key`), with quarantine before restore;
+- hash-chained JSONL audit (`--audit-verify`) for start/stop and automatic 30s
+  vault-state changes; metadata only;
 - local standard + forensic ZIP bundles with a SHA-256 manifest, no upload, and
   no caller-supplied path;
 - separate `custos/custos.discovery.json` (0600), not the daemon token;
 - no mutation method, token, TCP listener, agent tool, or provider key.
 
-Tests: 59 unit + 4 integration + 1 module-governance; full Rust workspace
-4,766 passed / 0 failed / 6 ignored; full Swift suite 673 passed / 0 failed.
+Tests: 62 unit + 4 integration + 1 module-governance; full Rust workspace
+4,769 passed / 0 failed / 6 ignored; full Swift suite 673 passed / 0 failed.
 The SwiftUI window is a normal GUI with the `Custos` wordmark as the only ASCII
 art: graphical diamond, nine dimension rows (including vault/process shadows), counts, ring line, local
 diagnostics sheet, and a read-only menu-bar item that only opens/closes the

@@ -115,6 +115,10 @@ async fn observe_only_status_health_charter_and_ping() {
     assert_eq!(ping["role"], "core");
     assert_eq!(ping["protocol"], 1);
 
+    let audit = vp_custos::audit::verify(dir.path()).unwrap();
+    assert_eq!(audit.state, "ok");
+    assert!(audit.entries >= 1);
+
     let error = vp_custos::client::call(&socket, "act", json!({}))
         .await
         .unwrap_err()

@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod audit;
 pub mod capacity;
 pub mod charter;
 pub mod client;

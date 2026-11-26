@@ -43,6 +43,8 @@ The first slice implements:
 - a content-addressed hash vault for Custos-owned binary/plist baselines, with
   optional local Ed25519 signing, explicit init/verify/repair, and quarantine
   before restore;
+- an append-only hash-chained JSONL audit for start/stop and automatic 30s
+  vault-state changes, with `--audit-verify`;
 - a 0600 Unix-domain socket with `status`, `health`, `charter`, `ping`, and the
   explicitly consented `diagnostics.generate`;
 - local standard + forensic ZIP bundles (0700 directory, 0600 files, SHA-256
@@ -81,8 +83,8 @@ controls.
   verify `status`, `health`, `charter`, `ping`, `METHOD_NOT_FOUND` for `act`,
   and that a missing database is not created.
 - `cargo clippy --workspace --all-targets -- -D warnings` passes.
-- `cargo test -p vp-custos`: 59 unit + 4 integration + 1 module-governance.
-- Full Rust workspace: 4,766 passed / 0 failed / 6 ignored.
+- `cargo test -p vp-custos`: 62 unit + 4 integration + 1 module-governance.
+- Full Rust workspace: 4,769 passed / 0 failed / 6 ignored.
 - Swift `xcodebuild test`: 673 passed / 0 failed, including Custos wordmark,
   protocol decoding, diagnostics-result decoding, and unavailable-socket model
   tests.

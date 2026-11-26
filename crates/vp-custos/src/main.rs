@@ -4,6 +4,7 @@ use anyhow::{Result, bail};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+use vp_custos::audit;
 use vp_custos::client::default_data_dir;
 use vp_custos::launchd::{self, LaunchdPaths, SystemLaunchctl};
 use vp_custos::protocol::CustosRole;
@@ -50,6 +51,9 @@ struct Args {
     /// Verify the Custos-owned hash vault against the current installation.
     #[arg(long)]
     vault_verify: bool,
+    /// Verify the Custos audit hash chain.
+    #[arg(long)]
+    audit_verify: bool,
     /// Explicitly repair drifted/missing Custos-owned targets from the vault.
     #[arg(long)]
     vault_repair: bool,
@@ -76,12 +80,20 @@ async fn main() -> Result<()> {
         args.vault_verify,
         args.vault_repair,
         args.vault_keygen.is_some(),
+        args.audit_verify,
     ]
     .into_iter()
     .filter(|value| *value)
     .count();
     if actions > 1 {
         bail!("choose only one lifecycle or vault action");
+    }
+    if args.audit_verify {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&audit::verify(&data_dir)?)?
+        );
+        return Ok(());
     }
     if let Some(path) = args.vault_keygen.as_deref() {
         if !args.yes {

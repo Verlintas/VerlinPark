@@ -215,6 +215,11 @@ pub async fn run_support_role(data_dir: PathBuf, role: CustosRole) -> Result<()>
         );
         write_heartbeat(&data_dir, &heartbeat)
     };
+    let _ = crate::audit::append(
+        &data_dir,
+        "custos.start",
+        serde_json::json!({"role": role.as_str(), "observe_only": true}),
+    );
     write()?;
     let mut last_attempt = std::collections::HashMap::new();
     let paths = launchd_paths(&data_dir);
@@ -242,6 +247,11 @@ pub async fn run_support_role(data_dir: PathBuf, role: CustosRole) -> Result<()>
             }
         }
     }
+    let _ = crate::audit::append(
+        &data_dir,
+        "custos.stop",
+        serde_json::json!({"role": role.as_str()}),
+    );
     let _ = fs::remove_file(heartbeat_path(&data_dir, role));
     Ok(())
 }

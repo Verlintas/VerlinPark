@@ -17,6 +17,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use crate::audit;
 use crate::capacity::MachineCapacity;
 use crate::charter;
 use crate::diagnostics::{self, BundleMode};
@@ -110,6 +111,18 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         process_cache: ProcessCache::new(),
         vault_cache: Arc::new(Mutex::new(None)),
     };
+    if let Err(error) = audit::append(
+        &config.data_dir,
+        "custos.start",
+        serde_json::json!({
+            "role": config.role.as_str(),
+            "observe_only": config.observe_only,
+            "build_hash": discovery::build_hash(),
+            "charter_hash": charter::hash(),
+        }),
+    ) {
+        warn!(%error, "could not append custos.start audit");
+    }
     write_core_heartbeat(&state)
         .await
         .context("writing initial custos heartbeat")?;
@@ -130,6 +143,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
     let heartbeat_task = tokio::spawn(async move {
         let mut ticks = 0u64;
         let mut last_attempt = std::collections::HashMap::new();
+        let mut last_vault_state = String::new();
         let paths = ring::launchd_paths(&heartbeat_state.data_dir);
         let runner = crate::launchd::SystemLaunchctl;
         loop {
@@ -154,12 +168,36 @@ pub async fn run(config: ServerConfig) -> Result<()> {
                     }
                 }
             }
+            if ticks.is_multiple_of(15)
+                && let Some(paths) = paths.as_ref()
+                && let Ok(report) = vault::verify(&heartbeat_state.data_dir, paths, &paths.binary)
+            {
+                let state = vault_state_str(report.state).to_string();
+                if state != last_vault_state {
+                    let _ = audit::append(
+                        &heartbeat_state.data_dir,
+                        "vault.state",
+                        serde_json::json!({
+                            "state": state,
+                            "files_ok": report.files.iter().filter(|file| file.target_state == "ok").count(),
+                            "files_drift": report.files.iter().filter(|file| file.target_state == "drift").count(),
+                            "files_missing": report.files.iter().filter(|file| file.target_state == "missing").count(),
+                        }),
+                    );
+                    last_vault_state = state;
+                }
+            }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     });
 
     let result = accept_loop(listener, state).await;
     heartbeat_task.abort();
+    let _ = audit::append(
+        &config.data_dir,
+        "custos.stop",
+        serde_json::json!({"role": config.role.as_str()}),
+    );
     let _ = fs::remove_file(&config.socket_path);
     let _ = fs::remove_file(ring::heartbeat_path(&config.data_dir, CustosRole::Core));
     discovery::remove_discovery(&config.data_dir);
