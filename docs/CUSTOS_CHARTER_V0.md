@@ -1018,9 +1018,10 @@ Answered in this round: capacity formulas and 5-run learning mode (yes), vault
 UX (project/task label, category, consequence, diagnostics entry), menu-bar
 diamond status item (yes), no stack samples/full paths. Remaining:
 
-1. Which pure-ASCII wordmark to use; see
-   `docs/CUSTOS_WORDMARK_ASCII.md` for the five lockups and animation frames.
-   Window-layout concepts remain in `docs/CUSTOS_GUI_ASCII.md`.
+1. Which diamond mark to use with the accepted `Custos` wordmark; see
+   `docs/CUSTOS_WORDMARK_ASCII.md` for WIDE HASH / WIDE PLUS / WIDE DOUBLE and
+   the rejected narrow-slash reference. Window-layout concepts remain in
+   `docs/CUSTOS_GUI_ASCII.md`.
 2. Should audit-chain tamper restore the head from anchor memory and mark a
    gap, or only flag the gap without writing a new head? Proposed: preserve
    the tampered file, write a `tamper_detected` gap marker, never fabricate

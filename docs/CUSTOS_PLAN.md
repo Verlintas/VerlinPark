@@ -840,12 +840,13 @@ There are two separate design sets:
 - `docs/CUSTOS_GUI_ASCII.md` — **window layout** studies: MONOLITH / VIGIL /
   REACTOR / RELIC / CATHEDRAL. These still use box-drawing characters for
   concept; they will be normalized to pure ASCII before implementation.
-- `docs/CUSTOS_WORDMARK_ASCII.md` — **the CUSTOS name itself**: DIAMOND / PIXEL,
-  DIAMOND / SLAB, DIAMOND / WIRE, DIAMOND / TERMINAL, DIAMOND / CUSTOS. The
-  diamond is drawn with `/` and `\` and placed **before** the word, not above
-  it.
+- `docs/CUSTOS_WORDMARK_ASCII.md` — the accepted four-row `Custos` wordmark plus
+  drawn diamond marks: WIDE HASH, WIDE PLUS, WIDE DOUBLE, and the rejected
+  narrow slash for comparison. The diamond uses explicit `#`/`+` points and a
+  two-column horizontal step per row so it reads as a roughly 90-degree
+  rhombus instead of a steep `/\` spike.
 
-Recommended lockup: DIAMOND / PIXEL as the primary identity, DIAMOND / SLAB for
-boot, DIAMOND / TERMINAL for the menu-bar popover. The selection is a design
+Recommended lockup: the accepted `Custos` wordmark + WIDE HASH. WIDE PLUS is the
+quiet variant; WIDE DOUBLE is for boot/large title. The selection is a design
 choice, not a runtime policy; the chosen variant will be implemented as a
 monospaced text layer with a static fallback, not as an image asset.
