@@ -30,6 +30,11 @@ in-daemon module.
 - Read-only process sampling for `supervised_processes` using `sysinfo`; the
   deterministic score is exposed as shadow pressure/stop recommendations in
   status/health, with no signal, notice, or mutation.
+- Custos-owned hash vault (`--vault-init`, `--vault-verify`,
+  `--vault-repair --yes`): content-addressed binary/plist baseline, quarantine
+  before explicit restore, no VerlinPark source/policy/worktree/database writes.
+  The vault manifest is explicitly unsigned/draft; automatic repair and signed
+  releases remain open.
 - 0600 Unix socket and separate `custos/discovery.json`; methods are `status`,
   `health`, `charter`, `ping`, and the explicitly consented
   `diagnostics.generate`. No TCP, token, provider key, agent tool, or state
@@ -41,14 +46,14 @@ in-daemon module.
   DMG `bin/` staging; the SwiftUI window is a normal GUI with the accepted
   `Custos` wordmark as the only ASCII art and a local diagnostics sheet.
 
-Verification: `cargo test -p vp-custos` 55 unit + 4 integration + 1 module
-governance; full workspace **4,762 Rust passed / 0 failed / 6 ignored**;
+Verification: `cargo test -p vp-custos` 58 unit + 4 integration + 1 module
+governance; full workspace **4,765 Rust passed / 0 failed / 6 ignored**;
 `cargo clippy --workspace --all-targets -- -D warnings` passes; Swift
 `xcodebuild test` **673 passed / 0 failed** with English test language; the
 Custos window is a normal SwiftUI GUI with only the wordmark as ASCII art.
 The four-role launchd ring is implemented but not yet installed/verified on a
-real machine; signed vault/self-heal, one-way notices, and L2–L4 mutation
-classes remain open and are not claimed.
+real machine; signed vault/automatic self-heal, one-way notices, and L2–L4
+mutation classes remain open and are not claimed.
 
 ## 2026-11-26 V1 Phase 1 closure batch
 

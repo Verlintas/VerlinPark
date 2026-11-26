@@ -26,6 +26,7 @@ pub mod protocol;
 pub mod ring;
 pub mod score;
 pub mod server;
+pub mod vault;
 
 pub use capacity::{EffectiveCaps, MachineCapacity};
 pub use charter::{ActionClass, ActionSpec, CharterView};

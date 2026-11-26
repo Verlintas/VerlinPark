@@ -8,6 +8,7 @@ use vp_custos::client::default_data_dir;
 use vp_custos::launchd::{self, LaunchdPaths, SystemLaunchctl};
 use vp_custos::protocol::CustosRole;
 use vp_custos::server::{ServerConfig, run};
+use vp_custos::vault;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -37,7 +38,16 @@ struct Args {
     /// Apply install/uninstall/status to all four roles.
     #[arg(long)]
     all: bool,
-    /// Required confirmation for install/uninstall.
+    /// Explicitly initialize the Custos-owned hash vault.
+    #[arg(long)]
+    vault_init: bool,
+    /// Verify the Custos-owned hash vault against the current installation.
+    #[arg(long)]
+    vault_verify: bool,
+    /// Explicitly repair drifted/missing Custos-owned targets from the vault.
+    #[arg(long)]
+    vault_repair: bool,
+    /// Required confirmation for mutating commands.
     #[arg(long)]
     yes: bool,
 }
@@ -52,12 +62,39 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
     let data_dir = args.data_dir.clone().unwrap_or_else(default_data_dir);
-    let actions = [args.install, args.uninstall, args.agent_status]
-        .into_iter()
-        .filter(|value| *value)
-        .count();
+    let actions = [
+        args.install,
+        args.uninstall,
+        args.agent_status,
+        args.vault_init,
+        args.vault_verify,
+        args.vault_repair,
+    ]
+    .into_iter()
+    .filter(|value| *value)
+    .count();
     if actions > 1 {
-        bail!("choose only one of --install, --uninstall, or --agent-status");
+        bail!("choose only one lifecycle or vault action");
+    }
+    if args.vault_init || args.vault_verify || args.vault_repair {
+        let binary = std::env::current_exe()?;
+        let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("home directory unavailable"))?;
+        let paths = LaunchdPaths::new(home, &data_dir, &binary);
+        let report = if args.vault_init {
+            if !args.yes {
+                bail!("--vault-init requires --yes");
+            }
+            vault::init(&data_dir, &paths, &binary)?
+        } else if args.vault_repair {
+            if !args.yes {
+                bail!("--vault-repair requires --yes");
+            }
+            vault::repair(&data_dir, &paths, &binary, true)?
+        } else {
+            vault::verify(&data_dir, &paths, &binary)?
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
     }
     if args.install || args.uninstall || args.agent_status {
         let roles = if args.all {

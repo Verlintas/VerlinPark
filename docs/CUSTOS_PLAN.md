@@ -4,8 +4,9 @@ Status: **observe-only foundation implemented** (ADR-0235): read-only server,
 four-role launchd installer/heartbeats/watchdog, local standard/forensic
 diagnostics, and a normal SwiftUI window with only the wordmark as ASCII art.
 The ring has not been installed/verified on a real machine; one-way notices,
-signed vault/self-heal, and L2–L4 mutation classes remain open. Process
-sampling is read-only shadow evidence and never signals.
+signed/automatic self-heal, and L2–L4 mutation classes remain open. Process
+sampling is read-only shadow evidence and never signals; the hash vault is
+unsigned and explicit-repair only.
 Date: 2026-11-26  
 Repository: `/Users/apple/orca/workspaces/VerlinPark/m3-round`  
 Branch: `Verlintas/m3-round`
@@ -872,13 +873,15 @@ ADR-0235 adds `crates/vp-custos` with `custosd` and `custos`:
 - read-only SQLite probes (no `Store::open`, no schema migration);
 - 0600 Unix socket: `status`, `health`, `charter`, `ping`,
   `diagnostics.generate`;
+- unsigned content-addressed vault: `--vault-init`, `--vault-verify`,
+  `--vault-repair --yes`, with quarantine before restore;
 - local standard + forensic ZIP bundles with a SHA-256 manifest, no upload, and
   no caller-supplied path;
 - separate `custos/custos.discovery.json` (0600), not the daemon token;
 - no mutation method, token, TCP listener, agent tool, or provider key.
 
-Tests: 55 unit + 4 integration + 1 module-governance; full Rust workspace
-4,762 passed / 0 failed / 6 ignored; full Swift suite 673 passed / 0 failed.
+Tests: 58 unit + 4 integration + 1 module-governance; full Rust workspace
+4,765 passed / 0 failed / 6 ignored; full Swift suite 673 passed / 0 failed.
 The SwiftUI window is a normal GUI with the `Custos` wordmark as the only ASCII
 art: graphical diamond, eight dimension rows, counts, ring line, local
 diagnostics sheet, and a read-only menu-bar item that only opens/closes the
@@ -887,7 +890,9 @@ window.
 Still open before mutation authority:
 
 - install/verify the four-role launchd ring on a real machine;
-- add peer-uid/token checks and the signed vault/self-heal path;
+- add peer-uid/token checks and the signed/automatic self-heal path;
 - add one-way notices; read-only process sampling already exists;
+- implement signed vault verification and automatic self-heal (the current
+  hash vault is unsigned and explicit-repair only);
 - validate thresholds against shadow-mode evidence;
 - implement L2/L3/L4 action execution and audit chain.
