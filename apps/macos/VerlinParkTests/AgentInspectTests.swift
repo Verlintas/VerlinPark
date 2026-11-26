@@ -314,7 +314,7 @@ final class AgentInspectTests: XCTestCase {
 
         await model.loadCollabAgentInspect(agentID: "agent-1")
         XCTAssertNil(model.collabAgentInspect)
-        XCTAssertEqual(model.collabAgentInspectError, "Select a session first.")
+        XCTAssertEqual(model.collabAgentInspectError, L10n.t("Select a session first."))
         let noSessionCalls = await rpc.inspectCallCount
         XCTAssertEqual(noSessionCalls, 0)
 

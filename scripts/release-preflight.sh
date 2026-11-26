@@ -63,7 +63,8 @@ if [[ "$MODE" == "full" ]]; then
     xcodegen generate
     xcodebuild -project VerlinPark.xcodeproj -scheme VerlinPark \
       -configuration Debug -destination 'platform=macOS' \
-      -derivedDataPath build CODE_SIGNING_ALLOWED=NO test
+      -derivedDataPath build CODE_SIGNING_ALLOWED=NO \
+      -testLanguage en -testRegion US test
   )
   echo "==> backup/restore drill"
   cargo build --locked -p vp-cli -p vp-daemon

@@ -608,7 +608,7 @@ final class ResourceGovernorTests: XCTestCase {
         XCTAssertEqual(batch.items[0].reasonLabel, "host change")
         XCTAssertEqual(batch.remainingCount, 2)
         XCTAssertTrue(batch.truncated)
-        XCTAssertEqual(batch.summaryLabel, "3 pending · 7/20 interrupts")
+        XCTAssertEqual(batch.summaryLabel, L10n.format("%lld pending · %lld/%lld interrupts", 3, 7, 20))
         XCTAssertEqual(batch.riskSummary, "host_state 2")
 
         let wrongSchema = try XCTUnwrap(

@@ -14,7 +14,7 @@ final class ProviderProbeTests: XCTestCase {
           "output_tokens": 7,
           "tool_calling": true,
           "tool_name": "probe_echo",
-          "arguments_preview": "{\"value\":\"ok\"}",
+          "arguments_preview": "ok",
           "text": "",
           "note": "provider emitted the expected tool call"
         }
@@ -25,7 +25,7 @@ final class ProviderProbeTests: XCTestCase {
         )
         XCTAssertTrue(result.toolCalling)
         XCTAssertEqual(result.toolName, "probe_echo")
-        XCTAssertEqual(result.argumentsPreview, "{\"value\":\"ok\"}")
+        XCTAssertEqual(result.argumentsPreview, "ok")
         XCTAssertEqual(result.inputTokens, 42)
         XCTAssertEqual(result.outputTokens, 7)
     }
