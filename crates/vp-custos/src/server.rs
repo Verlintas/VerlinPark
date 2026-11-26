@@ -17,10 +17,12 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use crate::capacity::MachineCapacity;
 use crate::charter;
 use crate::diagnostics::{self, BundleMode};
 use crate::discovery;
 use crate::probe::{self, ProbeReport};
+use crate::process_probe::{ProcessCache, ProcessReport};
 use crate::protocol::{
     CUSTOS_PROTOCOL_VERSION, CUSTOS_VERSION, CustosRole, CustosState, Dimension, DimensionState,
     Health, PingResult, RpcRequest, RpcResponse, Status,
@@ -66,6 +68,7 @@ struct AppState {
     pid: u32,
     seq: Arc<AtomicU64>,
     cache: Arc<Mutex<Option<(Instant, ProbeReport)>>>,
+    process_cache: ProcessCache,
 }
 
 pub async fn run(config: ServerConfig) -> Result<()> {
@@ -100,6 +103,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         pid: std::process::id(),
         seq: Arc::new(AtomicU64::new(1)),
         cache: Arc::new(Mutex::new(None)),
+        process_cache: ProcessCache::new(),
     };
     write_core_heartbeat(&state)
         .await
@@ -238,17 +242,21 @@ async fn dispatch(state: &AppState, request: RpcRequest) -> RpcResponse {
         ),
         "status" => {
             let report = probe_cached(state).await;
+            let processes = process_report(state);
             RpcResponse::ok(
                 request.id,
-                serde_json::to_value(build_status(state, &report)).unwrap_or(Value::Null),
+                serde_json::to_value(build_status(state, &report, &processes))
+                    .unwrap_or(Value::Null),
             )
         }
         "health" => {
             let report = probe_cached(state).await;
+            let processes = process_report(state);
             let health = Health {
                 schema: crate::protocol::HEALTH_SCHEMA.to_string(),
-                status: build_status(state, &report),
+                status: build_status(state, &report, &processes),
                 probe: report.info.clone(),
+                processes: processes.samples.clone(),
             };
             RpcResponse::ok(
                 request.id,
@@ -348,10 +356,14 @@ async fn probe_cached(state: &AppState) -> ProbeReport {
     report
 }
 
-fn build_status(state: &AppState, report: &ProbeReport) -> Status {
+fn build_status(state: &AppState, report: &ProbeReport, processes: &ProcessReport) -> Status {
     let ring = ring::snapshot(&state.data_dir);
-    let dimensions = dimensions(state, report, &ring);
+    let dimensions = dimensions(state, report, &ring, processes);
     let overall = overall_state(&dimensions);
+    let mut counts = report.counts.clone();
+    counts.processes_tracked = processes.tracked;
+    counts.processes_pressure = processes.pressure;
+    counts.processes_shadow_stop = processes.shadow_stop;
     Status {
         schema: crate::protocol::STATUS_SCHEMA.to_string(),
         generated_at: vp_protocol::now_rfc3339(),
@@ -363,16 +375,22 @@ fn build_status(state: &AppState, report: &ProbeReport) -> Status {
         charter_hash: charter::hash(),
         charter_status: charter::CHARTER_STATUS.to_string(),
         dimensions,
-        counts: report.counts.clone(),
+        counts,
         ring,
         last_action: None,
     }
+}
+
+fn process_report(state: &AppState) -> ProcessReport {
+    let capacity = MachineCapacity::detect(&state.data_dir);
+    state.process_cache.get(&state.data_dir, &capacity)
 }
 
 fn dimensions(
     state: &AppState,
     report: &ProbeReport,
     ring: &crate::protocol::RingView,
+    processes: &ProcessReport,
 ) -> Vec<Dimension> {
     let data_state = if !report.info.db_present {
         DimensionState::Watch
@@ -487,6 +505,18 @@ fn dimensions(
             detail: format!(
                 "{} fresh · {} stale · {} missing",
                 ring.fresh, ring.stale, ring.missing
+            ),
+        },
+        Dimension {
+            key: "processes".to_string(),
+            state: if processes.pressure > 0 {
+                DimensionState::Watch
+            } else {
+                DimensionState::Ok
+            },
+            detail: format!(
+                "{} tracked · {} pressure · {} shadow",
+                processes.tracked, processes.pressure, processes.shadow_stop
             ),
         },
     ]

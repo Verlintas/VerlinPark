@@ -30,14 +30,14 @@ final class CustosProtocolTests: XCTestCase {
         XCTAssertEqual(status.generatedAt, "2026-11-26T12:00:00Z")
     }
 
-    func testStatusPresentationKeepsSevenCanonicalDimensions() throws {
+    func testStatusPresentationKeepsEightCanonicalDimensions() throws {
         let status = try JSONDecoder().decode(CustosStatus.self, from: Data(Self.statusJSON.utf8))
         XCTAssertEqual(
             status.dimensionRows.map(\.key),
-            ["runtime", "data", "leases", "queues", "effects", "signal", "ring"]
+            ["runtime", "data", "leases", "queues", "effects", "signal", "ring", "processes"]
         )
         XCTAssertEqual(status.dimensionRows.map(\.label), [
-            "RUNTIME", "DATA", "LEASES", "QUEUES", "EFFECTS", "SIGNAL", "RING",
+            "RUNTIME", "DATA", "LEASES", "QUEUES", "EFFECTS", "SIGNAL", "RING", "PROCESSES",
         ])
         XCTAssertEqual(status.dimensionRows[2].state, .degraded)
         XCTAssertEqual(status.dimensionRows[3].state, .watch)

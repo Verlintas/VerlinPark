@@ -111,6 +111,9 @@ pub struct Counts {
     pub effects_unknown: u64,
     pub approvals_pending: u64,
     pub processes_live: u64,
+    pub processes_tracked: u64,
+    pub processes_pressure: u64,
+    pub processes_shadow_stop: u64,
     pub db_bytes: u64,
     pub wal_bytes: u64,
     pub disk_free_bytes: u64,
@@ -181,10 +184,26 @@ pub struct ProbeInfo {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProcessPressure {
+    pub pid: u32,
+    pub label: String,
+    pub state: String,
+    pub score: u8,
+    pub action: String,
+    pub reason: String,
+    pub rss_bytes: u64,
+    pub children: u32,
+    pub cpu_share: f64,
+    pub no_progress_secs: u64,
+    pub learning_mode: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Health {
     pub schema: String,
     pub status: Status,
     pub probe: ProbeInfo,
+    pub processes: Vec<ProcessPressure>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -27,6 +27,9 @@ in-daemon module.
 - Read-only SQLite probes: sessions, events, leases, runs, plan tasks, merge
   queue, effects, approvals, supervised processes; `SQLITE_OPEN_READ_ONLY` +
   `PRAGMA query_only`, never `Store::open()` and never a schema write.
+- Read-only process sampling for `supervised_processes` using `sysinfo`; the
+  deterministic score is exposed as shadow pressure/stop recommendations in
+  status/health, with no signal, notice, or mutation.
 - 0600 Unix socket and separate `custos/discovery.json`; methods are `status`,
   `health`, `charter`, `ping`, and the explicitly consented
   `diagnostics.generate`. No TCP, token, provider key, agent tool, or state
@@ -38,14 +41,14 @@ in-daemon module.
   DMG `bin/` staging; the SwiftUI window is a normal GUI with the accepted
   `Custos` wordmark as the only ASCII art and a local diagnostics sheet.
 
-Verification: `cargo test -p vp-custos` 53 unit + 4 integration + 1 module
-governance; full workspace **4,760 Rust passed / 0 failed / 6 ignored**;
+Verification: `cargo test -p vp-custos` 55 unit + 4 integration + 1 module
+governance; full workspace **4,762 Rust passed / 0 failed / 6 ignored**;
 `cargo clippy --workspace --all-targets -- -D warnings` passes; Swift
 `xcodebuild test` **673 passed / 0 failed** with English test language; the
 Custos window is a normal SwiftUI GUI with only the wordmark as ASCII art.
 The four-role launchd ring is implemented but not yet installed/verified on a
-real machine; signed vault/self-heal, live process sampling/notices, and
-L2–L4 mutation classes remain open and are not claimed.
+real machine; signed vault/self-heal, one-way notices, and L2–L4 mutation
+classes remain open and are not claimed.
 
 ## 2026-11-26 V1 Phase 1 closure batch
 

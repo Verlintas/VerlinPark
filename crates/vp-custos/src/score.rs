@@ -69,6 +69,21 @@ pub enum ProcessState {
     Exited,
 }
 
+impl ProcessState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Watch => "watch",
+            Self::Pressure => "pressure",
+            Self::SuspectedStall => "suspected_stall",
+            Self::Stalled => "stalled",
+            Self::Runaway => "runaway",
+            Self::HardCap => "hard_cap",
+            Self::Exited => "exited",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RecommendedAction {
@@ -77,6 +92,18 @@ pub enum RecommendedAction {
     Notice,
     FinalNotice,
     Stop,
+}
+
+impl RecommendedAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Log => "log",
+            Self::Notice => "notice",
+            Self::FinalNotice => "final_notice",
+            Self::Stop => "stop",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

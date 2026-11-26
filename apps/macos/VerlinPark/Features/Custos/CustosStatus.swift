@@ -137,6 +137,7 @@ struct CustosDimensionRow: Identifiable, Sendable, Equatable {
         "effects",
         "signal",
         "ring",
+        "processes",
     ]
 
     static func label(for key: String) -> String {
@@ -148,6 +149,7 @@ struct CustosDimensionRow: Identifiable, Sendable, Equatable {
         case "effects": "EFFECTS"
         case "signal": "SIGNAL"
         case "ring": "RING"
+        case "processes": "PROCESSES"
         default: key.uppercased()
         }
     }
@@ -221,7 +223,7 @@ extension CustosStatus {
 
         switch state {
         case .healthy:
-            return "All seven observations are within tolerance. Protection remains active."
+            return "All eight observations are within tolerance. Protection remains active."
         case .watch:
             return plural(
                 watchCount,

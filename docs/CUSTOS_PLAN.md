@@ -3,9 +3,9 @@
 Status: **observe-only foundation implemented** (ADR-0235): read-only server,
 four-role launchd installer/heartbeats/watchdog, local standard/forensic
 diagnostics, and a normal SwiftUI window with only the wordmark as ASCII art.
-The ring has not been installed/verified on a real machine; notices, live
-process sampling, signed vault/self-heal, and L2–L4 mutation classes remain
-open.
+The ring has not been installed/verified on a real machine; one-way notices,
+signed vault/self-heal, and L2–L4 mutation classes remain open. Process
+sampling is read-only shadow evidence and never signals.
 Date: 2026-11-26  
 Repository: `/Users/apple/orca/workspaces/VerlinPark/m3-round`  
 Branch: `Verlintas/m3-round`
@@ -865,6 +865,8 @@ ADR-0235 adds `crates/vp-custos` with `custosd` and `custos`:
 
 - pinned draft charter/hash and a closed v0 action catalog;
 - capacity normalization and a pure process-pressure score with learning mode;
+- read-only `sysinfo` sampling of `supervised_processes` with shadow
+  pressure/stop evidence; no signal or notice;
 - four-role heartbeat files, quorum helper, support loops, and a peer watchdog;
 - explicit user LaunchAgent install/status/uninstall without sudo;
 - read-only SQLite probes (no `Store::open`, no schema migration);
@@ -875,10 +877,10 @@ ADR-0235 adds `crates/vp-custos` with `custosd` and `custos`:
 - separate `custos/custos.discovery.json` (0600), not the daemon token;
 - no mutation method, token, TCP listener, agent tool, or provider key.
 
-Tests: 53 unit + 4 integration + 1 module-governance; full Rust workspace
-4,760 passed / 0 failed / 6 ignored; full Swift suite 673 passed / 0 failed.
+Tests: 55 unit + 4 integration + 1 module-governance; full Rust workspace
+4,762 passed / 0 failed / 6 ignored; full Swift suite 673 passed / 0 failed.
 The SwiftUI window is a normal GUI with the `Custos` wordmark as the only ASCII
-art: graphical diamond, seven dimension rows, counts, ring line, local
+art: graphical diamond, eight dimension rows, counts, ring line, local
 diagnostics sheet, and a read-only menu-bar item that only opens/closes the
 window.
 
@@ -886,6 +888,6 @@ Still open before mutation authority:
 
 - install/verify the four-role launchd ring on a real machine;
 - add peer-uid/token checks and the signed vault/self-heal path;
-- add live process sampling and one-way notices;
+- add one-way notices; read-only process sampling already exists;
 - validate thresholds against shadow-mode evidence;
 - implement L2/L3/L4 action execution and audit chain.

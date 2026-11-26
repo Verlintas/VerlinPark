@@ -19,7 +19,10 @@ fn seed_database(data_dir: &Path) {
             CREATE TABLE merge_queue(status TEXT);
             CREATE TABLE effect_receipts(state TEXT);
             CREATE TABLE approvals(status TEXT);
-            CREATE TABLE supervised_processes(state TEXT);
+            CREATE TABLE supervised_processes(
+                id TEXT, state TEXT, pid INTEGER, task_id TEXT, agent_name TEXT,
+                heartbeat_at TEXT, updated_at TEXT
+            );
             INSERT INTO sessions VALUES ('running');
             INSERT INTO events VALUES ('agent.message', datetime('now'));
             INSERT INTO session_runs VALUES ('running');
@@ -27,9 +30,14 @@ fn seed_database(data_dir: &Path) {
             INSERT INTO merge_queue VALUES ('queued');
             INSERT INTO effect_receipts VALUES ('done');
             INSERT INTO approvals VALUES ('approved');
-            INSERT INTO supervised_processes VALUES ('running');
             INSERT INTO runtime_leases VALUES (NULL, datetime('now', '+10 minutes'));
             ",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO supervised_processes              (id, state, pid, task_id, agent_name, heartbeat_at, updated_at)              VALUES ('proc1', 'running', ?1, 'task-1', 'worker-1', datetime('now'), datetime('now'))",
+            [std::process::id() as i64],
         )
         .unwrap();
 }
@@ -70,6 +78,7 @@ async fn observe_only_status_health_charter_and_ping() {
     assert_eq!(status["observe_only"], true);
     assert_eq!(status["role"], "core");
     assert_eq!(status["counts"]["sessions_total"], 1);
+    assert!(status["counts"]["processes_tracked"].as_u64().unwrap() >= 1);
     assert!(
         status["dimensions"]
             .as_array()
@@ -81,6 +90,7 @@ async fn observe_only_status_health_charter_and_ping() {
     let health = vp_custos::client::health(&socket).await.unwrap();
     assert_eq!(health["probe"]["db_open"], true);
     assert_eq!(health["probe"]["user_version"], 1);
+    assert!(!health["processes"].as_array().unwrap().is_empty());
 
     let charter = vp_custos::client::charter(&socket).await.unwrap();
     assert_eq!(charter["observe_only"], true);

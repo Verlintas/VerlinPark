@@ -38,6 +38,8 @@ The first slice implements:
   peer watchdog that only kickstarts an already-installed plist;
 - read-only SQLite probes for sessions, events, leases, runs, tasks, merge
   queue, effects, approvals, and supervised processes;
+- read-only process sampling with `sysinfo` and shadow pressure/stop
+  recommendations, without any signal or notice;
 - a 0600 Unix-domain socket with `status`, `health`, `charter`, `ping`, and the
   explicitly consented `diagnostics.generate`;
 - local standard + forensic ZIP bundles (0700 directory, 0600 files, SHA-256
@@ -76,8 +78,8 @@ controls.
   verify `status`, `health`, `charter`, `ping`, `METHOD_NOT_FOUND` for `act`,
   and that a missing database is not created.
 - `cargo clippy --workspace --all-targets -- -D warnings` passes.
-- `cargo test -p vp-custos`: 53 unit + 4 integration + 1 module-governance.
-- Full Rust workspace: 4,760 passed / 0 failed / 6 ignored.
+- `cargo test -p vp-custos`: 55 unit + 4 integration + 1 module-governance.
+- Full Rust workspace: 4,762 passed / 0 failed / 6 ignored.
 - Swift `xcodebuild test`: 673 passed / 0 failed, including Custos wordmark,
   protocol decoding, diagnostics-result decoding, and unavailable-socket model
   tests.
@@ -93,8 +95,8 @@ controls.
   read-only status metadata is exposed.
 - Probe coverage is bounded to the named tables and does not run a full
   `PRAGMA integrity_check`.
-- Process scoring is a pure policy module; live process sampling and notices
-  are later slices.
+- Process sampling is read-only shadow evidence; notices and any action remain
+  later slices.
 - The GUI does not yet generate diagnostic bundles.
 - No live daemon or real project data is modified by this slice.
 

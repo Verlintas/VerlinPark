@@ -21,6 +21,7 @@ pub mod diagnostics;
 pub mod discovery;
 pub mod launchd;
 pub mod probe;
+pub mod process_probe;
 pub mod protocol;
 pub mod ring;
 pub mod score;

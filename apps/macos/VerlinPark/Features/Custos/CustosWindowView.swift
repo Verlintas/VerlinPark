@@ -274,7 +274,7 @@ private struct CustosDimensionsPanel: View {
         VStack(alignment: .leading, spacing: 10) {
             CustosSectionHeader(
                 title: "INTEGRITY",
-                detail: "SEVEN OBSERVATIONS"
+                detail: "EIGHT OBSERVATIONS"
             )
 
             LazyVGrid(columns: columns, alignment: .leading, spacing: 0) {
