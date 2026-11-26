@@ -33,6 +33,8 @@ pub struct ProcessReport {
 struct SupervisedRow {
     pid: u32,
     session_id: String,
+    agent_id: Option<String>,
+    task_id: Option<String>,
     label: String,
     heartbeat_age_secs: u64,
 }
@@ -117,6 +119,8 @@ impl ProcessSampler {
                 samples.push(ProcessPressure {
                     pid: row.pid,
                     session_id: row.session_id.clone(),
+                    agent_id: row.agent_id.clone(),
+                    task_id: row.task_id.clone(),
                     label: row.label.clone(),
                     state: verdict.state.as_str().to_string(),
                     score: verdict.score,
@@ -180,21 +184,26 @@ fn list_rows(data_dir: &Path) -> Result<Vec<SupervisedRow>> {
     )?;
     connection.busy_timeout(Duration::from_millis(500))?;
     let mut statement = connection.prepare(
-        "SELECT pid, session_id, COALESCE(name, ''), \
+        "SELECT p.pid, p.session_id, o.agent_id, o.task_id, COALESCE(p.name, ''), \
          COALESCE(CAST(strftime('%s','now') AS INTEGER) \
-         - CAST(strftime('%s', heartbeat_at) AS INTEGER), 0) \
-         FROM supervised_processes \
-         WHERE state IN ('running','live','starting') AND pid IS NOT NULL \
-         ORDER BY updated_at DESC LIMIT ?1",
+         - CAST(strftime('%s', p.heartbeat_at) AS INTEGER), 0) \
+         FROM supervised_processes p \
+         LEFT JOIN supervised_process_owners o ON o.process_id = p.id \
+         WHERE p.state IN ('running','live','starting') AND p.pid IS NOT NULL \
+         ORDER BY p.updated_at DESC LIMIT ?1",
     )?;
     let rows = statement.query_map([MAX_TRACKED as i64], |row| {
         let pid: i64 = row.get(0)?;
         let session_id: String = row.get(1)?;
-        let name: String = row.get(2)?;
-        let age: i64 = row.get(3)?;
+        let agent_id: Option<String> = row.get(2)?;
+        let task_id: Option<String> = row.get(3)?;
+        let name: String = row.get(4)?;
+        let age: i64 = row.get(5)?;
         Ok(SupervisedRow {
             pid: u32::try_from(pid.max(0)).unwrap_or(0),
             session_id,
+            agent_id,
+            task_id,
             label: if name.is_empty() {
                 "supervised process".to_string()
             } else {

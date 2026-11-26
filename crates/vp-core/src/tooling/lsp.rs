@@ -3757,6 +3757,8 @@ mod tests {
             git_branch: None,
             remote: None,
             session_id: None,
+            agent_id: None,
+            task_id: None,
             process_supervisor: None,
             test_cache: None,
         }

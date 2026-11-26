@@ -13,7 +13,7 @@ VerlinPark 已经是一个可运行的 macOS 原生多 Agent 开发区：Rust da
 |---|---:|
 | Rust crates | 11（新增 `vp-custos`） |
 | ADR | 235 |
-| 最近全量 Rust 测试 | 4,777 passed / 0 failed / 6 ignored |
+| 最近全量 Rust 测试 | 4,779 passed / 0 failed / 6 ignored |
 | Swift | 673 passed，`xcodebuild test` 通过 |
 | Live provider | DeepSeek `deepseek-flash` 流式/provider-test/完整 Leader 写文件通过；小前缀 cache 97.1–97.4% |
 | 当前分支 | `m3-round`（本轮审查前不合并） |

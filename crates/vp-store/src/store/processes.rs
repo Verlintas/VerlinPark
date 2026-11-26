@@ -77,6 +77,52 @@ impl Store {
     /// Insert a `process.starting` row and its event in one transaction.
     /// The event is written before the projection so a crash cannot leave a
     /// process row with no lifecycle audit trail.
+    /// Read back the optional owner mapping for tests/diagnostics.
+    #[allow(clippy::type_complexity)]
+    pub fn supervised_process_owner(
+        &self,
+        process_id: &str,
+    ) -> Result<Option<(String, Option<String>, Option<String>)>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT session_id, agent_id, task_id FROM supervised_process_owners \
+             WHERE process_id = ?1",
+        )?;
+        let mut rows = statement.query([process_id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?)))
+    }
+
+    /// Record which agent/task started a durable process. This is a separate
+    /// table so the supervised-process row and its event schema stay stable.
+    pub fn set_supervised_process_owner(
+        &self,
+        process_id: &str,
+        session_id: &str,
+        agent_id: Option<&str>,
+        task_id: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO supervised_process_owners \
+             (process_id, session_id, agent_id, task_id, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(process_id) DO UPDATE SET \
+             session_id = excluded.session_id, agent_id = excluded.agent_id, \
+             task_id = excluded.task_id, updated_at = excluded.updated_at",
+            rusqlite::params![
+                process_id,
+                session_id,
+                agent_id,
+                task_id,
+                vp_protocol::now_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn insert_supervised_process_with_event(
         &self,
         session_id: &str,

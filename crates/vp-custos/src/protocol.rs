@@ -187,6 +187,8 @@ pub struct ProbeInfo {
 pub struct ProcessPressure {
     pub pid: u32,
     pub session_id: String,
+    pub agent_id: Option<String>,
+    pub task_id: Option<String>,
     pub label: String,
     pub state: String,
     pub score: u8,

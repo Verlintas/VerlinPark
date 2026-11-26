@@ -545,6 +545,8 @@ pub(super) async fn run_integration_command(
         git_branch: session.branch.clone(),
         remote: None,
         session_id: None,
+        agent_id: None,
+        task_id: None,
         process_supervisor: None,
         test_cache: None,
     };

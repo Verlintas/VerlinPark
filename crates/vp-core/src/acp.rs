@@ -539,6 +539,8 @@ async fn build_command(launch: &AcpLaunch) -> Result<tokio::process::Command> {
         git_branch: launch.git_branch.clone(),
         remote: None,
         session_id: None,
+        agent_id: None,
+        task_id: None,
         process_supervisor: None,
         test_cache: None,
     };

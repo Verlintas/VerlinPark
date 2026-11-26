@@ -1857,6 +1857,8 @@ impl crate::Engine {
             git_branch: session.branch.clone(),
             remote: None,
             session_id: Some(session.id.clone()),
+            agent_id: None,
+            task_id: None,
             process_supervisor: None,
             test_cache: Some(std::sync::Arc::new(TestCacheAccess::new(
                 store.clone(),
@@ -2633,6 +2635,8 @@ mod tests {
             git_branch: None,
             remote: None,
             session_id: None,
+            agent_id: None,
+            task_id: None,
             process_supervisor: None,
             test_cache: None,
         }

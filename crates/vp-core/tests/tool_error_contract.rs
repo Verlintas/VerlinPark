@@ -55,6 +55,8 @@ fn context(root: &Path) -> ToolContext {
         network_allowed: false,
         remote: None,
         session_id: None,
+        agent_id: None,
+        task_id: None,
         process_supervisor: None,
         test_cache: None,
     }

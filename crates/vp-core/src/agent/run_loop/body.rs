@@ -178,6 +178,8 @@ pub(in crate::agent) async fn run_loop_body(
         git_branch: Some(spec.branch.clone()),
         remote: engine.remote_access(&project.id).await?.map(Arc::new),
         session_id: Some(session.id.clone()),
+        agent_id: Some(spec.id.clone()),
+        task_id: spec.task_id.clone(),
         process_supervisor: Some(Arc::clone(engine.process_supervisor())),
         test_cache: Some(Arc::new(crate::test_cache::TestCacheAccess::new(
             engine.store().clone(),

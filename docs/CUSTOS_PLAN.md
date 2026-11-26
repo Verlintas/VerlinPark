@@ -6,7 +6,8 @@ diagnostics, and a normal SwiftUI window with only the wordmark as ASCII art.
 The ring has not been installed/verified on a real machine; release
 signing/automatic binary self-heal and L2–L4 mutation classes remain open.
 Process sampling is read-only shadow evidence and never signals; sealed one-way
-notices are delivered to the session Leader at turn boundaries; the hash vault
+notices are delivered at turn boundaries and route to the owning agent/task when
+`supervised_process_owners` is present (Leader fallback otherwise); the hash vault
 supports optional local Ed25519 and opt-in plist auto-repair, but binary repair
 remains explicit/restart-bound.
 Date: 2026-11-26  
@@ -882,14 +883,15 @@ ADR-0235 adds `crates/vp-custos` with `custosd` and `custos`:
 - hash-chained JSONL audit (`--audit-verify`) for start/stop and automatic 30s
   vault-state changes; metadata only;
 - sealed one-way notice outbox and turn-boundary agent delivery, with
-  `reply: forbidden`; shadow notices currently target the session Leader;
+  `reply: forbidden`; `supervised_process_owners` targets the owning agent/task
+  and falls back to the session Leader for legacy/unowned processes;
 - local standard + forensic ZIP bundles with a SHA-256 manifest, no upload, and
   no caller-supplied path;
 - separate `custos/custos.discovery.json` (0600), not the daemon token;
 - no mutation method, token, TCP listener, agent tool, or provider key.
 
 Tests: 64 unit + 4 integration + 1 module-governance; full Rust workspace
-4,777 passed / 0 failed / 6 ignored; full Swift suite 673 passed / 0 failed.
+4,779 passed / 0 failed / 6 ignored; full Swift suite 673 passed / 0 failed.
 The SwiftUI window is a normal GUI with the `Custos` wordmark as the only ASCII
 art: graphical diamond, nine dimension rows (including vault/process shadows), counts, ring line, local
 diagnostics sheet, and a read-only menu-bar item that only opens/closes the
@@ -899,7 +901,7 @@ Still open before mutation authority:
 
 - install/verify the four-role launchd ring on a real machine;
 - add peer-uid/token checks and the signed/automatic self-heal path;
-- extend notice ownership beyond the session Leader once process ownership is persisted;
+- add exact task-scoped notice wording for Labour/Worker and verify on a live run;
 - implement release signing and automatic binary self-heal (the current vault
   supports optional local Ed25519 and opt-in plist repair only);
 - validate thresholds against shadow-mode evidence;

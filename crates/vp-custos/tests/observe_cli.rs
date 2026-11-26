@@ -23,6 +23,10 @@ fn seed_database(data_dir: &Path) {
                 id TEXT, session_id TEXT, name TEXT, state TEXT, pid INTEGER,
                 heartbeat_at TEXT, updated_at TEXT
             );
+            CREATE TABLE supervised_process_owners(
+                process_id TEXT PRIMARY KEY, session_id TEXT, agent_id TEXT,
+                task_id TEXT, updated_at TEXT
+            );
             INSERT INTO sessions VALUES ('running');
             INSERT INTO events VALUES ('agent.message', datetime('now'));
             INSERT INTO session_runs VALUES ('running');
@@ -38,6 +42,12 @@ fn seed_database(data_dir: &Path) {
         .execute(
             "INSERT INTO supervised_processes              (id, session_id, name, state, pid, heartbeat_at, updated_at)              VALUES ('proc1', 'session-1', 'worker-1', 'running', ?1, datetime('now'), datetime('now'))",
             [std::process::id() as i64],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO supervised_process_owners              (process_id, session_id, agent_id, task_id, updated_at)              VALUES ('proc1', 'session-1', 'worker-1', 'task-1', datetime('now'))",
+            [],
         )
         .unwrap();
 }
@@ -97,7 +107,10 @@ async fn observe_only_status_health_charter_and_ping() {
     let health = vp_custos::client::health(&socket).await.unwrap();
     assert_eq!(health["probe"]["db_open"], true);
     assert_eq!(health["probe"]["user_version"], 1);
-    assert!(!health["processes"].as_array().unwrap().is_empty());
+    let processes = health["processes"].as_array().unwrap();
+    assert!(!processes.is_empty());
+    assert_eq!(processes[0]["agent_id"], "worker-1");
+    assert_eq!(processes[0]["task_id"], "task-1");
     assert_eq!(health["vault"]["state"], "not_initialized");
     assert_eq!(health["vault"]["signature"], "none");
 

@@ -408,6 +408,14 @@ impl ProcessSupervisor {
             &starting,
             PROCESS_STARTING_EVENT,
         )?;
+        if let Err(error) = self.store.set_supervised_process_owner(
+            &id,
+            session_id,
+            context.agent_id.as_deref(),
+            context.task_id.as_deref(),
+        ) {
+            tracing::warn!(%error, "failed to persist supervised-process owner");
+        }
 
         let stdout_file = OpenOptions::new()
             .append(true)
@@ -1232,6 +1240,8 @@ impl ProcessSupervisor {
             git_branch: session.branch.clone(),
             remote: None,
             session_id: Some(row.session_id.clone()),
+            agent_id: None,
+            task_id: None,
             process_supervisor: Some(Arc::clone(self)),
             test_cache: None,
         };
@@ -2482,6 +2492,8 @@ mod tests {
             git_branch: None,
             remote: None,
             session_id: Some(session.to_string()),
+            agent_id: None,
+            task_id: None,
             process_supervisor: Some(Arc::new(ProcessSupervisor::new(store.clone()))),
             test_cache: None,
         }
@@ -2553,6 +2565,23 @@ mod tests {
             restart_blocked_reason: None,
             detail: None,
         }
+    }
+
+    #[tokio::test]
+    async fn records_the_agent_and_task_owner_of_a_process() {
+        let dir = test_root();
+        let (data, store, session) = store_with_session(dir.path());
+        let supervisor = Arc::new(ProcessSupervisor::new(store.clone()));
+        let mut context = context(dir.path(), data.path(), &store, &session);
+        context.agent_id = Some("agent-1".to_string());
+        context.task_id = Some("task-1".to_string());
+        let row = start_sleep(&supervisor, &context, &session, 30).await;
+        let (_, agent, task) = store.supervised_process_owner(&row.id).unwrap().unwrap();
+        assert_eq!(agent.as_deref(), Some("agent-1"));
+        assert_eq!(task.as_deref(), Some("task-1"));
+        let _ = supervisor
+            .stop(&session, &row.id, Some("TERM"), Some(1), "test cleanup")
+            .await;
     }
 
     #[tokio::test]
@@ -3040,6 +3069,8 @@ mod replay_tests {
             git_branch: None,
             remote: None,
             session_id: Some(session.id.clone()),
+            agent_id: None,
+            task_id: None,
             process_supervisor: Some(Arc::clone(&supervisor)),
             test_cache: None,
         };
@@ -3117,6 +3148,8 @@ mod supervisor_edge_tests {
             git_branch: None,
             remote: None,
             session_id: Some(session.to_string()),
+            agent_id: None,
+            task_id: None,
             process_supervisor: Some(Arc::new(ProcessSupervisor::new(store.clone()))),
             test_cache: None,
         }
@@ -3438,6 +3471,8 @@ mod supervisor_safety_tests {
             git_branch: None,
             remote: None,
             session_id: Some(session.to_string()),
+            agent_id: None,
+            task_id: None,
             process_supervisor: Some(Arc::new(ProcessSupervisor::new(store.clone()))),
             test_cache: None,
         }
@@ -3720,6 +3755,8 @@ mod lifecycle_replay_tests {
             git_branch: None,
             remote: None,
             session_id: Some(session.to_string()),
+            agent_id: None,
+            task_id: None,
             process_supervisor: Some(Arc::new(ProcessSupervisor::new(store.clone()))),
             test_cache: None,
         }
@@ -4137,6 +4174,8 @@ mod process_policy_tests {
             git_branch: None,
             remote: None,
             session_id: Some(session.to_string()),
+            agent_id: None,
+            task_id: None,
             process_supervisor: Some(Arc::new(ProcessSupervisor::new(store.clone()))),
             test_cache: None,
         }

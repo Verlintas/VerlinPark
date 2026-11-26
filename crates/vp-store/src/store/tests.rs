@@ -13990,6 +13990,24 @@ fn vp_core_test_centroids(dimensions: u32, centroids: &[Vec<f32>]) -> Vec<u8> {
     bytes
 }
 
+#[test]
+fn supervised_process_owner_round_trips() {
+    let (_data, store, _repo) = test_store();
+    store
+        .set_supervised_process_owner("psup_1", "session-1", Some("worker-1"), Some("task-1"))
+        .unwrap();
+    let conn = store.lock().unwrap();
+    let (agent, task): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT agent_id, task_id FROM supervised_process_owners WHERE process_id = 'psup_1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(agent.as_deref(), Some("worker-1"));
+    assert_eq!(task.as_deref(), Some("task-1"));
+}
+
 fn supervised_row(session: &str, root: &std::path::Path, id: &str) -> SupervisedProcess {
     SupervisedProcess {
         id: id.to_string(),

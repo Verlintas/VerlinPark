@@ -2623,6 +2623,8 @@ mod tests {
             git_branch: None,
             remote: None,
             session_id: None,
+            agent_id: None,
+            task_id: None,
             process_supervisor: None,
             test_cache: None,
         }
@@ -2893,6 +2895,8 @@ Test Case 'ATests.testFoo' failed (0.01 seconds).\n";
             git_branch: None,
             remote: None,
             session_id: Some(session.id.clone()),
+            agent_id: None,
+            task_id: None,
             process_supervisor: None,
             test_cache: Some(access),
         };
@@ -3006,6 +3010,8 @@ Test Case 'ATests.testFoo' failed (0.01 seconds).\n";
             git_branch: None,
             remote: None,
             session_id: Some(session.id.clone()),
+            agent_id: None,
+            task_id: None,
             process_supervisor: None,
             test_cache: Some(access),
         };
@@ -3055,6 +3061,8 @@ Test Case 'ATests.testFoo' failed (0.01 seconds).\n";
             git_branch: None,
             remote: None,
             session_id: Some(session.id.clone()),
+            agent_id: None,
+            task_id: None,
             process_supervisor: None,
             test_cache: Some(Arc::new(crate::test_cache::TestCacheAccess::new(
                 store.clone(),
@@ -3120,6 +3128,8 @@ Test Case 'ATests.testFoo' failed (0.01 seconds).\n";
             git_branch: None,
             remote: None,
             session_id: Some(session.id.clone()),
+            agent_id: None,
+            task_id: None,
             process_supervisor: None,
             test_cache: Some(Arc::new(crate::test_cache::TestCacheAccess::new(
                 store.clone(),
@@ -3239,6 +3249,8 @@ Test Case 'ATests.testFoo' failed (0.01 seconds).\n";
             git_branch: None,
             remote: None,
             session_id: Some(session.id.clone()),
+            agent_id: None,
+            task_id: None,
             process_supervisor: None,
             test_cache: Some(access),
         };

@@ -797,6 +797,8 @@ mod tests {
             git_branch: None,
             remote: None,
             session_id: Some(session_id.to_string()),
+            agent_id: None,
+            task_id: None,
             process_supervisor: Some(Arc::new(ProcessSupervisor::new(store.clone()))),
             test_cache: None,
         }

@@ -58,6 +58,10 @@ pub struct ToolContext {
     /// The session this tool call belongs to. Durable process supervision is
     /// session-scoped; tools that do not run inside a session leave this unset.
     pub session_id: Option<String>,
+    /// The agent that owns this tool call, when it belongs to a run.
+    pub agent_id: Option<String>,
+    /// The plan task that owns this tool call, when it belongs to one.
+    pub task_id: Option<String>,
     /// Daemon-owned durable process supervisor. `None` only in contexts that
     /// cannot create durable processes (for example a one-shot integration
     /// command or an isolated tool unit test).
@@ -2611,6 +2615,8 @@ mod tests {
                 network_allowed: true,
                 remote: None,
                 session_id: None,
+                agent_id: None,
+                task_id: None,
                 process_supervisor: None,
                 test_cache: None,
             },
@@ -2918,6 +2924,8 @@ mod tests {
             network_allowed: true,
             remote: None,
             session_id: None,
+            agent_id: None,
+            task_id: None,
             process_supervisor: None,
             test_cache: None,
         };
@@ -2972,6 +2980,8 @@ mod tests {
             git_branch: None,
             remote: None,
             session_id: None,
+            agent_id: None,
+            task_id: None,
             process_supervisor: None,
             test_cache: None,
         };
@@ -3012,6 +3022,8 @@ mod tests {
             git_branch: None,
             remote: None,
             session_id: None,
+            agent_id: None,
+            task_id: None,
             process_supervisor: None,
             test_cache: None,
         };
@@ -3054,6 +3066,8 @@ mod tests {
             network_allowed: false,
             remote: None,
             session_id: None,
+            agent_id: None,
+            task_id: None,
             process_supervisor: None,
             test_cache: None,
         };
@@ -3085,6 +3099,8 @@ mod tests {
             network_allowed: true,
             remote: None,
             session_id: None,
+            agent_id: None,
+            task_id: None,
             process_supervisor: None,
             test_cache: None,
         };
@@ -3170,6 +3186,8 @@ mod tests {
             network_allowed: true,
             remote: None,
             session_id: None,
+            agent_id: None,
+            task_id: None,
             process_supervisor: None,
             test_cache: None,
         };
@@ -3263,6 +3281,8 @@ mod tests {
             network_allowed: true,
             remote: None,
             session_id: None,
+            agent_id: None,
+            task_id: None,
             process_supervisor: None,
             test_cache: None,
         };

@@ -742,8 +742,8 @@ async fn notice_loop(state: AppState) {
                 created_at: vp_protocol::now_rfc3339(),
                 severity: severity.to_string(),
                 session_id: sample.session_id.clone(),
-                agent_id: None,
-                task_id: None,
+                agent_id: sample.agent_id.clone(),
+                task_id: sample.task_id.clone(),
                 subject: sample.label.clone(),
                 action: sample.action.clone(),
                 observed: vp_protocol::custos_notice::CustosNoticeObserved {

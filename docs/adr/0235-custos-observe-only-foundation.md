@@ -46,8 +46,8 @@ The first slice implements:
 - an append-only hash-chained JSONL audit for start/stop and automatic 30s
   vault-state changes, with `--audit-verify`;
 - sealed one-way notice files drained by the agent loop at a turn boundary and
-  appended as persisted system messages; shadow process notices currently use
-  the session Leader because process ownership is not persisted per agent;
+  appended as persisted system messages; new process notices target the owning agent/task via
+  `supervised_process_owners`, with the session Leader as a legacy/unowned fallback;
 - a 0600 Unix-domain socket with `status`, `health`, `charter`, `ping`, and the
   explicitly consented `diagnostics.generate`;
 - local standard + forensic ZIP bundles (0700 directory, 0600 files, SHA-256
@@ -87,7 +87,7 @@ controls.
   and that a missing database is not created.
 - `cargo clippy --workspace --all-targets -- -D warnings` passes.
 - `cargo test -p vp-custos`: 64 unit + 4 integration + 1 module-governance.
-- Full Rust workspace: 4,777 passed / 0 failed / 6 ignored.
+- Full Rust workspace: 4,779 passed / 0 failed / 6 ignored.
 - Swift `xcodebuild test`: 673 passed / 0 failed, including Custos wordmark,
   protocol decoding, diagnostics-result decoding, and unavailable-socket model
   tests.

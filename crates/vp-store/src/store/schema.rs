@@ -26,7 +26,6 @@ impl Store {
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
-
             CREATE TABLE IF NOT EXISTS projects (
                 id            TEXT PRIMARY KEY,
                 name          TEXT NOT NULL,
@@ -34,7 +33,6 @@ impl Store {
                 default_branch TEXT NOT NULL,
                 created_at    TEXT NOT NULL
             );
-
             CREATE TABLE IF NOT EXISTS model_presets (
                 id                    TEXT PRIMARY KEY,
                 name                  TEXT NOT NULL,
@@ -46,7 +44,6 @@ impl Store {
                 notes                 TEXT NOT NULL DEFAULT '',
                 created_at            TEXT NOT NULL
             );
-
             CREATE TABLE IF NOT EXISTS project_shell_policies (
                 project_id      TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
                 network         TEXT NOT NULL,
@@ -2154,14 +2151,17 @@ impl Store {
                 restart_blocked_reason TEXT,
                 detail              TEXT
             );
-
             CREATE INDEX IF NOT EXISTS idx_supervised_processes_session
                 ON supervised_processes(session_id, started_at);
             CREATE INDEX IF NOT EXISTS idx_supervised_processes_state
                 ON supervised_processes(state, heartbeat_at);
             CREATE INDEX IF NOT EXISTS idx_supervised_processes_retention
                 ON supervised_processes(retention_deadline);
-
+            CREATE TABLE IF NOT EXISTS supervised_process_owners (
+                process_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                agent_id TEXT, task_id TEXT, updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_supervised_process_owners_session ON supervised_process_owners(session_id);
             CREATE TABLE IF NOT EXISTS session_continuations (
                 id              TEXT PRIMARY KEY,
                 session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,

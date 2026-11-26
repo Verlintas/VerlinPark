@@ -46,8 +46,9 @@ in-daemon module.
   files; the agent loop drains up to two matching notices at a turn boundary
   and appends a persisted system message, then moves them to `delivered`.
   Notices have `reply: forbidden`, no tool/RPC path, no action, and no prompt
-  content. Unaddressed process notices go to the session Leader until process
-  ownership is persisted per agent.
+  content. `supervised_process_owners` records the agent/task at process start,
+  so new process notices target the owning agent; legacy/unowned processes fall
+  back to the session Leader.
 - 0600 Unix socket and separate `custos/discovery.json`; methods are `status`,
   `health`, `charter`, `ping`, and the explicitly consented
   `diagnostics.generate`. No TCP, token, provider key, agent tool, or state
@@ -60,7 +61,7 @@ in-daemon module.
   `Custos` wordmark as the only ASCII art and a local diagnostics sheet.
 
 Verification: `cargo test -p vp-custos` 64 unit + 4 integration + 1 module
-governance; full workspace **4,777 Rust passed / 0 failed / 6 ignored**;
+governance; full workspace **4,779 Rust passed / 0 failed / 6 ignored**;
 `cargo clippy --workspace --all-targets -- -D warnings` passes; Swift
 `xcodebuild test` **673 passed / 0 failed** with English test language; the
 Custos window is a normal SwiftUI GUI with only the wordmark as ASCII art.

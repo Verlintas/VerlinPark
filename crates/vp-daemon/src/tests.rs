@@ -54,6 +54,8 @@ mod process_rpc_tests {
             git_branch: None,
             remote: None,
             session_id: Some(session.to_string()),
+            agent_id: None,
+            task_id: None,
             process_supervisor: Some(supervisor),
             test_cache: None,
         }
