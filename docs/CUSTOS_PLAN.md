@@ -807,12 +807,43 @@ launchd/watchdog history, and aggregate calibration p50/p95. The decision path
 also does not use `sample`; it relies on `proc_pid_rusage`,
 `proc_pidinfo`, output/heartbeat progress, and capacity calibration.
 
-### 17.5 Remaining review questions
+### 17.5 Decisions after this round
 
-- Are the capacity formulas and score weights acceptable?
-- Is the 0500/0400 vault + app-bundle baseline enough for self-heal?
-- Idle-agent notices: inbox or drop with audit?
-- Quarantine UX and menu-bar presence.
-- Audit-chain tamper handling.
-- How calibration should distinguish a permanently slow machine from a real
-  stall without letting a poisoned baseline hide regressions.
+Accepted: capacity formulas and 5-run learning mode; 0500/0400 vault +
+app-bundle baseline; idle notices to project inbox; quarantine UX
+(project/task label, category, consequence, diagnostics entry); menu-bar `◇`
+status item; no stack samples/full paths.
+
+Remaining:
+
+- Which ASCII visual direction to use (see `docs/CUSTOS_GUI_ASCII.md`).
+- Audit-chain tamper handling: gap marker vs restored head.
+- Calibration drift: distinguish a permanently slow machine from a real stall
+  without letting a poisoned baseline hide regressions.
+- Whether calibration p50/p95 appears in the forensic bundle as aggregates.
+- Whether the menu-bar `◇` shows a `CONTAINED` count.
+
+## 18. Round 6 direction: accepted calibration and ASCII visual language
+
+The owner accepted the capacity model, the 5-run learning window, the
+vault/app-bundle self-heal baseline, and inbox delivery for idle-agent notices.
+The quarantine display and menu-bar `◇` status item are also accepted.
+
+The main window now treats **fixed-width ASCII/box-drawing art** as a
+first-class layer: a central glyph, concentric rings, character animation at
+8–12 fps, a static frame that is still readable, and no essential information
+that exists only in the art. Reduce Motion freezes the animation; VoiceOver
+ignores the art and reads the status text.
+
+There are two separate design sets:
+
+- `docs/CUSTOS_GUI_ASCII.md` — **window layout** studies: MONOLITH / VIGIL /
+  REACTOR / RELIC / CATHEDRAL.
+- `docs/CUSTOS_WORDMARK_ASCII.md` — **the CUSTOS name itself**: SEALED SLAB /
+  THIN CIRCUIT / TERMINAL / ANSI SHADOW / MONOLITH LOCKUP, with scanline, node
+  travel, glitch, and orbit frames.
+
+Recommended lockup: MONOLITH LOCKUP as the primary identity, SEALED SLAB for a
+compact header, TERMINAL for the menu-bar popover. The selection is a design
+choice, not a runtime policy; the chosen variant will be implemented as a
+monospaced text layer with a static fallback, not as an image asset.

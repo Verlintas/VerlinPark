@@ -500,6 +500,8 @@ Quarantine is evidence-preserving, not deletion:
   non-dispatchable;
 - keep files, commits, logs, artifacts, and audit;
 - emit `custos.quarantine` and a notice;
+- show the user only the project/task label, category, consequence, and a
+  diagnostics entry; no raw internals and no release control;
 - release only by deterministic postcondition (clean verification, resolved
   effect, repaired DB, operator-independent health check). The user has no GUI
   release control.
@@ -647,8 +649,12 @@ a panel embedded in the main Stage:
 - 5–7 integrity rings or bars: RUNTIME, DATA, LEASES, QUEUES, WORKTREES,
   BACKUP, SIGNAL;
 - one deterministic sentence of state;
+- a fixed-width ASCII/box-drawing layer (monospaced, state-colored, no unique
+  information that is not also in text);
 - a bounded log of the last 8–12 actions: time, category, target label, result;
 - `PROTECTION ACTIVE`, `CONTAINED {n}`, `LAST ACTION ...`;
+- a small `◇` menu-bar status item that mirrors state and opens/closes the
+  window; it has no repair/restart/restore/approve/kill action;
 - no buttons, no text field, no chat, no repair/restart/restore/approve/kill
   control, no policy editor.
 
@@ -667,9 +673,16 @@ a panel embedded in the main Stage:
 - distinct from VerlinPark pages: no sidebar, cards, tabs, rounded panels, or
   glass dashboard;
 - mono type, wide tracking, 1px rules, restrained glow/pulse/scanline;
+- ASCII/box-drawing art is a first-class layer: fixed-width, monospaced, no
+  proportional fallback, no ligatures, no essential information only in art;
+- character animation runs at 8–12 fps, never faster than 1.2s per pulse and
+  4s per scan; no flashing above 3 Hz;
 - state colors: ice (healthy), amber (watch/degraded), red (critical),
   near-black (quarantined);
-- Reduce Motion disables pulse/scanline; Reduce Transparency removes blur;
+- Reduce Motion freezes the static frame and disables pulse/scanline; Reduce
+  Transparency removes blur;
+- VoiceOver reads the status text, not the art; the art layer is
+  `accessibilityHidden`;
 - all text is deterministic; no generated copy.
 
 ### 9.4 Information tiers
@@ -999,34 +1012,26 @@ catalog is closed; Custos cannot invent an action.
 
 ## Appendix D — Review questions for the owner
 
-Answered in this round: fourth sentinel (yes), no privileged `custos-guard`
-(accepted residual), daemon restart (yes, automatic), verified restore (yes,
-automatic), adaptive capacity calibration (yes), no stack samples or full paths
-in diagnostics. Remaining:
+Answered in this round: capacity formulas and 5-run learning mode (yes), vault
++ app-bundle baseline (enough), idle notices to project inbox (yes), quarantine
+UX (project/task label, category, consequence, diagnostics entry), menu-bar `◇`
+status item (yes), no stack samples/full paths. Remaining:
 
-1. Are the capacity formulas and score weights acceptable? Proposed:
-   `rss_hard = clamp(0.50×mem, 3, 24 GiB)`,
-   `children_hard = clamp(16×cores, 64, 256)`,
-   `scratch_hard = clamp(0.05×disk_free, 2, 24 GiB)`,
-   `fds_hard = clamp(1024×cores, 4096, 32768)`;
-   notice at 60, final at 80, stop at 90 with two signal families; first 5 runs
-   per workload fingerprint are learning mode.
-2. Is the 0500/0400 vault plus app-bundle baseline enough for self-heal, or
-   should the baseline be a signed read-only disk image / notarized helper?
-3. Should idle-agent notices go to the project inbox, or be dropped with an
-   audit entry if no agent is running?
-4. What should the user see when Custos quarantines a project? Proposed:
-   project name, category, consequence, and a “diagnostics” path only.
-5. Should Custos have a menu-bar status dot in addition to the independent
-   window, or only the window?
-6. Should audit-chain tamper restore the head from anchor memory and mark a
+1. Which ASCII/box-drawing visual direction to use; see
+   `docs/CUSTOS_GUI_ASCII.md` for variants and animation frames.
+2. Should audit-chain tamper restore the head from anchor memory and mark a
    gap, or only flag the gap without writing a new head? Proposed: preserve
    the tampered file, write a `tamper_detected` gap marker, never fabricate
    missing entries.
-7. How should capacity calibration handle a permanently slow machine or a
+3. How should capacity calibration handle a permanently slow machine or a
    thermal-throttled run without letting a bad baseline hide a real stall?
-8. Should calibration data be included in the forensic bundle as aggregate
-   p50/p95 (no raw samples), or only as counts?
+   Proposed: capacity multiplier + trend alarm when a workload is consistently
+   slower than its own older baseline, with notice-only until shadow evidence.
+4. Should calibration data appear in the forensic bundle as aggregate p50/p95
+   (no raw samples), or only as counts? Proposed: aggregate p50/p95 plus sample
+   count, no raw rows.
+5. Should the menu-bar `◇` item show only state color, or also a tiny numeric
+   `CONTAINED` count? Proposed: state color + count when non-zero.
 
 ---
 
