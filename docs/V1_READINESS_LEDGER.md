@@ -804,9 +804,13 @@ four-tier path with a deliberately non-human spatial output.
   This is CI-scale structural evidence, not the Phase 2 live 10-Worker/soak
   proof.
 
-Still open in the same area: native computer and Code Mode are not yet a
-project-level explicit opt-in (computer remains helper/TCC-gated and Code Mode
-remains capability-limited, but both are still advertised by default);
+Still open in the same area: redaction covers tool/approval event and row
+payloads only; legacy rows are not rewritten, and provider-facing conversation
+messages, artifacts/sources, file content, and journal/effect inputs are not
+filtered, so a secret echoed into those surfaces can still persist. Matching is
+pattern/key based, not entropy detection. Native computer and Code Mode are not
+yet a project-level explicit opt-in (computer remains helper/TCC-gated and Code
+Mode remains capability-limited, but both are still advertised by default);
 Keychain/TCC first-run needs a real-machine pass; the provider tool probe has
 not yet been run against a live endpoint in this workspace; automatic project
 creation from non-GUI clients does not force a shell trust decision; and the

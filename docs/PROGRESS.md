@@ -47,10 +47,13 @@
   bearer/JWT/provider tokens, URL query credentials, and assignment-shaped
   values from tool and approval payloads while leaving execution inputs intact.
 
-Remaining honest gaps: no live tool-calling probe in this workspace yet, no
-real-machine Keychain/TCC pass, no live multi-Worker/merge-conflict/daemon
-restart/72-hour soak evidence, and release signing/notarization plus a real
-CUSTOS ring install remain open.
+Remaining honest gaps: redaction is payload-scoped and pattern/key based (legacy
+rows, conversation messages, artifacts/sources, file content, and
+journal/effect inputs are not rewritten); native computer/Code Mode are not yet
+a project-level opt-in; no live tool-calling probe or live
+multi-Worker/merge-conflict/daemon-restart/soak run has been recorded in this
+workspace; Keychain/TCC first-run still needs a real-machine pass; and release
+signing/notarization plus a real CUSTOS ring install remain open.
 
 ---
 
