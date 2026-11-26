@@ -767,10 +767,10 @@ four-tier path with a deliberately non-human spatial output.
   access as an explicit opt-in; `vp project-add --hardened-shell` applies the
   same policy from the CLI.
 - **No scripted backup/restore drill.** `scripts/backup-restore-drill.sh` seeds
-  a real daemon data directory, adds a Git project through the normal RPC, then
-  proves v1 ZIP and signed/encrypted repository (v3) restore round trips and
-  project-row equality. Run with `just backup-drill`; `just release-preflight`
-  includes it.
+  a real daemon data directory, adds a Git project with `--hardened-shell`,
+  checks the persisted shell policy, then proves v1 ZIP and signed/encrypted
+  repository (v3) restore round trips and project-row equality. Run with
+  `just backup-drill`; `just release-preflight` includes it.
 - **Tool/approval secrets could be persisted.** A deterministic,
   persistence-boundary redactor now sanitizes `tool.started`/`tool.finished`
   payloads (including the journal path), approval event/row input, URL query
@@ -800,3 +800,26 @@ the provider tool probe has not yet been run against a live endpoint in this
 workspace; automatic project creation from non-GUI clients does not force a
 shell trust decision; and the scale/fault harness does not replace live
 multi-Worker, merge-conflict, daemon restart, or 72-hour soak evidence.
+
+### Evidence run (2026-11-27)
+
+| Check | Result |
+|---|---|
+| `cargo test -p vp-core --lib` | 2,723 passed / 0 failed / 2 ignored |
+| `cargo test -p vp-core --test secret_redaction` | 3 passed |
+| `cargo test -p vp-bench` | 164 passed / 1 ignored |
+| `cargo test -p vp-cli` | unit + integration suites passed |
+| `cargo test -p vp-daemon` | 57 passed plus module governance |
+| `cargo test -p vp-protocol` | 306 passed |
+| `just backup-drill` | v1 ZIP plus signed/encrypted repository restore passed |
+| `vp bench scale` | PASS, 100/100 tasks, 10 batches, peak 10 |
+| `vp bench fault` | PASS, 5/5 cases, 3 real fake-provider runtime cases |
+| `cargo clippy ... -D warnings` | passed |
+| `swiftformat --lint` | passed |
+| `xcodebuild build` | passed |
+
+A full `cargo test --workspace` run reported 4,802 passed / 0 failed / 6
+ignored before the final empty-project-removal tests were added; those three
+tests and all touched-crate suites passed individually afterward. The run is
+not claimed as a clean final full-workspace number until it is repeated without
+concurrent cargo builds.

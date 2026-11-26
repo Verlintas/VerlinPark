@@ -54,12 +54,21 @@ for _ in $(seq 1 200); do
 done
 [[ -f "$DATA/run/daemon.json" ]] || fail "daemon discovery file was not written"
 
-"$VP" --data-dir "$DATA" --json project-add "$REPO" --name "Backup Drill" >"$OUT/project.json"
+"$VP" --data-dir "$DATA" --json project-add "$REPO" --name "Backup Drill" --hardened-shell >"$OUT/project.json"
+PROJECT_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$OUT/project.json")"
 python3 - "$OUT/project.json" <<'PY'
 import json, sys
 value = json.load(open(sys.argv[1]))
 assert value.get("name") == "Backup Drill", value
 assert value.get("id"), value
+PY
+"$VP" --data-dir "$DATA" --json shell-policy "$PROJECT_ID" >"$OUT/shell-policy.json"
+python3 - "$OUT/shell-policy.json" <<'PY'
+import json, sys
+policy = json.load(open(sys.argv[1]))["policy"]
+assert policy["network"] == "deny", policy
+assert policy["restrict_home"] is True, policy
+assert policy["read_jail"] is True, policy
 PY
 
 kill "$DAEMON_PID"

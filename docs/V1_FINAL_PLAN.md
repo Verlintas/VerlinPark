@@ -445,6 +445,14 @@ Close all S0/S1 items:
 Exit: S0/S1 zero; fault-injection and regression tests pass; backup/restore
 drill passes; a clean local first-run cannot report false success.
 
+2026-11-27 status: secret redaction, shell trust decision, backup scope/verify,
+approval fail-closed, remote ACP/header handling, source rebuild reporting,
+imported repair semantics, schema guard, Git/provider/Auto-cap/New-Session
+preflights, empty-project recovery, and a scripted backup/restore drill are
+implemented. Native computer/Code Mode remain open S1 items, no live provider
+tool probe has been run in this workspace, and Keychain/TCC first-run still
+needs a real-machine pass. In-run plan revision remains open.
+
 ### Phase 2 — Scale, coding precision, and Agent Inspector (4–6 weeks)
 
 On the real target repository:
