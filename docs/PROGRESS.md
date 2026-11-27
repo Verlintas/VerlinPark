@@ -67,6 +67,17 @@ idle with correct `LIVE_SMOKE.md` content, 5 calls, 64,919 input / 1,275 output
 / 60,928 cache-read tokens, and 93.85% cache hit. The small live cache-bench
 reported 95.07–96.83% hit; it is not the long-prefix 99.5% acceptance run.
 
+Real-machine GUI smoke on 2026-11-27 used an isolated data directory and a
+temporary repository. The first-run wizard probed the live provider
+(780 ms, tool calling supported · `probe_echo`), selected hardened shell trust,
+and added the project through the native folder picker. A GUI session ran
+Leader→`write_file` to idle with the exact 18-byte `GUI_LIVE.md`; a second
+session's host-state shell request showed an approval card, was denied, and
+returned `PERMISSION_DENIED` without creating `/tmp/vp-gui-approval.txt`. The
+wizard also gained a **Test current provider** button for env-configured
+daemons. Test data was removed and the owner's default project/app data was
+untouched.
+
 ---
 
 ## 2026-11-26 CUSTOS observe-only foundation

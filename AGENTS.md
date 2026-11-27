@@ -153,7 +153,11 @@ on a real machine. Two consecutive clean `just release-preflight full` runs on
 helper Swift tests passed, plus the backup drill, scale/fault harness, and
 release binaries. Live DeepSeek validation (environment-only key) returned
 `tool_calling=true`/`probe_echo` at 411 ms and a 5-call Leader→`write_file`→idle
-session at 93.85% cache hit.
+session at 93.85% cache hit. Real-machine GUI smoke (isolated data directory)
+verified the first-run provider probe and tool calling, hardened project trust,
+a Leader `write_file` session ending idle with the exact 18-byte file, and a
+denied `HOST_STATE` shell approval that returned `PERMISSION_DENIED` without
+running the command. The existing app instance and owner data were untouched.
 
 ## Commands
 

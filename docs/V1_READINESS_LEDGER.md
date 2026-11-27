@@ -761,7 +761,9 @@ four-tier path with a deliberately non-human spatial output.
   (hardened recommended), and a successful live `agent.probe` before Continue.
   It also runs the one-call `agent.probe.tools` check and labels tool calling
   as verified or unverified; unsupported tool calling is never silently called
-  "connected". Session creation is also blocked until a provider is configured.
+  "connected". A daemon configured from the environment can be probed with
+  **Test current provider** without rewriting its key. Session creation is also
+  blocked until a provider is configured.
 - **Wizard startup raced the daemon.** First-run now waits a bounded time for
   the local daemon, shows connection state, and provides an explicit Retry that
   cancels automatic backoff; setup controls stay disabled until connected.
@@ -839,6 +841,7 @@ scale/soak evidence.
 | `scripts/package-release.sh` | DMG created (universal, ad-hoc signed) |
 | `just verify-dmg` | checksum, image, helpers, layout, signature passed |
 | live DeepSeek smoke | provider probe + `tool_calling=true`; full E2E idle; 93.85% cache hit |
+| live GUI smoke | wizard probe/tool calling, hardened trust, write_file idle, denied host-state shell |
 
 The first preflight run exposed one load-sensitive ACP WebSocket timeout
 (20s) and two locale-dependent Swift assertions. The timeout was raised to 60s
@@ -861,3 +864,26 @@ tool-calling probe.
   `live provider smoke ok`.
 - The small cache-bench was capped at $0.05; the full session used the script's
   120k token / 300s budget.
+
+### Live GUI validation (2026-11-27)
+
+Real Debug app instance with an isolated `VERLINPARK_DATA_DIR` and a temporary
+Git repository; the existing app instance and owner data were untouched. The
+API key was passed only in the daemon/app process environment, never stored by
+this test.
+
+- First-run wizard: **Test current provider** (new button added from this
+  smoke) completed the live text probe at 780 ms / 1 chunk / 737 ms first
+  token and reported **Tool calling supported · probe_echo**.
+- Project selection through the native `NSOpenPanel` succeeded; the project
+  preflight rejected the parent folder and accepted the actual Git root.
+- Hardened shell trust was selected and shown in the final setup summary.
+- GUI session 1: Leader used `write_file` and finished `idle`; the worktree
+  `GUI_LIVE.md` contained exactly `gui live smoke ok` (18 bytes, SHA-256
+  `1b6db0b8…399731`), and the source checkout stayed unmodified.
+- GUI session 2: a shell command writing outside the worktree raised a
+  `HOST_STATE` approval card. The operator denied it; the UI showed `DENIED`
+  and `PERMISSION_DENIED`, the command did not run, no `/tmp` file was created,
+  and the session returned to `idle`.
+- Temp app data/repository were removed and the onboarding preference was
+  restored after the test.

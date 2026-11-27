@@ -307,6 +307,14 @@ struct SetupWizardView: View {
                 }
                 .buttonStyle(VPPrimaryButtonStyle(tint: VPTheme.accentDeep))
                 .disabled(model.providerBusy || model.providerModel.isEmpty || !daemonConnected)
+                if model.agentInfo?.configured == true {
+                    Button(L10n.t("Test current provider")) {
+                        Task { await model.probeProvider() }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(model.providerProbeBusy || !daemonConnected)
+                }
                 if model.providerBusy || model.providerProbeBusy {
                     ProgressView().controlSize(.small)
                 }

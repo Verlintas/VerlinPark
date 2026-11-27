@@ -455,9 +455,12 @@ and scale/fault harness passed, a universal ad-hoc DMG was built and verified,
 and release binaries built. Live DeepSeek validation on 2026-11-27 confirmed
 the provider text stream, `tool_calling=true` for `probe_echo`, a full
 Leader→`write_file`→idle session (5 calls, 93.85% cache hit), and a small
-cache-bench; the key was environment-only. Native computer/Code Mode remain open
-S1 items, the live run is not a 10-Worker/soak proof, and Keychain/TCC first-run
-still needs a real-machine pass. In-run plan revision remains open.
+cache-bench; the key was environment-only. A real-machine GUI smoke also
+verified the first-run probe/tool calling, hardened trust, an exact
+`GUI_LIVE.md` write, and a denied host-state shell approval that did not run.
+Native computer/Code Mode remain open S1 items, the live run is not a
+10-Worker/soak proof, and Keychain/TCC first-run still needs a real-machine
+pass. In-run plan revision remains open.
 
 ### Phase 2 — Scale, coding precision, and Agent Inspector (4–6 weeks)
 
