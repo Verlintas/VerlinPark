@@ -88,8 +88,9 @@ write-scope violation. Fixed and unit-tested: contract shell analysis now treats
 in-worktree `__pycache__`/`.pytest_cache`/`.pyc` cleanup as a
 workspace write and permits ancestor `mkdir`; Worker commit/scope checks ignore
 generated Python caches and do not stage them. Simple scratch aliases (including `mktemp -d` under scratch) are fixed (ADR-0238),
-and heredoc/`PYTHONPATH="$(pwd)"` commands are analyzed as workspace writes
-(ADR-0239). A deterministic pause-before-verification plan test now asserts
+heredoc/`PYTHONPATH="$(pwd)"` commands are analyzed as workspace writes
+(ADR-0239), and `cp`/`install`/`ln` sources are reads rather than writes
+(ADR-0240). A deterministic pause-before-verification plan test now asserts
 both tasks still get Verifier runs and merge; a dispatch deferral reports
 `Plan deferred` instead of `Plan complete`. Turn ceilings are
 now operator-owned (default none) rather than a hidden constant. Completion

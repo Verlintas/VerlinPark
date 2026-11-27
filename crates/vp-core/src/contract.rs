@@ -1717,7 +1717,19 @@ fn analyze_shell_inner(
                     }
                 }
             }
-            "mv" | "cp" | "install" | "ln" | "tee" | "touch" | "truncate" | "unlink" | "rmdir" => {
+            "cp" | "install" | "ln" => {
+                // Copy-style commands read their sources and write only the
+                // destination. Treating a read-only source as a write target
+                // made routine verification (`cp -R app tests "$SCRATCH/..."`)
+                // look like an out-of-scope write. A move still writes every
+                // source path and keeps the conservative all-args rule.
+                for target in copy_like_write_targets(args) {
+                    if !shell_path_in_scope(contract, target, worktree) {
+                        analysis.writes_outside_scope = true;
+                    }
+                }
+            }
+            "mv" | "tee" | "touch" | "truncate" | "unlink" | "rmdir" => {
                 for target in args.iter().filter(|arg| !arg.starts_with('-')) {
                     if !shell_path_in_scope(contract, target, worktree) {
                         analysis.writes_outside_scope = true;
@@ -1883,6 +1895,38 @@ fn shell_path_is_scope_parent(contract: &TaskContract, raw: &str) -> bool {
         .allowed_paths
         .iter()
         .any(|allowed| allowed != "." && (allowed == target || allowed.starts_with(&prefix)))
+}
+
+/// Write targets of a copy/install/link command. Sources are reads; the
+/// destination (or every directory with `install -d`) is the write set.
+fn copy_like_write_targets(args: &[String]) -> Vec<&str> {
+    if let Some(target) = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--target-directory="))
+    {
+        return vec![target];
+    }
+    if let Some(position) = args
+        .iter()
+        .position(|arg| arg == "-t" || arg == "--target-directory")
+    {
+        return args
+            .get(position + 1)
+            .map(|target| vec![target.as_str()])
+            .unwrap_or_default();
+    }
+    if args.iter().any(|arg| arg == "-d" || arg == "--directory") {
+        return args
+            .iter()
+            .filter(|arg| !arg.starts_with('-'))
+            .map(String::as_str)
+            .collect();
+    }
+    args.iter()
+        .rev()
+        .find(|arg| !arg.starts_with('-'))
+        .map(|target| vec![target.as_str()])
+        .unwrap_or_default()
 }
 
 fn shell_path_in_scope(contract: &TaskContract, raw: &str, worktree: &Path) -> bool {
@@ -2472,7 +2516,7 @@ mod tests {
     fn shell_mutation_outside_scope_escalates_even_in_advisory_mode() {
         let (worktree, _keep) = worktree();
         let contract = derive_contract(derivation(vec!["crates/vp-core".into()])).unwrap();
-        let input = json!({"command": "cp docs/x crates/vp-core/src/y"});
+        let input = json!({"command": "cp crates/vp-core/src/y docs/x"});
         let advisory_policy = policy();
         let decision = authorize(
             &call("shell", &input, &worktree),
@@ -2900,6 +2944,46 @@ mod tests {
         assert!(analyze_shell_command("ssh host ls", &contract, worktree).remote);
         let parsed = analyze_shell_command("echo x > /etc/passwd", &contract, worktree);
         assert!(parsed.writes_outside_scope);
+    }
+
+    #[test]
+    fn copy_sources_are_reads_and_only_the_destination_is_a_write() {
+        let contract = derive_contract(derivation(vec!["app/calc.py".into()])).unwrap();
+        let worktree = Path::new(".");
+        let scratch_copy = analyze_shell_command(
+            "cp -R app tests \"$VERLINPARK_SCRATCH/t1check\"/",
+            &contract,
+            worktree,
+        );
+        assert!(
+            !scratch_copy.writes_outside_scope,
+            "copying sources into scratch is a read of the sources: {scratch_copy:?}"
+        );
+        let outside = analyze_shell_command("cp app/calc.py app/other.py", &contract, worktree);
+        assert!(outside.writes_outside_scope, "{outside:?}");
+        let read_source = analyze_shell_command("cp /etc/hosts app/calc.py", &contract, worktree);
+        assert!(
+            !read_source.writes_outside_scope,
+            "a read-only source is not a write: {read_source:?}"
+        );
+        let explicit_target = analyze_shell_command(
+            "cp -t \"$VERLINPARK_SCRATCH/dir\" app/calc.py",
+            &contract,
+            worktree,
+        );
+        assert!(!explicit_target.writes_outside_scope, "{explicit_target:?}");
+        let move_in = analyze_shell_command(
+            "mv \"$VERLINPARK_SCRATCH/calc.py\" app/calc.py",
+            &contract,
+            worktree,
+        );
+        assert!(!move_in.writes_outside_scope, "{move_in:?}");
+        let link = analyze_shell_command(
+            "ln -s app/calc.py \"$VERLINPARK_SCRATCH/calc-link\"",
+            &contract,
+            worktree,
+        );
+        assert!(!link.writes_outside_scope, "{link:?}");
     }
 
     #[test]

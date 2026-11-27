@@ -915,15 +915,22 @@ This is partial evidence, not a clean two-task merge:
     ancestor directory of an allowed path.
   - Worker commit/scope checks ignore generated Python caches; `git add` no
     longer stages them, so a test-generated `.pyc` cannot fail integration.
-- **Scratch aliases and heredoc/substitution analysis are fixed locally.**
+- **Scratch aliases, heredocs, and copy sources are fixed locally.**
   ADR-0238 resolves chained `NAME="$VERLINPARK_SCRATCH/..."` aliases and
   `D=$(mktemp -d "$VERLINPARK_SCRATCH/...")`. ADR-0239 strips quoted heredoc
   bodies (fixture data is not a command), keeps unquoted bodies for the
   substitution scan, and skips `$()`/backtick substitutions as a unit so
-  `PYTHONPATH="$(pwd)" python3 ...` classifies as a workspace write. Unknown
-  variables, `$HOME`, traversal, and arbitrary host paths remain conservative.
-  Unit and contract tests cover the exact live-plan shape; a live plan has not
-  yet been rerun after this change.
+  `PYTHONPATH="$(pwd)" python3 ...` classifies as a workspace write. ADR-0240
+  treats `cp`/`install`/`ln` sources as reads and only the destination as a
+  write, so `cp -R app tests "$VERLINPARK_SCRATCH/..."` is not an out-of-scope
+  write; `mv` keeps the conservative all-args rule. Unknown variables, `$HOME`,
+  traversal, and arbitrary host paths remain conservative. A 200k live rerun
+  confirmed the heredoc/PYTHONPATH verification command is a workspace write
+  with no approval; it then failed honestly at the hard token cap before
+  commit, not through a false reserve pause. A 1M live run is the next check.
+  A subsequent 1M attempt surfaced the `cp` source/destination false positive
+  and was stopped before deciding its approval; ADR-0240 is unit-tested but has
+  not yet been exercised by a completed live run.
 - **Mid-plan pause/verification loss was not reproduced in the deterministic
   path.** `a_paused_plan_worker_still_verifies_and_merges_completed_work`
   pauses a two-task plan while a Worker is between its write and final turns,
