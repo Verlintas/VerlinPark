@@ -1449,8 +1449,8 @@ fn assess_shell_interpreter(
 fn assess_interpreter(
     name: &str,
     args: &[String],
-    cwd: &Path,
-    worktree: &Path,
+    _cwd: &Path,
+    _worktree: &Path,
 ) -> PermissionAssessment {
     if let Some(index) = args
         .iter()
