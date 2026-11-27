@@ -789,9 +789,9 @@ four-tier path with a deliberately non-human spatial output.
   remote helper, and CUSTOS binaries, ad-hoc signed. `scripts/verify-dmg.sh` /
   `just verify-dmg` verified its checksum, image, app/helper layout, packaged
   `vp`/`verlinpadd`/`custos`/`custosd` entrypoints, and code signature without
-  installing it. The final DMG was rebuilt after the Python-cache contract and
-  commit fixes and reverified; SHA-256
-  `21d1e6d4c4e806be943504004e9c24772bc18efada4c74cf510e9af76b96fe5c`.
+  installing it. The final DMG was rebuilt after the Python-cache and operator-owned turn
+  ceiling changes and reverified; SHA-256
+  `f100b461ee75b21dca2e444d0c1b21e914b6df32820d744174a1e1c2fc16a16e`.
   This is not Developer ID signing or notarization.
 - **A bad project entry could not be removed.** `project.remove` /
   `vp project-remove --yes` removes only an empty project (no sessions,
@@ -827,7 +827,7 @@ scale/soak evidence.
 
 | Check | Result |
 |---|---|
-| `cargo test -p vp-core --lib` | 2,728 passed / 0 failed / 2 ignored |
+| `cargo test -p vp-core --lib` | 2,729 passed / 0 failed / 2 ignored |
 | `cargo test -p vp-core --test secret_redaction` | 3 passed |
 | `cargo test -p vp-bench` | 164 passed / 1 ignored |
 | `cargo test -p vp-cli` | unit + integration suites passed |
@@ -839,7 +839,7 @@ scale/soak evidence.
 | `cargo clippy ... -D warnings` | passed |
 | `swiftformat --lint` | passed |
 | `just release-preflight full` | passed repeatedly, including after the final cache fixes |
-| `cargo test --workspace` | 4,809 passed / 0 failed / 6 ignored |
+| `cargo test --workspace` | 4,810 passed / 0 failed / 6 ignored |
 | `xcodebuild test` | 544 app + 132 helper passed |
 | `scripts/package-release.sh` | DMG created (universal, ad-hoc signed) |
 | `just verify-dmg` | checksum, image, helpers, layout, signature passed |
