@@ -386,7 +386,7 @@ final class AutoBudgetTests: XCTestCase {
         XCTAssertEqual(draft.validation()?.code, "INVALID_AUTO_BUDGET_POLICY")
 
         draft.pauseAtRatio = 0.05
-        draft.maxTurnsPerRun = 0
+        draft.maxTurnsPerRun = 201
         XCTAssertEqual(draft.validation()?.code, "INVALID_AUTO_BUDGET_POLICY")
     }
 
