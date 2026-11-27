@@ -56,7 +56,7 @@ first-run still needs a real-machine pass; and release signing/notarization plus
 a real CUSTOS ring install remain open.
 
 Repeated clean `just release-preflight full` runs on 2026-11-27 (final counts after cache fixes):
-4,813 Rust passed / 0 failed / 6 ignored; 544 app + 132 helper Swift tests
+4,831 Rust passed / 0 failed / 6 ignored; 544 app + 132 helper Swift tests
 passed; backup/restore drill, `vp bench scale`, `vp bench fault`, and release
 binaries passed.
 

@@ -823,11 +823,11 @@ harness does not replace live multi-Worker, merge-conflict, daemon restart, or
 72-hour soak evidence. The live DeepSeek run is one small session, not that
 scale/soak evidence.
 
-### Evidence run (2026-11-27)
+### Evidence run (2026-11-28)
 
 | Check | Result |
 |---|---|
-| `cargo test -p vp-core --lib` | 2,732 passed / 0 failed / 2 ignored |
+| `cargo test -p vp-core --lib` | 2,750 passed / 0 failed / 2 ignored |
 | `cargo test -p vp-core --test secret_redaction` | 3 passed |
 | `cargo test -p vp-bench` | 164 passed / 1 ignored |
 | `cargo test -p vp-cli` | unit + integration suites passed |
@@ -838,8 +838,8 @@ scale/soak evidence.
 | `vp bench fault` | PASS, 5/5 cases, 3 real fake-provider runtime cases |
 | `cargo clippy ... -D warnings` | passed |
 | `swiftformat --lint` | passed |
-| `just release-preflight full` | passed repeatedly, including after the final cache fixes |
-| `cargo test --workspace` | 4,813 passed / 0 failed / 6 ignored |
+| `just release-preflight full` | passed repeatedly, including after the shell-analysis fixes |
+| `cargo test --workspace` | 4,831 passed / 0 failed / 6 ignored |
 | `xcodebuild test` | 544 app + 132 helper passed |
 | `scripts/package-release.sh` | DMG created (universal, ad-hoc signed) |
 | `just verify-dmg` | checksum, image, helpers, layout, signature passed |
