@@ -208,6 +208,7 @@ pub mod tools;
 pub mod worktree;
 
 mod shell_alias;
+mod shell_text;
 
 mod engine;
 

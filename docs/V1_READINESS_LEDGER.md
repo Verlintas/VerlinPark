@@ -915,14 +915,15 @@ This is partial evidence, not a clean two-task merge:
     ancestor directory of an allowed path.
   - Worker commit/scope checks ignore generated Python caches; `git add` no
     longer stages them, so a test-generated `.pyc` cannot fail integration.
-- **Simple scratch aliases are resolved, but heredoc/command-substitution
-  analysis remains open.** ADR-0238 resolves chained `NAME="$VERLINPARK_SCRATCH/..."`
-  aliases and `D=$(mktemp -d "$VERLINPARK_SCRATCH/...")` before permission/
-  contract analysis. Unknown variables, `$HOME`, traversal, and arbitrary host
-  paths remain conservative. A follow-up live plan still hit
-  `shell expansion hides the command name` for heredoc/`PYTHONPATH="$(pwd)"`
-  verification commands, so those produce host-state approvals and are not
-  claimed fixed.
+- **Scratch aliases and heredoc/substitution analysis are fixed locally.**
+  ADR-0238 resolves chained `NAME="$VERLINPARK_SCRATCH/..."` aliases and
+  `D=$(mktemp -d "$VERLINPARK_SCRATCH/...")`. ADR-0239 strips quoted heredoc
+  bodies (fixture data is not a command), keeps unquoted bodies for the
+  substitution scan, and skips `$()`/backtick substitutions as a unit so
+  `PYTHONPATH="$(pwd)" python3 ...` classifies as a workspace write. Unknown
+  variables, `$HOME`, traversal, and arbitrary host paths remain conservative.
+  Unit and contract tests cover the exact live-plan shape; a live plan has not
+  yet been rerun after this change.
 - **Still open**: a mid-plan completion-reserve pause followed by resume
   returned the session to idle without creating a Verifier/Integrator for
   already-completed tasks. The legacy hidden 20-turn cap was removed in

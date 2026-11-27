@@ -1649,8 +1649,9 @@ fn analyze_shell_inner(
         analysis.ambiguous = true;
         return analysis;
     }
-    let aliases = crate::shell_alias::scratch_aliases(command);
-    let expanded = crate::shell_alias::expand_scratch_aliases(command, &aliases);
+    let stripped = crate::shell_text::strip_heredoc_bodies(command);
+    let aliases = crate::shell_alias::scratch_aliases(&stripped);
+    let expanded = crate::shell_alias::expand_scratch_aliases(&stripped, &aliases);
     let trimmed = expanded.trim();
     if trimmed.is_empty() {
         analysis.ambiguous = true;
@@ -2882,6 +2883,13 @@ mod tests {
         );
         assert!(!alias.destructive, "{alias:?}");
         assert!(!alias.writes_outside_scope, "{alias:?}");
+        let heredoc = analyze_shell_command(
+            "cat > \"$VERLINPARK_SCRATCH/test_ok.py\" <<'EOF'\nrm -rf /etc\nself.assertEqual(\"x\", \"y\")\nEOF\nPYTHONPATH=\"$(pwd)\" python3 \"$VERLINPARK_SCRATCH/test_ok.py\"\n",
+            &contract,
+            worktree,
+        );
+        assert!(!heredoc.destructive, "{heredoc:?}");
+        assert!(!heredoc.writes_outside_scope, "{heredoc:?}");
     }
 
     #[test]

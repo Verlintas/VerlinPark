@@ -589,8 +589,11 @@ fn assess_shell_from(command: &str, start_cwd: &Path, worktree: &Path) -> Permis
     if original.is_empty() {
         return PermissionAssessment::new(RiskLevel::ReadOnly, "empty shell command");
     }
-    let aliases = crate::shell_alias::scratch_aliases(original);
-    let expanded = crate::shell_alias::expand_scratch_aliases(original, &aliases);
+    // Heredoc bodies are data, not shell commands. Quoted delimiters never
+    // expand; unquoted bodies are still scanned for command substitutions.
+    let stripped = crate::shell_text::strip_heredoc_bodies(original);
+    let aliases = crate::shell_alias::scratch_aliases(&stripped);
+    let expanded = crate::shell_alias::expand_scratch_aliases(&stripped, &aliases);
     let trimmed = expanded.trim();
     if is_fork_bomb(trimmed) {
         return PermissionAssessment::blocked("fork bombs are never allowed");
@@ -631,7 +634,9 @@ fn assess_shell_from(command: &str, start_cwd: &Path, worktree: &Path) -> Permis
             pipeline_has_download = true;
         }
     }
-    for substitution in extract_substitutions(trimmed) {
+    let expansion = crate::shell_text::expansion_text(original);
+    let expansion = crate::shell_alias::expand_scratch_aliases(&expansion, &aliases);
+    for substitution in extract_substitutions(&expansion) {
         best = max_assessment(best, assess_shell_from(&substitution, start_cwd, worktree));
     }
     best
@@ -1592,11 +1597,19 @@ fn split_shell_segments(command: &str) -> Vec<ShellSegment> {
         }
         if let Some(active) = quote {
             if active == '"' && ch == '$' && chars.get(index + 1) == Some(&'(') {
+                if let Some(after) = skip_substitution(&chars, index + 2) {
+                    index = after;
+                    continue;
+                }
                 push_segment(&mut segments, &mut current, &mut next_pipe);
                 index += 2;
                 continue;
             }
             if active == '"' && ch == '`' {
+                if let Some(after) = skip_backtick(&chars, index + 1) {
+                    index = after;
+                    continue;
+                }
                 push_segment(&mut segments, &mut current, &mut next_pipe);
                 index += 1;
                 continue;
@@ -1619,9 +1632,19 @@ fn split_shell_segments(command: &str) -> Vec<ShellSegment> {
                 escaped = true;
                 current.push(ch);
             }
-            '`' => push_segment(&mut segments, &mut current, &mut next_pipe),
+            '`' => {
+                if let Some(after) = skip_backtick(&chars, index + 1) {
+                    index = after;
+                    continue;
+                }
+                push_segment(&mut segments, &mut current, &mut next_pipe);
+            }
             '(' | ')' => push_segment(&mut segments, &mut current, &mut next_pipe),
             '$' if chars.get(index + 1) == Some(&'(') => {
+                if let Some(after) = skip_substitution(&chars, index + 2) {
+                    index = after;
+                    continue;
+                }
                 push_segment(&mut segments, &mut current, &mut next_pipe);
                 index += 1;
             }
@@ -1657,6 +1680,72 @@ fn split_shell_segments(command: &str) -> Vec<ShellSegment> {
 struct ShellSegment {
     raw: String,
     pipe_from_previous: bool,
+}
+
+/// Skip a `$(...)` substitution body, respecting quotes and nested parens.
+/// The inner command is assessed separately by `extract_substitutions`; keeping
+/// it out of the outer segment avoids breaking quote state.
+fn skip_substitution(chars: &[char], start: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut index = start;
+    while index < chars.len() {
+        let ch = chars[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if let Some(active) = quote {
+            if ch == '\\' && active == '"' {
+                escaped = true;
+            } else if ch == active {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '\\' => escaped = true,
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(index + 1);
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Skip a backtick substitution body. Returns the index after the closing
+/// backtick. An unterminated substitution stays in the outer segment.
+fn skip_backtick(chars: &[char], start: usize) -> Option<usize> {
+    let mut escaped = false;
+    let mut index = start;
+    while index < chars.len() {
+        let ch = chars[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if ch == '`' {
+            return Some(index + 1);
+        }
+        index += 1;
+    }
+    None
 }
 
 fn push_segment(segments: &mut Vec<ShellSegment>, current: &mut String, next_pipe: &mut bool) {
@@ -1892,6 +1981,39 @@ mod tests {
             RiskLevel::WorkspaceWrite
         );
         assert!(shell("echo x > \"$HOME/verlinpark-check.txt\"").risk >= RiskLevel::HostState);
+    }
+
+    #[test]
+    fn quoted_substitutions_and_heredoc_data_do_not_hide_the_command() {
+        let assessment = shell(
+            "D=\"$VERLINPARK_SCRATCH/t2check\"; cat > \"$D/test_greet.py\" <<'EOF'\nimport unittest\nself.assertEqual(greet(\"World\"), \"Hello, World!\")\nEOF\nPYTHONPATH=\"$(pwd)\" python3 -m unittest discover -s \"$D\" -v\n",
+        );
+        assert_eq!(assessment.risk, RiskLevel::WorkspaceWrite, "{assessment:?}");
+        assert_eq!(
+            shell("PYTHONPATH=\"$(pwd)\" python3 -c \"print(1)\"").risk,
+            RiskLevel::WorkspaceWrite
+        );
+        assert_eq!(
+            shell("X=\"`pwd`\" python3 -c \"print(1)\"").risk,
+            RiskLevel::WorkspaceWrite
+        );
+    }
+
+    #[test]
+    fn unquoted_heredoc_substitutions_are_still_assessed() {
+        let assessment = shell("cat <<EOF\n$(rm -rf /)\nEOF\necho done\n");
+        assert!(
+            assessment.risk >= RiskLevel::HostState || assessment.blocked,
+            "{assessment:?}"
+        );
+    }
+
+    #[test]
+    fn quoted_heredoc_data_is_not_executed_as_commands() {
+        let assessment =
+            shell("cat > \"$VERLINPARK_SCRATCH/fixture.sh\" <<'EOF'\nrm -rf /\nsudo reboot\nEOF\n");
+        assert_eq!(assessment.risk, RiskLevel::WorkspaceWrite, "{assessment:?}");
+        assert!(!assessment.blocked, "{assessment:?}");
     }
 
     #[test]

@@ -464,9 +464,9 @@ Worker→Verifier→merge-queue→Integrator path and merged T2; T1 was verified
 blocked by scratch-probe effect receipts, and a retry exposed generated Python
 caches as a write-scope violation. In-worktree Python cache cleanup and commit
 staging were fixed and unit-tested. Mid-plan pause/resume verification loss,
-simple daemon-scratch aliases (including mktemp) are fixed (ADR-0238), while
-heredoc/`PYTHONPATH="$(pwd)"` shell-expansion approvals and mid-plan
-pause/resume remain open. Per-run turn ceilings are now
+simple daemon-scratch aliases (including mktemp) are fixed (ADR-0238) and
+heredoc/`PYTHONPATH="$(pwd)"` commands no longer trigger shell-expansion
+approvals (ADR-0239); mid-plan pause/resume remains open. Per-run turn ceilings are now
 operator-owned (default none), with budgets/no-progress/approvals/cancel as the
 normal bounds. The completion reserve is task-aware: running tasks can finish,
 pending critical-path p90 estimates drive the reserve, and missing estimates
