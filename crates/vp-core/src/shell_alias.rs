@@ -28,6 +28,10 @@ pub(crate) fn scratch_aliases(command: &str) -> HashMap<String, String> {
             continue;
         }
         let value = value.trim();
+        if let Some(scratch) = scratch_mktemp_substitution(value) {
+            aliases.insert(name.to_string(), scratch.to_string());
+            continue;
+        }
         let value = unquote(value);
         let mut resolved = value.to_string();
         for _ in 0..EXPANSION_ROUNDS {
@@ -112,6 +116,23 @@ fn is_shell_variable(value: &str) -> bool {
         && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
+fn scratch_mktemp_substitution(value: &str) -> Option<&'static str> {
+    let lower = value.to_ascii_lowercase();
+    if !lower.starts_with("$(") || !lower.contains("mktemp") {
+        return None;
+    }
+    [
+        "$VERLINPARK_SCRATCH",
+        "${VERLINPARK_SCRATCH}",
+        "$VERLINPARK_WORKTREE",
+        "${VERLINPARK_WORKTREE}",
+        "$TMPDIR",
+        "${TMPDIR}",
+    ]
+    .into_iter()
+    .find(|prefix| value.contains(prefix))
+}
+
 fn is_scratch_root(value: &str) -> bool {
     [
         "$VERLINPARK_SCRATCH",
@@ -152,5 +173,18 @@ mod tests {
         let aliases = scratch_aliases(command);
         assert!(aliases.is_empty());
         assert_eq!(expand_scratch_aliases(command, &aliases), command);
+    }
+
+    #[test]
+    fn resolves_mktemp_scratch_command_substitution() {
+        let command =
+            "D=$(mktemp -d \"$VERLINPARK_SCRATCH/check.XXXXXX\"); cp app/x.py \"$D/x.py\"";
+        let aliases = scratch_aliases(command);
+        assert_eq!(
+            aliases.get("D").map(String::as_str),
+            Some("$VERLINPARK_SCRATCH")
+        );
+        let expanded = expand_scratch_aliases(command, &aliases);
+        assert!(expanded.contains("cp app/x.py \"$VERLINPARK_SCRATCH/x.py\""));
     }
 }

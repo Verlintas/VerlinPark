@@ -166,7 +166,9 @@ blocked by effect receipts from scratch probes, and a retry exposed generated
 Worker commit/scope checks now treat in-worktree Python cache cleanup and
 generated caches as sandbox-local rather than destructive or task output.
 Mid-plan pause/resume losing verification remains open; simple scratch
-shell aliases are now resolved before permission/contract analysis (ADR-0238). Per-run turn ceilings are now opt-in (`VERLINPARK_MAX_TURNS`,
+shell aliases (including mktemp under scratch) are resolved before
+permission/contract analysis (ADR-0238); heredoc/`PYTHONPATH="$(pwd)"` commands
+still trigger host-state shell-expansion approvals. Per-run turn ceilings are now opt-in (`VERLINPARK_MAX_TURNS`,
 `runtime-config-set --max-turns`, or Auto Budget); there is no hidden default.
 The completion reserve is task-aware (ADR-0237): running tasks can finish, and
 pending critical-path p90 estimates drive the reserve; missing estimates or a

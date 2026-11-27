@@ -87,9 +87,10 @@ and a GNU-style operator question worked, but the Leader hit a legacy 20-turn ca
 write-scope violation. Fixed and unit-tested: contract shell analysis now treats
 in-worktree `__pycache__`/`.pytest_cache`/`.pyc` cleanup as a
 workspace write and permits ancestor `mkdir`; Worker commit/scope checks ignore
-generated Python caches and do not stage them. Scratch alias approvals/unknown effects are fixed for simple aliases rooted
-in the daemon scratch/worktree/TMPDIR paths (ADR-0238). Still open: mid-plan
-pause/resume skipping Verifier for already-completed tasks. Turn ceilings are
+generated Python caches and do not stage them. Simple scratch aliases (including `mktemp -d` under scratch) are fixed (ADR-0238),
+but heredoc/`PYTHONPATH="$(pwd)"` verification commands still trigger
+host-state shell-expansion approvals. Still open: mid-plan pause/resume skipping
+Verifier for already-completed tasks. Turn ceilings are
 now operator-owned (default none) rather than a hidden constant. Completion
 reserve is now task-aware (ADR-0237): running tasks are not interrupted,
 pending critical-path p90 estimates drive the reserve, and missing estimates or
