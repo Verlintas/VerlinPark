@@ -246,6 +246,7 @@
 | [0240](adr/0240-copy-source-shell-scope.md) | `cp`/`install`/`ln` write only their destination; earlier arguments are read-only sources, while `mv` keeps the conservative all-args rule | Accepted (2026-11-28) | Security/Shell/Tooling |
 | [0241](adr/0241-find-root-shell-scope.md) | `find` roots are traversal scopes, not writes; `-exec` is assessed through the existing shell analyzer and `-delete` is a sandbox-confined write, while outside roots still escalate | Accepted (2026-11-28) | Security/Shell/Tooling |
 | [0242](adr/0242-redirection-token-shell-analysis.md) | Shell redirection operators/targets are removed from contract argument checks; the separate redirect audit still enforces scope | Accepted (2026-11-28) | Security/Shell/Tooling |
+| [0243](adr/0243-function-call-parentheses-shell.md) | Parentheses split shell segments only at a real boundary; function-call syntax in interpreter `-c` code is not misread as a command | Accepted (2026-11-28) | Security/Shell/Tooling |
 
 ---
 

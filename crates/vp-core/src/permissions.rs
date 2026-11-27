@@ -1671,7 +1671,22 @@ fn split_shell_segments(command: &str) -> Vec<ShellSegment> {
                 }
                 push_segment(&mut segments, &mut current, &mut next_pipe);
             }
-            '(' | ')' => push_segment(&mut segments, &mut current, &mut next_pipe),
+            '(' | ')' => {
+                // Parentheses start a shell segment only at a real boundary
+                // (start of input, whitespace, or an operator). A function
+                // call such as `print(repr(open(...)))` inside `python3 -c`
+                // must not turn `open` into a command and request host-state
+                // approval for opening an application.
+                let at_boundary = current.trim().is_empty()
+                    || current.chars().next_back().is_some_and(|last| {
+                        last.is_whitespace() || matches!(last, ';' | '|' | '&')
+                    });
+                if at_boundary {
+                    push_segment(&mut segments, &mut current, &mut next_pipe);
+                } else {
+                    current.push(ch);
+                }
+            }
             '$' if chars.get(index + 1) == Some(&'(') => {
                 if let Some(after) = skip_substitution(&chars, index + 2) {
                     index = after;
@@ -2076,6 +2091,26 @@ mod tests {
         assert!(
             nested.blocked || nested.risk >= RiskLevel::Destructive,
             "{nested:?}"
+        );
+    }
+
+    #[test]
+    fn interpreter_function_calls_are_not_shell_commands() {
+        assert_eq!(
+            shell("python3 -c \"print(repr(open('app/greet.py','rb').read()))\"").risk,
+            RiskLevel::WorkspaceWrite
+        );
+        assert_eq!(
+            shell("python3 -c \"print(repr(open('app/greet.py','rb').read())); print('ok')\"").risk,
+            RiskLevel::WorkspaceWrite
+        );
+        assert_eq!(
+            shell("python3 -c \"import os; os.system('id')\"").risk,
+            RiskLevel::HostState
+        );
+        assert_eq!(
+            shell("( cd \"$VERLINPARK_SCRATCH\" && rm -rf app/__pycache__ )").risk,
+            RiskLevel::WorkspaceWrite
         );
     }
 

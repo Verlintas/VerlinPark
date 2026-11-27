@@ -939,7 +939,9 @@ This is partial evidence, not a clean two-task merge:
   `2>&1` as a path target; ADR-0242 strips redirection tokens from contract
   argument checks while the separate redirect audit still enforces scope. The
   next attempt used `D=$(mktemp -d)` without a template; plain `mktemp` now
-  resolves to the exported `$TMPDIR` (ADR-0238 follow-up).
+  resolves to the exported `$TMPDIR` (ADR-0238 follow-up). A later attempt
+  surfaced `python3 -c "print(repr(open(...)))"` being misread as the `open`
+  host launcher; ADR-0243 now splits parentheses only at shell boundaries.
 - **Mid-plan pause/verification loss was not reproduced in the deterministic
   path.** `a_paused_plan_worker_still_verifies_and_merges_completed_work`
   pauses a two-task plan while a Worker is between its write and final turns,
