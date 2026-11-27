@@ -492,7 +492,7 @@ fn build_agent_config(
         model: model.clone(),
         role_models,
         base_url: None,
-        max_turns: config.max_turns,
+        max_turns: Some(config.max_turns),
         max_tokens: Some(2_048),
         max_managers: 3,
         max_workers: config.max_workers,

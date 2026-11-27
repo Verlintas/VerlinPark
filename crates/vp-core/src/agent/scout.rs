@@ -264,11 +264,14 @@ pub(super) async fn run_scout(
     .await?;
     // Never raise the configured global turn limit; `max_steps` can only
     // narrow the Scout's run.
-    let scout_turns = config.max_turns.min(request.max_steps);
+    let scout_turns = config
+        .max_turns
+        .map(|limit| limit.min(request.max_steps))
+        .unwrap_or(request.max_steps);
     let brief = scout_brief(parent, &request, scout_turns);
     let mut conversation = vec![ChatMessage::user(brief.clone())];
     let mut scout_config = config.clone();
-    scout_config.max_turns = scout_turns;
+    scout_config.max_turns = Some(scout_turns);
     let result = run_loop(
         engine,
         &scout_config,

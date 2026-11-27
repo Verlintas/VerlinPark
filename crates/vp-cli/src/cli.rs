@@ -826,7 +826,7 @@ pub(crate) enum Command {
         /// Model context window in tokens; 0 disables automatic management.
         #[arg(long)]
         context_window: Option<u64>,
-        /// Maximum provider turns per run (1-200).
+        /// Maximum provider turns per run (0 disables, otherwise 1-200).
         #[arg(long)]
         max_turns: Option<u32>,
         /// Per-response output token limit (256-65536).

@@ -201,7 +201,7 @@ pub struct AgentConfig {
     pub model: String,
     pub role_models: RoleModels,
     pub base_url: Option<String>,
-    pub max_turns: u32,
+    pub max_turns: Option<u32>,
     pub max_tokens: Option<u32>,
     pub max_managers: usize,
     pub max_workers: usize,

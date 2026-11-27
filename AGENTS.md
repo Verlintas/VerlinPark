@@ -165,8 +165,9 @@ blocked by effect receipts from scratch probes, and a retry exposed generated
 `__pycache__/*.pyc` as a write-scope violation. Contract shell analysis and
 Worker commit/scope checks now treat in-worktree Python cache cleanup and
 generated caches as sandbox-local rather than destructive or task output.
-Mid-plan pause/resume losing verification, scratch-variable approval loops, and
-the low default Leader turn cap remain open.
+Mid-plan pause/resume losing verification and scratch-variable approval loops
+remain open. Per-run turn ceilings are now opt-in (`VERLINPARK_MAX_TURNS`,
+`runtime-config-set --max-turns`, or Auto Budget); there is no hidden default.
 
 ## Commands
 

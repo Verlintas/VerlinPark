@@ -896,7 +896,7 @@ mod tool_surface_tests {
             model: "test-model".into(),
             role_models: RoleModels::default(),
             base_url: None,
-            max_turns: 4,
+            max_turns: Some(4),
             max_tokens: Some(1024),
             max_managers: 5,
             max_workers: 10,

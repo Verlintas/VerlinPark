@@ -1,6 +1,6 @@
 # VerlinPark 决策记录
 
-> 最后更新：2026-11-26
+> 最后更新：2026-11-27
 > 格式：Architecture Decision Record（ADR）  
 > 规则：已接受的决策不删除；如果改变，新增一条“Supersedes”记录。
 
@@ -239,6 +239,7 @@
 | [0233](adr/0233-non-destructive-provider-reconnect.md) | Non-destructive provider reconnect: apply stored client provider only when the daemon is unconfigured or the provider identity matches; a mismatch requires an explicit Settings save | Accepted (2026-11-23) | Client/Provider/Data safety |
 | [0234](adr/0234-run-contract-and-anytime-execution.md) | Run Contract + anytime execution: multi-resource governor (money/time/attention/risk/context/capacity/quality/progress), profiles, completion reserve, evidence-driven stopping, partial delivery, R3a allocation preview + one-shot auto rescue, R3b opt-in runtime envelope reallocation + explicit validated envelope persistence + opt-in pre-run auto-persist + opt-in cross-department sources, R4a trade-off/quality preview, no hidden routing or gate bypass | Accepted (2026-11-24, R3a/R3b/R4a 2026-11-25); automatic reallocation with reservation semantics/daily attention schedule open | Runtime/Resource Governance/Quality |
 | [0235](adr/0235-custos-observe-only-foundation.md) | CUSTOS observe-only foundation: separate `vp-custos` crate, `custosd` + `custos`, 0600 Unix socket, read-only SQLite probes, pinned draft charter, capacity/score/ring modules, launchd installer/watchdog, local diagnostic bundles, normal SwiftUI window with ASCII wordmark only, no mutation/agent surface | Accepted (2026-11-26); real ring install/verification, notices, signed vault, and L2–L4 actions open | Guardian/Security/Observability |
+| [0236](adr/0236-operator-owned-turn-budget.md) | Per-run turn ceiling is operator-owned (`Option<u32>`, default none); explicit env/CLI/Auto policy only, with budgets/no-progress/approvals/cancel as normal bounds | Accepted (2026-11-27) | Runtime/Budget/Reliability |
 
 ---
 

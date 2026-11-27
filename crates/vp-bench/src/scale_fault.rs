@@ -1032,7 +1032,7 @@ impl FaultRig {
                 scout: role,
             },
             base_url: None,
-            max_turns: 8,
+            max_turns: Some(8),
             max_tokens: Some(1_024),
             max_managers: 1,
             max_workers: 1,

@@ -138,7 +138,7 @@ fn test_service_with_provider_cap(
         model: "test".into(),
         role_models: RoleModels::default(),
         base_url: None,
-        max_turns: 4,
+        max_turns: Some(4),
         max_tokens: Some(1024),
         max_managers: 5,
         max_workers: 10,
@@ -3983,7 +3983,7 @@ async fn injects_a_finalize_nudge_before_the_turn_limit() {
     let (engine, service, project) = test_service_with_provider(&dir, provider);
     {
         let mut config = service.config.read().unwrap().as_ref().unwrap().clone();
-        config.max_turns = 8;
+        config.max_turns = Some(8);
         *service.config.write().unwrap() = Some(config);
     }
     let session = engine
@@ -14567,7 +14567,7 @@ fn leader_config(dir: &TempDir) -> AgentConfig {
         model: "test".into(),
         role_models: RoleModels::default(),
         base_url: None,
-        max_turns: 1,
+        max_turns: Some(1),
         max_tokens: Some(128),
         max_managers: 1,
         max_workers: 1,
@@ -19134,7 +19134,7 @@ fn configured_service_for_test(
         model: "test".into(),
         role_models: RoleModels::default(),
         base_url: None,
-        max_turns: 4,
+        max_turns: Some(4),
         max_tokens: Some(1024),
         max_managers: 5,
         max_workers: 10,

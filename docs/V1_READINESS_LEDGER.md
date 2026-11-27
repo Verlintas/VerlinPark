@@ -906,7 +906,7 @@ This is partial evidence, not a clean two-task merge:
   (`60d4a32`) with the correct `app/calc.py` diff, but integration was blocked
   by `EFFECT_UNKNOWN` receipts from approved scratch shell probes. The Leader
   asked the operator with bounded options; effect reconciliation and an answer
-  were recorded, then the Leader hit its **20-turn cap** before retrying T1.
+  were recorded, then the Leader hit a legacy **20-turn cap** before retrying T1. That hidden default is now removed; turn ceilings are opt-in.
 - A fresh T1 retry exposed generated `app/__pycache__/calc*.pyc` as a
   write-scope violation. Two bounded fixes were added and unit-tested:
   - Contract shell analysis no longer treats `rm -rf` of `__pycache__` /
@@ -919,7 +919,8 @@ This is partial evidence, not a clean two-task merge:
   (`SCRATCH="$VERLINPARK_SCRATCH/..."`) still trigger host-state approvals and
   `EFFECT_UNKNOWN` receipts; a mid-plan completion-reserve pause followed by
   resume returned the session to idle without creating a Verifier/Integrator
-  for already-completed tasks; and the default 20-turn Leader cap is too low
-  for a two-task plan with operator reconciliation.
+  for already-completed tasks. The legacy hidden 20-turn cap was removed in
+  ADR-0236: per-run ceilings are now operator-owned (`VERLINPARK_MAX_TURNS`,
+  `runtime-config-set --max-turns`, or Auto Budget) and default to none.
 - The plan run used the live key in the daemon environment only; the key was
   never stored in the repo or session data.

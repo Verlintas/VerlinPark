@@ -628,14 +628,19 @@ pub(in crate::agent) async fn run_loop_body(
     // child runtimes are request-fit only.
     let owns_turns = top_level && spec.role == AgentRole::Leader;
     let mut auto_budget = AutoBudgetRuntime::load_for(engine, session, owns_turns).await?;
-    let max_turns = if owns_turns {
+    let explicit_max_turns = if owns_turns {
         auto_budget
             .as_ref()
             .map(AutoBudgetRuntime::per_run_turn_limit)
-            .unwrap_or(config.max_turns)
+            .or(config.max_turns)
     } else {
         config.max_turns
     };
+    // No hidden turn ceiling. A normal plan is bounded by its session
+    // token/cost/time budgets, no-progress policy, approvals, and operator
+    // cancellation. `u32::MAX` is only the loop-shape sentinel; an explicit
+    // operator/Auto-Budget limit still drives the finalize window below.
+    let max_turns = explicit_max_turns.unwrap_or(u32::MAX);
     let mut tool_failure_guard = ToolFailureGuard::default();
     // A provider output-token cap is a formatting failure, not a task failure.
     // Give the model a bounded chance to split the same work into smaller tool
@@ -1072,15 +1077,18 @@ pub(in crate::agent) async fn run_loop_body(
         // Reserve the last few turns for a durable commit instead of letting a
         // Worker discover the max-turn cliff after every file is already written.
         // The message is persisted so a later resume sees the same instruction.
-        let finalize_reserve = (max_turns / 5).clamp(3, 6);
+        let finalize_reserve = explicit_max_turns
+            .map(|limit| (limit / 5).clamp(3, 6))
+            .unwrap_or(0);
         let can_commit = matches!(
             spec.role,
             AgentRole::Leader | AgentRole::Worker | AgentRole::Labour
         );
-        if can_commit
+        if let Some(limit) = explicit_max_turns
+            && can_commit
             && !finalize_nudged
-            && max_turns > finalize_reserve + 2
-            && turn + finalize_reserve >= max_turns
+            && limit > finalize_reserve + 2
+            && turn + finalize_reserve >= limit
         {
             let notice = "RUNTIME FINALIZE WINDOW: you are near the turn limit. Stop new exploration. Preserve completed work now: run only the bounded check, commit the files you have already written inside the task write scope, and return a concise final status. Do not start a new design or another browser-testing loop.";
             emit(
@@ -1090,7 +1098,7 @@ pub(in crate::agent) async fn run_loop_body(
                 "agent.finalize_nudge",
                 serde_json::json!({
                     "turn": turn + 1,
-                    "max_turns": max_turns,
+                    "max_turns": limit,
                     "reserve": finalize_reserve,
                 }),
             )

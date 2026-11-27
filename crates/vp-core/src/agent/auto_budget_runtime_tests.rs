@@ -123,7 +123,7 @@ async fn harness_with_delay(
         model: "test".into(),
         role_models: RoleModels::default(),
         base_url: None,
-        max_turns,
+        max_turns: Some(max_turns),
         max_tokens: Some(1024),
         max_managers: 5,
         max_workers: 10,

@@ -18,6 +18,17 @@ fn resolve_approval_mode(value: Option<&str>) -> ApprovalMode {
     }
 }
 
+/// Turn ceilings are operator policy, not a hidden default. `None` leaves the
+/// loop bounded by the session's token/cost/time budgets, no-progress policy,
+/// approvals, and cancellation. Explicit env/CLI/Auto-Budget values still
+/// clamp to 1..=200; `0` disables the ceiling explicitly.
+fn max_turns_from_env(value: Option<String>) -> Option<u32> {
+    value
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.clamp(1, 200))
+}
+
 fn approval_mode_from_env() -> ApprovalMode {
     match env::var("VERLINPARK_APPROVAL_MODE") {
         Ok(value) => resolve_approval_mode(Some(&value)),
@@ -93,10 +104,7 @@ impl AgentService {
                 model,
                 role_models: RoleModels::default(),
                 base_url: Some(base_url),
-                max_turns: env::var("VERLINPARK_MAX_TURNS")
-                    .ok()
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(20),
+                max_turns: max_turns_from_env(env::var("VERLINPARK_MAX_TURNS").ok()),
                 max_tokens: env::var("VERLINPARK_MAX_TOKENS")
                     .ok()
                     .and_then(|value| value.parse().ok())
@@ -218,7 +226,7 @@ impl AgentService {
             model,
             role_models: params.role_models.unwrap_or_default(),
             base_url: Some(base_url),
-            max_turns: params.max_turns.unwrap_or(20).clamp(1, 200),
+            max_turns: params.max_turns.map(|value| value.clamp(1, 200)),
             max_tokens: params.max_tokens.or(Some(4096)),
             max_managers: params.max_managers.unwrap_or(5).clamp(1, 5) as usize,
             max_workers: params.max_workers.unwrap_or(10).clamp(1, 10) as usize,
@@ -304,7 +312,7 @@ impl AgentService {
                 config.context_window = context_window.min(10_000_000);
             }
             if let Some(max_turns) = max_turns {
-                config.max_turns = max_turns.clamp(1, 200);
+                config.max_turns = (max_turns > 0).then(|| max_turns.clamp(1, 200));
             }
             if let Some(max_tokens) = max_tokens {
                 config.max_tokens = Some(max_tokens.clamp(256, 65_536));
@@ -685,5 +693,19 @@ mod provider_preflight_tests {
         ));
         assert!(!super::provider_env_is_usable(None, None));
         assert!(super::provider_env_is_usable(None, Some("key")));
+    }
+}
+
+#[cfg(test)]
+mod turn_budget_tests {
+    use super::max_turns_from_env;
+
+    #[test]
+    fn turn_budget_is_opt_in_and_explicitly_bounded() {
+        assert_eq!(max_turns_from_env(None), None);
+        assert_eq!(max_turns_from_env(Some("8".into())), Some(8));
+        assert_eq!(max_turns_from_env(Some("0".into())), None);
+        assert_eq!(max_turns_from_env(Some("999".into())), Some(200));
+        assert_eq!(max_turns_from_env(Some("bogus".into())), None);
     }
 }
