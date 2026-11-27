@@ -935,7 +935,9 @@ This is partial evidence, not a clean two-task merge:
   host-state write; ADR-0241 now treats the find root as a traversal scope,
   assesses `-exec` through the normal shell analyzer, and keeps outside roots
   escalated. That fix is unit-tested; the completed live rerun is still
-  pending.
+  pending. The next 1M attempt then surfaced `rm ... 2>&1` being parsed with
+  `2>&1` as a path target; ADR-0242 strips redirection tokens from contract
+  argument checks while the separate redirect audit still enforces scope.
 - **Mid-plan pause/verification loss was not reproduced in the deterministic
   path.** `a_paused_plan_worker_still_verifies_and_merges_completed_work`
   pauses a two-task plan while a Worker is between its write and final turns,

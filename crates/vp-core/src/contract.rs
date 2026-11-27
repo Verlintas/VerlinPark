@@ -1661,7 +1661,7 @@ fn analyze_shell_inner(
         analysis.ambiguous = true;
     }
     for segment in split_shell_segments(trimmed) {
-        let words = shell_words(&segment);
+        let words = strip_shell_redirections(shell_words(&segment));
         if words.is_empty() {
             continue;
         }
@@ -2071,6 +2071,45 @@ fn is_assignment(word: &str) -> bool {
 
 fn basename(value: &str) -> String {
     value.rsplit('/').next().unwrap_or(value).to_string()
+}
+
+/// Remove redirection operators and their targets from command words. The
+/// separate `redirection_target` audit still checks where `>` writes. Without
+/// this, `2>&1` was treated as a path argument and made
+/// `rm -rf app/__pycache__ tests/__pycache__ 2>&1` look out of scope.
+fn strip_shell_redirections(words: Vec<String>) -> Vec<String> {
+    let mut stripped = Vec::with_capacity(words.len());
+    let mut index = 0;
+    while index < words.len() {
+        let word = &words[index];
+        if is_bare_redirection(word) {
+            index += 2;
+            continue;
+        }
+        if is_inline_redirection(word) {
+            index += 1;
+            continue;
+        }
+        stripped.push(word.clone());
+        index += 1;
+    }
+    stripped
+}
+
+fn is_bare_redirection(word: &str) -> bool {
+    let rest = word.trim_start_matches(|ch: char| ch.is_ascii_digit());
+    matches!(rest, ">" | ">>" | "<" | "<<" | "&>" | "&>>")
+}
+
+fn is_inline_redirection(word: &str) -> bool {
+    let rest = word.trim_start_matches(|ch: char| ch.is_ascii_digit());
+    if is_bare_redirection(rest) {
+        return false;
+    }
+    rest.starts_with('>')
+        || rest.starts_with('<')
+        || rest.starts_with("&>")
+        || rest.starts_with("&<")
 }
 
 fn redirection_target(segment: &str) -> Option<String> {
@@ -2934,6 +2973,23 @@ mod tests {
         );
         assert!(!heredoc.destructive, "{heredoc:?}");
         assert!(!heredoc.writes_outside_scope, "{heredoc:?}");
+    }
+
+    #[test]
+    fn rm_python_caches_outside_the_declared_scope_is_not_a_scope_violation() {
+        let contract = derive_contract(derivation(vec![
+            "app/calc.py".into(),
+            "tests/test_calc.py".into(),
+        ]))
+        .unwrap();
+        let worktree = Path::new(".");
+        let analysis = analyze_shell_command(
+            "rm -rf app/__pycache__ tests/__pycache__ 2>&1; echo \"EXIT=$?\"; git status --porcelain --ignored",
+            &contract,
+            worktree,
+        );
+        assert!(!analysis.destructive, "{analysis:?}");
+        assert!(!analysis.writes_outside_scope, "{analysis:?}");
     }
 
     #[test]
