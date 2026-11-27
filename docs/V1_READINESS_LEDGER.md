@@ -789,7 +789,8 @@ four-tier path with a deliberately non-human spatial output.
   remote helper, and CUSTOS binaries, ad-hoc signed. `scripts/verify-dmg.sh` /
   `just verify-dmg` verified its checksum, image, app/helper layout, packaged
   `vp`/`verlinpadd`/`custos`/`custosd` entrypoints, and code signature without
-  installing it. This is not Developer ID signing or notarization.
+  installing it. The final DMG was rebuilt after the Python-cache contract and
+  commit fixes and reverified. This is not Developer ID signing or notarization.
 - **A bad project entry could not be removed.** `project.remove` /
   `vp project-remove --yes` removes only an empty project (no sessions,
   identities, workspaces, or intake tasks), refuses without explicit
