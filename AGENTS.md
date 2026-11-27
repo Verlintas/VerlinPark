@@ -168,6 +168,9 @@ generated caches as sandbox-local rather than destructive or task output.
 Mid-plan pause/resume losing verification and scratch-variable approval loops
 remain open. Per-run turn ceilings are now opt-in (`VERLINPARK_MAX_TURNS`,
 `runtime-config-set --max-turns`, or Auto Budget); there is no hidden default.
+The completion reserve is task-aware (ADR-0237): running tasks can finish, and
+pending critical-path p90 estimates drive the reserve; missing estimates or a
+plan-less session fall back to the proportional guard.
 
 ## Commands
 

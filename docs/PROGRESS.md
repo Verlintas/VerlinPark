@@ -89,7 +89,10 @@ in-worktree `__pycache__`/`.pytest_cache`/`.pyc` cleanup as a
 workspace write and permits ancestor `mkdir`; Worker commit/scope checks ignore
 generated Python caches and do not stage them. Still open: scratch-variable alias approvals/unknown effects and mid-plan
 pause/resume skipping Verifier for already-completed tasks. Turn ceilings are
-now operator-owned (default none) rather than a hidden constant.
+now operator-owned (default none) rather than a hidden constant. Completion
+reserve is now task-aware (ADR-0237): running tasks are not interrupted,
+pending critical-path p90 estimates drive the reserve, and missing estimates or
+plan-less sessions fall back to the proportional guard.
 
 ---
 

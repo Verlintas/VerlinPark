@@ -924,3 +924,13 @@ This is partial evidence, not a clean two-task merge:
   `runtime-config-set --max-turns`, or Auto Budget) and default to none.
 - The plan run used the live key in the daemon environment only; the key was
   never stored in the repo or session data.
+- **The completion reserve was blind to remaining work.** ADR-0237 makes it
+  task-aware: a session with no pending non-running task gets a zero
+  future-work reserve so the active task can finish; pending critical-path p90
+  estimates drive the token/cost reserve; missing estimates or no TeamPlan
+  fall back to the proportional reserve. The allocation preview is computed
+  only when the proportional rule would already pause, and decision details
+  expose the reserve source and p90. Tests:
+  `pending_critical_path_p90_can_drive_the_completion_reserve`,
+  `running_work_does_not_pause_on_the_completion_reserve`, and
+  `critical_path_p90_can_replace_or_tighten_the_proportional_reserve`.

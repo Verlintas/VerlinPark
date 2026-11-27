@@ -466,7 +466,9 @@ caches as a write-scope violation. In-worktree Python cache cleanup and commit
 staging were fixed and unit-tested. Mid-plan pause/resume verification loss,
 scratch-variable approval loops remain open. Per-run turn ceilings are now
 operator-owned (default none), with budgets/no-progress/approvals/cancel as the
-normal bounds. Native computer/Code Mode remain open S1 items, the live run is not a
+normal bounds. The completion reserve is task-aware: running tasks can finish,
+pending critical-path p90 estimates drive the reserve, and missing estimates
+fall back to the proportional guard (ADR-0237). Native computer/Code Mode remain open S1 items, the live run is not a
 10-Worker/soak proof, and Keychain/TCC first-run still needs a real-machine
 pass. In-run plan revision remains open.
 

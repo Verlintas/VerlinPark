@@ -13,8 +13,8 @@ use vp_protocol::types::{
     AutoBudgetCaps, AutoBudgetExtension, BudgetMode, MergeQueueEntry, ProjectRunPolicy,
     ReadinessSnapshot, ResourceAttention, ResourceCount, ResourceDimension, ResourceSnapshot,
     ResourceSoftTargets, RunContractOverride, RunContractView, SESSION_RESOURCE_DECISION_EVENT,
-    SESSION_RUN_CONTRACT_UPDATED_EVENT, SessionBudgetStatus, SetRunContractParams,
-    SetSessionBudgetParams, TopUpSessionResourcesParams,
+    SESSION_RUN_CONTRACT_UPDATED_EVENT, SessionAllocationParams, SessionBudgetStatus,
+    SetRunContractParams, SetSessionBudgetParams, TopUpSessionResourcesParams,
 };
 
 const READINESS_CACHE_TTL: Duration = Duration::from_secs(2);
@@ -31,6 +31,58 @@ const COMPLETION_RESERVE_COST_CAP_USD: f64 = 0.75;
 
 fn completion_reserve(hard: f64, ratio: f64, cap: f64) -> f64 {
     (hard * ratio).min(cap).max(0.0)
+}
+
+/// Optional critical-path-aware replacement for the proportional completion
+/// reserve. It is computed only when the proportional rule would already pause.
+#[derive(Debug, Clone, Copy, Default)]
+struct CompletionReserveOverride {
+    tokens: Option<f64>,
+    cost_usd: Option<f64>,
+    time_secs: Option<f64>,
+    /// `proportional`, `critical_path_p90`, or `critical_path_unavailable`.
+    source: &'static str,
+    p90_tokens: Option<u64>,
+    p90_cost_usd: Option<f64>,
+}
+
+fn pick_completion_reserve(proportional: f64, p90: Option<f64>) -> f64 {
+    p90.filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(proportional)
+}
+
+fn completion_reserve_under_pressure(
+    hard_caps: &AutoBudgetCaps,
+    dimensions: &[ResourceDimension],
+    ratio: f64,
+) -> bool {
+    if ratio <= 0.0 {
+        return false;
+    }
+    for (key, hard, cap) in [
+        (
+            "tokens",
+            hard_caps.token.map(|value| value as f64),
+            COMPLETION_RESERVE_TOKEN_CAP,
+        ),
+        (
+            "time",
+            hard_caps.wall_clock_secs.map(|value| value as f64),
+            COMPLETION_RESERVE_TIME_CAP_SECS,
+        ),
+        ("money", hard_caps.cost_usd, COMPLETION_RESERVE_COST_CAP_USD),
+    ] {
+        let Some(hard) = hard else { continue };
+        let Some(remaining) =
+            resource_dimension(dimensions, key).and_then(|dimension| dimension.remaining)
+        else {
+            continue;
+        };
+        if remaining < completion_reserve(hard, ratio, cap) {
+            return true;
+        }
+    }
+    false
 }
 
 fn readiness_cache_hit(cached: &CachedReadiness, seq: u64, now: Instant) -> bool {
@@ -748,6 +800,130 @@ impl Engine {
         }
     }
 
+    /// Compute a critical-path p90 replacement for the proportional completion
+    /// reserve only when that proportional rule would already pause. Missing
+    /// estimates or an unavailable path fall back to the proportional reserve.
+    async fn critical_path_completion_reserve(
+        &self,
+        session_id: &str,
+        hard_caps: &AutoBudgetCaps,
+        ratio: f64,
+        dimensions: &[ResourceDimension],
+        unlimited: bool,
+    ) -> CompletionReserveOverride {
+        let fallback = CompletionReserveOverride {
+            source: "proportional",
+            ..CompletionReserveOverride::default()
+        };
+        if unlimited
+            || ratio <= 0.0
+            || !completion_reserve_under_pressure(hard_caps, dimensions, ratio)
+        {
+            return fallback;
+        }
+        // A direct (no-plan) session still needs the proportional finalization
+        // reserve. Once a plan exists, only work that has not started needs a
+        // reserve; the currently running task must be allowed to reach a clean
+        // commit instead of being interrupted mid-edit.
+        let plan = match self.get_team_plan(session_id).await {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return fallback,
+            Err(error) => {
+                tracing::warn!(%error, session_id, "completion reserve plan probe failed; using proportional reserve");
+                return CompletionReserveOverride {
+                    source: "critical_path_unavailable",
+                    ..CompletionReserveOverride::default()
+                };
+            }
+        };
+        let queue = match self.task_queue(None, Some(session_id.to_string())).await {
+            Ok(queue) => queue.tasks,
+            Err(error) => {
+                tracing::warn!(%error, session_id, "completion reserve task probe failed; using proportional reserve");
+                return CompletionReserveOverride {
+                    source: "critical_path_unavailable",
+                    ..CompletionReserveOverride::default()
+                };
+            }
+        };
+        let has_running = queue.iter().any(|task| task.status == "running");
+        let pending = queue.iter().any(|task| {
+            task.status != "running" && crate::critical_path::is_remaining_status(&task.status)
+        });
+        if !pending {
+            return CompletionReserveOverride {
+                tokens: Some(0.0),
+                cost_usd: Some(0.0),
+                time_secs: None,
+                source: "no_pending_work",
+                p90_tokens: Some(0),
+                p90_cost_usd: Some(0.0),
+            };
+        }
+        let preview = match self
+            .session_allocation(SessionAllocationParams {
+                session_id: session_id.to_string(),
+            })
+            .await
+        {
+            Ok(preview) => preview,
+            Err(error) => {
+                tracing::warn!(%error, session_id, "critical-path reserve probe failed; using proportional reserve");
+                return CompletionReserveOverride {
+                    source: "critical_path_unavailable",
+                    ..CompletionReserveOverride::default()
+                };
+            }
+        };
+        let statuses = queue
+            .iter()
+            .map(|task| (task.task_id.clone(), task.status.clone()))
+            .collect::<HashMap<_, _>>();
+        let critical_available = preview.feasibility.critical_path_available;
+        let mut tokens = 0u64;
+        let mut token_complete = true;
+        let mut selected = 0usize;
+        for task in &preview.tasks {
+            let status = statuses
+                .get(&task.task_id)
+                .map(String::as_str)
+                .unwrap_or(task.status.as_str());
+            if status == "running" || !crate::critical_path::is_remaining_status(status) {
+                continue;
+            }
+            if critical_available && !task.critical_path {
+                continue;
+            }
+            selected += 1;
+            match task.p90_tokens.filter(|value| *value > 0) {
+                Some(value) => tokens = tokens.saturating_add(value),
+                None => token_complete = false,
+            }
+        }
+        if selected == 0 || !token_complete {
+            return CompletionReserveOverride {
+                source: "critical_path_unavailable",
+                ..CompletionReserveOverride::default()
+            };
+        }
+        // The plan object is intentionally only probed; task budgets and
+        // statuses are the source of truth. Keep the variable meaningful for
+        // future per-department reserve extensions.
+        let _ = plan;
+        let cost = (!has_running)
+            .then_some(preview.feasibility.p90_cost_usd)
+            .flatten()
+            .filter(|value| value.is_finite() && *value > 0.0);
+        CompletionReserveOverride {
+            tokens: Some(tokens as f64),
+            cost_usd: cost,
+            time_secs: None,
+            source: "critical_path_p90",
+            p90_tokens: Some(tokens),
+            p90_cost_usd: cost,
+        }
+    }
+
     /// Deterministic R2a resource guard. It never spends, approves, merges, or
     /// routes; it only returns a bounded decision for dispatch/turn boundaries.
     ///
@@ -782,6 +958,15 @@ impl Engine {
         } else {
             contract.completion_reserve_ratio
         };
+        let reserve_override = self
+            .critical_path_completion_reserve(
+                session_id,
+                &reserve_caps,
+                reserve_ratio,
+                &snapshot.dimensions,
+                unlimited,
+            )
+            .await;
         let inputs = ResourceGovernorInputs {
             profile: &contract.profile,
             attention_cap: contract.attention_cap,
@@ -789,6 +974,9 @@ impl Engine {
             completion_reserve_ratio: reserve_ratio,
             hard_caps: &reserve_caps,
             dimensions: &snapshot.dimensions,
+            token_reserve_override: reserve_override.tokens,
+            cost_reserve_override: reserve_override.cost_usd,
+            time_reserve_override: reserve_override.time_secs,
             readiness_blocked: snapshot
                 .readiness
                 .as_ref()
@@ -796,7 +984,7 @@ impl Engine {
             unlimited,
         };
         let (action, reason) = resource_governor_action(&inputs);
-        let details = resource_governor_details(
+        let mut details = resource_governor_details(
             phase,
             &contract.profile,
             snapshot.bottleneck.as_deref(),
@@ -804,6 +992,10 @@ impl Engine {
             contract.completion_reserve_ratio,
             &snapshot.dimensions,
         );
+        details["completion_reserve_source"] = serde_json::json!(reserve_override.source);
+        details["completion_reserve_p90_tokens"] = serde_json::json!(reserve_override.p90_tokens);
+        details["completion_reserve_p90_cost_usd"] =
+            serde_json::json!(reserve_override.p90_cost_usd);
         Ok(ResourceGovernorDecision {
             session_id: session_id.to_string(),
             phase: phase.to_string(),
@@ -903,6 +1095,15 @@ impl Engine {
         } else {
             effective_completion_reserve_ratio
         };
+        let reserve_override = self
+            .critical_path_completion_reserve(
+                session_id,
+                &reserve_caps,
+                gate_reserve_ratio,
+                &dimensions,
+                budget.unlimited,
+            )
+            .await;
         let profile = profile.as_str();
         let inputs = ResourceGovernorInputs {
             profile,
@@ -911,6 +1112,9 @@ impl Engine {
             completion_reserve_ratio: gate_reserve_ratio,
             hard_caps: &reserve_caps,
             dimensions: &dimensions,
+            token_reserve_override: reserve_override.tokens,
+            cost_reserve_override: reserve_override.cost_usd,
+            time_reserve_override: reserve_override.time_secs,
             readiness_blocked: false,
             unlimited: budget.unlimited,
         };
@@ -924,6 +1128,10 @@ impl Engine {
             &dimensions,
         );
         details["attention_batch"] = attention_batch_details(&approvals, &attention, attention_cap);
+        details["completion_reserve_source"] = serde_json::json!(reserve_override.source);
+        details["completion_reserve_p90_tokens"] = serde_json::json!(reserve_override.p90_tokens);
+        details["completion_reserve_p90_cost_usd"] =
+            serde_json::json!(reserve_override.p90_cost_usd);
         if let Some(grant) = &active_rescue {
             details["rescue"] = serde_json::json!({
                 "grant_id": grant.id.clone(),
@@ -1199,6 +1407,9 @@ struct ResourceGovernorInputs<'a> {
     completion_reserve_ratio: f64,
     hard_caps: &'a AutoBudgetCaps,
     dimensions: &'a [ResourceDimension],
+    token_reserve_override: Option<f64>,
+    cost_reserve_override: Option<f64>,
+    time_reserve_override: Option<f64>,
     readiness_blocked: bool,
     /// `Session.unlimited` bypasses session/plan/project economic gates. It
     /// does not bypass attention, readiness, risk, context, approvals, or any
@@ -1248,7 +1459,12 @@ fn resource_governor_action(inputs: &ResourceGovernorInputs<'_>) -> (String, Str
                 "time" => COMPLETION_RESERVE_TIME_CAP_SECS,
                 _ => f64::INFINITY,
             };
-            let reserve = completion_reserve(hard, inputs.completion_reserve_ratio, cap);
+            let proportional = completion_reserve(hard, inputs.completion_reserve_ratio, cap);
+            let reserve = match key {
+                "tokens" => pick_completion_reserve(proportional, inputs.token_reserve_override),
+                "time" => pick_completion_reserve(proportional, inputs.time_reserve_override),
+                _ => proportional,
+            };
             if remaining < reserve {
                 return ("defer".to_string(), format!("completion_reserve_{key}"));
             }
@@ -1258,10 +1474,13 @@ fn resource_governor_action(inputs: &ResourceGovernorInputs<'_>) -> (String, Str
             resource_dimension(inputs.dimensions, "money")
                 .and_then(|dimension| dimension.remaining),
         ) && remaining
-            < completion_reserve(
-                hard,
-                inputs.completion_reserve_ratio,
-                COMPLETION_RESERVE_COST_CAP_USD,
+            < pick_completion_reserve(
+                completion_reserve(
+                    hard,
+                    inputs.completion_reserve_ratio,
+                    COMPLETION_RESERVE_COST_CAP_USD,
+                ),
+                inputs.cost_reserve_override,
             )
         {
             return ("defer".to_string(), "completion_reserve_money".to_string());
@@ -1477,6 +1696,15 @@ mod tests {
                 .unwrap();
             assert!(status.success());
         }
+    }
+
+    #[test]
+    fn critical_path_p90_can_replace_or_tighten_the_proportional_reserve() {
+        assert_eq!(pick_completion_reserve(40.0, Some(10.0)), 10.0);
+        assert_eq!(pick_completion_reserve(40.0, Some(100.0)), 100.0);
+        assert_eq!(pick_completion_reserve(40.0, None), 40.0);
+        assert_eq!(pick_completion_reserve(40.0, Some(0.0)), 0.0);
+        assert_eq!(pick_completion_reserve(40.0, Some(f64::NAN)), 40.0);
     }
 
     /// Record usage in both places a real provider call updates: the session
@@ -1888,6 +2116,104 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn pending_critical_path_p90_can_drive_the_completion_reserve() {
+        let (_data, _repo, engine, session) = fixture().await;
+        engine
+            .set_session_budget(SetSessionBudgetParams {
+                session_id: session.id.clone(),
+                mode: Some(BudgetMode::Fixed),
+                token_budget: Some(10_000),
+                ..SetSessionBudgetParams::default()
+            })
+            .await
+            .unwrap();
+        engine
+            .record_agent_usage(
+                &session.id,
+                "worker-1",
+                "Worker",
+                "worker",
+                Some("T1".to_string()),
+                Some("impl".to_string()),
+                "test-model",
+                9_000,
+                0,
+                false,
+                0.0,
+            )
+            .await
+            .unwrap();
+        engine
+            .set_run_contract(SetRunContractParams {
+                session_id: session.id.clone(),
+                profile: RunProfile::Balanced,
+                completion_reserve_ratio: Some(0.2),
+                attention_cap: Some(100),
+                stop_policy: None,
+                updated_by: None,
+            })
+            .await
+            .unwrap();
+        let dispatch = engine
+            .resource_governor_decision(&session.id, "dispatch")
+            .await
+            .unwrap();
+        assert_eq!(dispatch.action, "defer", "{dispatch:?}");
+        assert_eq!(dispatch.reason, "completion_reserve_tokens");
+        assert_eq!(
+            dispatch.details["completion_reserve_source"],
+            "critical_path_p90"
+        );
+        assert_eq!(
+            dispatch.details["completion_reserve_p90_tokens"],
+            serde_json::json!(9_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn running_work_does_not_pause_on_the_completion_reserve() {
+        let (_data, _repo, engine, session) = fixture().await;
+        let plan_seq = engine
+            .task_queue(None, Some(session.id.clone()))
+            .await
+            .unwrap()
+            .tasks[0]
+            .plan_seq;
+        engine
+            .store()
+            .claim_plan_tasks(&session.id, plan_seq, &["T1".to_string()])
+            .unwrap();
+        engine
+            .set_session_budget(SetSessionBudgetParams {
+                session_id: session.id.clone(),
+                mode: Some(BudgetMode::Fixed),
+                token_budget: Some(1_000),
+                ..SetSessionBudgetParams::default()
+            })
+            .await
+            .unwrap();
+        engine.record_usage(&session.id, 900, 0).await.unwrap();
+        engine
+            .set_run_contract(SetRunContractParams {
+                session_id: session.id.clone(),
+                profile: RunProfile::Balanced,
+                completion_reserve_ratio: Some(0.2),
+                attention_cap: Some(100),
+                stop_policy: None,
+                updated_by: None,
+            })
+            .await
+            .unwrap();
+        let turn = engine
+            .resource_governor_decision(&session.id, "turn")
+            .await
+            .unwrap();
+        assert_ne!(turn.action, "defer", "{turn:?}");
+        assert_ne!(turn.reason, "completion_reserve_tokens", "{turn:?}");
+        assert_eq!(turn.details["completion_reserve_source"], "no_pending_work");
     }
 
     #[tokio::test]
