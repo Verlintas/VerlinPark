@@ -148,8 +148,8 @@ project-level opt-in, a live DeepSeek probe and small E2E session passed but no
 live multi-Worker/soak run has been recorded in this workspace, Keychain/TCC
 first-run still needs a real-machine pass, Developer ID signing/notarization
 remains unavailable here, and the CUSTOS ring has not been installed/verified
-on a real machine. Two consecutive clean `just release-preflight full` runs on
-2026-11-27 reported 4,806 Rust passed / 0 failed / 6 ignored and 544 app + 132
+on a real machine. Repeated clean `just release-preflight full` runs on
+2026-11-27 reported 4,809 Rust passed / 0 failed / 6 ignored and 544 app + 132
 helper Swift tests passed, plus the backup drill, scale/fault harness, and
 release binaries. Live DeepSeek validation (environment-only key) returned
 `tool_calling=true`/`probe_echo` at 411 ms and a 5-call Leader→`write_file`→idle
