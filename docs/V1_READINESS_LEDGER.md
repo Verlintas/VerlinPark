@@ -937,7 +937,9 @@ This is partial evidence, not a clean two-task merge:
   escalated. That fix is unit-tested; the completed live rerun is still
   pending. The next 1M attempt then surfaced `rm ... 2>&1` being parsed with
   `2>&1` as a path target; ADR-0242 strips redirection tokens from contract
-  argument checks while the separate redirect audit still enforces scope.
+  argument checks while the separate redirect audit still enforces scope. The
+  next attempt used `D=$(mktemp -d)` without a template; plain `mktemp` now
+  resolves to the exported `$TMPDIR` (ADR-0238 follow-up).
 - **Mid-plan pause/verification loss was not reproduced in the deterministic
   path.** `a_paused_plan_worker_still_verifies_and_merges_completed_work`
   pauses a two-task plan while a Worker is between its write and final turns,

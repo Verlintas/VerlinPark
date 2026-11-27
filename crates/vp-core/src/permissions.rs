@@ -2000,6 +2000,10 @@ mod tests {
             RiskLevel::WorkspaceWrite
         );
         assert!(shell("D=/tmp/elsewhere; rm -rf \"$D\"").risk >= RiskLevel::HostState);
+        assert_eq!(
+            shell("D=$(mktemp -d); cp -R app \"$D\"/; echo x > \"$D/app/calc.py\"").risk,
+            RiskLevel::WorkspaceWrite
+        );
     }
 
     #[test]

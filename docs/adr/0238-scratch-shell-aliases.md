@@ -52,8 +52,18 @@ analysis both use it, so their decisions cannot drift.
   host-state behavior.
 - Direct `$HOME`/network/credential paths remain outside the safe set.
 
+## Follow-up: TMPDIR-default mktemp (2026-11-28)
+
+A later live run used `D=$(mktemp -d)` without a template. macOS `mktemp`
+creates under the exported `TMPDIR`, which is one of the sandbox roots, but the
+first alias rule only accepted a scratch/worktree-prefixed template. Plain
+`mktemp`, `mktemp -d`, and `mktemp -t prefix` now resolve to `$TMPDIR`;
+`mktemp` with an explicit non-sandbox template stays unresolved. This is a
+bounded alias expansion, not a general command-substitution evaluator.
+
 ## Tests
 
+- `shell_alias::tests::plain_mktemp_resolves_to_the_sandbox_tmpdir`
 - `shell_alias::tests::resolves_chained_scratch_aliases_only`
 - `permissions::tests::chained_scratch_aliases_are_workspace_writes`
 - contract `shell_cache_cleanup_is_not_destructive_or_out_of_scope` includes

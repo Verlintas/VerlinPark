@@ -117,9 +117,34 @@ fn is_shell_variable(value: &str) -> bool {
 }
 
 fn scratch_mktemp_substitution(value: &str) -> Option<&'static str> {
-    let lower = value.to_ascii_lowercase();
-    if !lower.starts_with("$(") || !lower.contains("mktemp") {
+    let inner = value.strip_prefix("$(")?.strip_suffix(')')?.trim();
+    let mut words = inner.split_whitespace();
+    if words.next()? != "mktemp" {
         return None;
+    }
+    let mut skip_next = false;
+    let mut has_template = false;
+    for word in words {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if matches!(word, "-t" | "--tmpdir") {
+            skip_next = true;
+            continue;
+        }
+        if word.starts_with('-') {
+            continue;
+        }
+        has_template = true;
+        break;
+    }
+    if !has_template {
+        // Plain `mktemp`/`mktemp -d`/`mktemp -t prefix` creates under TMPDIR,
+        // which is one of the daemon-exported sandbox roots. Treating it as
+        // arbitrary expansion made routine "copy into a temp dir and check"
+        // work look out of scope.
+        return Some("$TMPDIR");
     }
     [
         "$VERLINPARK_SCRATCH",
@@ -186,5 +211,20 @@ mod tests {
         );
         let expanded = expand_scratch_aliases(command, &aliases);
         assert!(expanded.contains("cp app/x.py \"$VERLINPARK_SCRATCH/x.py\""));
+    }
+
+    #[test]
+    fn plain_mktemp_resolves_to_the_sandbox_tmpdir() {
+        for command in [
+            "D=$(mktemp -d); cp -R app \"$D\"/",
+            "D=$(mktemp -t check); cp -R app \"$D\"/",
+            "F=$(mktemp); echo x > \"$F\"",
+        ] {
+            let aliases = scratch_aliases(command);
+            let value = aliases.values().next().map(String::as_str);
+            assert_eq!(value, Some("$TMPDIR"), "{command}");
+        }
+        let explicit = "D=$(mktemp -d /tmp/check.XXXXXX); cp -R app \"$D\"/";
+        assert!(scratch_aliases(explicit).is_empty());
     }
 }
