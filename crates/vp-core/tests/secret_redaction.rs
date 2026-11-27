@@ -87,7 +87,7 @@ fn service(engine: &Engine, provider: Arc<ScriptProvider>) -> AgentService {
         model: "test-model".to_string(),
         role_models: RoleModels::default(),
         base_url: None,
-        max_turns: 4,
+        max_turns: Some(4),
         max_tokens: Some(512),
         max_managers: 3,
         max_workers: 4,

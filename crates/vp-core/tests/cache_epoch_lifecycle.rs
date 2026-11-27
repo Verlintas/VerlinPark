@@ -71,7 +71,7 @@ fn test_service(data_dir: &Path) -> (Engine, AgentService) {
         model: "test-model".to_string(),
         role_models: RoleModels::default(),
         base_url: None,
-        max_turns: 2,
+        max_turns: Some(2),
         max_tokens: Some(256),
         max_managers: 2,
         max_workers: 2,
