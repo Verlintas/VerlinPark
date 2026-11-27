@@ -791,7 +791,7 @@ four-tier path with a deliberately non-human spatial output.
   `vp`/`verlinpadd`/`custos`/`custosd` entrypoints, and code signature without
   installing it. The final DMG was rebuilt after the Python-cache and operator-owned turn
   ceiling changes and reverified; SHA-256
-  `f100b461ee75b21dca2e444d0c1b21e914b6df32820d744174a1e1c2fc16a16e`.
+  `7d7a5a347b2e405fb2dda4789196a1a059878203cc1638562c16e9c56ffa4c07`.
   This is not Developer ID signing or notarization.
 - **A bad project entry could not be removed.** `project.remove` /
   `vp project-remove --yes` removes only an empty project (no sessions,

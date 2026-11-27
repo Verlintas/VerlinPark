@@ -36,8 +36,9 @@ Explicit ceilings are operator policy:
 
 - `VERLINPARK_MAX_TURNS` / `runtime-config-set --max-turns` accept `1..=200`;
   `0` or an invalid value disables the ceiling;
-- Auto Budget's `max_turns_per_run` remains an explicit project policy and
-  still drives its configured per-run limit;
+- Auto Budget's `max_turns_per_run` also defaults to `0` (no per-run
+  ceiling); an explicit `1..=200` project policy still drives its per-run
+  limit;
 - Scout keeps its own bounded step request when no global ceiling is set.
 
 The token/cost/time budgets, Auto completion reserve, no-progress policy,
