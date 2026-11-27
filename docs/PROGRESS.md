@@ -72,9 +72,10 @@ temporary repository. The first-run wizard probed the live provider
 (780 ms, tool calling supported · `probe_echo`), selected hardened shell trust,
 and added the project through the native folder picker. A GUI session ran
 Leader→`write_file` to idle with the exact 18-byte `GUI_LIVE.md`; a second
-session's host-state shell request showed an approval card, was denied, and
-returned `PERMISSION_DENIED` without creating `/tmp/vp-gui-approval.txt`. The
-wizard also gained a **Test current provider** button for env-configured
+session's host-state shell request showed an approval card. Approving it was
+recorded, but the shell sandbox still rejected the `/tmp` write; the retry was
+denied in the GUI and returned `PERMISSION_DENIED` without creating the file.
+The wizard also gained a **Test current provider** button for env-configured
 daemons. Test data was removed and the owner's default project/app data was
 untouched.
 

@@ -457,7 +457,9 @@ the provider text stream, `tool_calling=true` for `probe_echo`, a full
 Leader→`write_file`→idle session (5 calls, 93.85% cache hit), and a small
 cache-bench; the key was environment-only. A real-machine GUI smoke also
 verified the first-run probe/tool calling, hardened trust, an exact
-`GUI_LIVE.md` write, and a denied host-state shell approval that did not run.
+`GUI_LIVE.md` write, and host-state shell approval cards where approval was
+recorded but the sandbox still blocked an outside-worktree write, and a retry
+denial did not run the command.
 Native computer/Code Mode remain open S1 items, the live run is not a
 10-Worker/soak proof, and Keychain/TCC first-run still needs a real-machine
 pass. In-run plan revision remains open.

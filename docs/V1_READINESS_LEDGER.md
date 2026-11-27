@@ -882,8 +882,10 @@ this test.
   `GUI_LIVE.md` contained exactly `gui live smoke ok` (18 bytes, SHA-256
   `1b6db0b8…399731`), and the source checkout stayed unmodified.
 - GUI session 2: a shell command writing outside the worktree raised a
-  `HOST_STATE` approval card. The operator denied it; the UI showed `DENIED`
-  and `PERMISSION_DENIED`, the command did not run, no `/tmp` file was created,
-  and the session returned to `idle`.
+  `HOST_STATE` approval card. The first approval was recorded as `approved`,
+  but the shell sandbox still blocked the `/tmp` write, proving approval does
+  not widen the sandbox. The Leader retried with a modified command; that retry
+  was denied in the GUI, the UI showed `DENIED` and `PERMISSION_DENIED`, the
+  command did not run, and the session returned to `idle`.
 - Temp app data/repository were removed and the onboarding preference was
   restored after the test.
