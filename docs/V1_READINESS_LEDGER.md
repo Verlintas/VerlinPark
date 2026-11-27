@@ -930,7 +930,12 @@ This is partial evidence, not a clean two-task merge:
   commit, not through a false reserve pause. A 1M live run is the next check.
   A subsequent 1M attempt surfaced the `cp` source/destination false positive
   and was stopped before deciding its approval; ADR-0240 is unit-tested but has
-  not yet been exercised by a completed live run.
+  not yet been exercised by a completed live run. A further 1M attempt surfaced
+  that `find . ... -exec rm -rf {} +` was classified as a worktree-root
+  host-state write; ADR-0241 now treats the find root as a traversal scope,
+  assesses `-exec` through the normal shell analyzer, and keeps outside roots
+  escalated. That fix is unit-tested; the completed live rerun is still
+  pending.
 - **Mid-plan pause/verification loss was not reproduced in the deterministic
   path.** `a_paused_plan_worker_still_verifies_and_merges_completed_work`
   pauses a two-task plan while a Worker is between its write and final turns,

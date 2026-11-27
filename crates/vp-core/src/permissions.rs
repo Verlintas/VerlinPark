@@ -1523,7 +1523,12 @@ fn assess_find(args: &[String], cwd: &Path, worktree: &Path) -> PermissionAssess
             args[index].as_str(),
             "-exec" | "-execdir" | "-ok" | "-okdir"
         ) {
-            let root_assessment = assess_target(root, cwd, worktree, false);
+            // The search root is traversed/read, not written. The nested
+            // command decides the actual writes. Requiring the root itself to
+            // be a write target made the routine
+            // `find . -name __pycache__ -exec rm -rf {} +` look like a
+            // host-state write against the worktree root.
+            let root_assessment = assess_find_root(root, cwd, worktree);
             if root_assessment.risk.requires_human() || root_assessment.blocked {
                 return root_assessment;
             }
@@ -1535,11 +1540,38 @@ fn assess_find(args: &[String], cwd: &Path, worktree: &Path) -> PermissionAssess
             );
         }
         if args[index] == "-delete" {
-            return assess_target(root, cwd, worktree, true);
+            let root_assessment = assess_find_root(root, cwd, worktree);
+            if root_assessment.risk.requires_human() || root_assessment.blocked {
+                return root_assessment;
+            }
+            return PermissionAssessment::new(
+                RiskLevel::WorkspaceWrite,
+                "find deletes matched files inside the sandbox",
+            );
         }
         index += 1;
     }
     PermissionAssessment::new(RiskLevel::ReadOnly, "find inspection")
+}
+
+/// A `find` search root may be the worktree root. It is outside the sandbox
+/// (or unresolvable) that must escalate before `-exec`/`-delete` can touch it.
+fn assess_find_root(root: &str, cwd: &Path, worktree: &Path) -> PermissionAssessment {
+    let raw = root.trim();
+    if raw.is_empty() || raw == "." || raw == "./" {
+        return PermissionAssessment::new(
+            RiskLevel::WorkspaceWrite,
+            "find root is the session worktree",
+        );
+    }
+    let assessment = assess_target(raw, cwd, worktree, false);
+    if assessment.reason == "the worktree root itself is the target" {
+        return PermissionAssessment::new(
+            RiskLevel::WorkspaceWrite,
+            "find root is the session worktree",
+        );
+    }
+    assessment
 }
 
 fn assess_xargs(args: &[String], cwd: &Path, worktree: &Path) -> PermissionAssessment {
@@ -2014,6 +2046,33 @@ mod tests {
             shell("cat > \"$VERLINPARK_SCRATCH/fixture.sh\" <<'EOF'\nrm -rf /\nsudo reboot\nEOF\n");
         assert_eq!(assessment.risk, RiskLevel::WorkspaceWrite, "{assessment:?}");
         assert!(!assessment.blocked, "{assessment:?}");
+    }
+
+    #[test]
+    fn find_exec_and_delete_use_the_nested_command_for_writes() {
+        assert_eq!(
+            shell("find . -name __pycache__ -type d -not -path './.git/*' -exec rm -rf {} +").risk,
+            RiskLevel::WorkspaceWrite
+        );
+        assert_eq!(
+            shell("find . -name '*.pyc' -delete").risk,
+            RiskLevel::WorkspaceWrite
+        );
+        assert_eq!(
+            shell("find \"$VERLINPARK_SCRATCH\" -name '*.pyc' -delete").risk,
+            RiskLevel::WorkspaceWrite
+        );
+        assert!(shell("find /Users/example -name x -delete").risk >= RiskLevel::HostState);
+        let root = shell("find / -name x -exec rm -rf {} +");
+        assert!(
+            root.blocked || root.risk >= RiskLevel::HostState,
+            "{root:?}"
+        );
+        let nested = shell("find . -exec rm -rf / +");
+        assert!(
+            nested.blocked || nested.risk >= RiskLevel::Destructive,
+            "{nested:?}"
+        );
     }
 
     #[test]

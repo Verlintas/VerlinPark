@@ -244,6 +244,7 @@
 | [0238](adr/0238-scratch-shell-aliases.md) | Bounded resolution of simple scratch/worktree shell aliases before permission/contract analysis; unknown variables and traversal stay conservative | Accepted (2026-11-27) | Security/Shell/Tooling |
 | [0239](adr/0239-heredoc-aware-shell-analysis.md) | Heredoc bodies are data (quoted delimiters never expand); `$()`/backtick substitutions are skipped as a unit and assessed recursively, keeping the outer command name analyzable | Accepted (2026-11-28) | Security/Shell/Tooling |
 | [0240](adr/0240-copy-source-shell-scope.md) | `cp`/`install`/`ln` write only their destination; earlier arguments are read-only sources, while `mv` keeps the conservative all-args rule | Accepted (2026-11-28) | Security/Shell/Tooling |
+| [0241](adr/0241-find-root-shell-scope.md) | `find` roots are traversal scopes, not writes; `-exec` is assessed through the existing shell analyzer and `-delete` is a sandbox-confined write, while outside roots still escalate | Accepted (2026-11-28) | Security/Shell/Tooling |
 
 ---
 
