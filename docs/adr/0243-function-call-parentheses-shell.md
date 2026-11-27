@@ -43,7 +43,21 @@ misread as a command.
   authoritative.
 - This is a bounded syntactic heuristic, not a language parser.
 
+## Follow-up: interpreter code is not re-parsed as shell (2026-11-28)
+
+A Verifier loop then ran `python3 -B -c` with `$variant` inside Python string
+literals. `assess_interpreter` still passed the whole code string through the
+shell analyzer; after quote stripping, `print('$variant', ...)` became a
+command word containing `$` and requested host-state approval again.
+
+Interpreter `-c`/`-e`/`-r` code now skips the shell re-parse and uses only the
+bounded `assess_interpreter_code` markers (`os.system`, `subprocess`,
+`child_process`, destructive host commands). The outer shell string is still
+analyzed normally, including `$()`/backtick substitution extraction. The
+sandbox remains authoritative for file/network effects.
+
 ## Tests
 
-`permissions::tests::interpreter_function_calls_are_not_shell_commands` covers
-the live one-liner, a second statement, `os.system`, and a subshell `cd`.
+- `permissions::tests::interpreter_function_calls_are_not_shell_commands`
+- `permissions::tests::interpreter_code_is_not_reparsed_as_shell`
+  (the Verifier loop, `$value` in a string, `os.system`, and `subprocess`).

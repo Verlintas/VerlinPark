@@ -941,7 +941,10 @@ This is partial evidence, not a clean two-task merge:
   next attempt used `D=$(mktemp -d)` without a template; plain `mktemp` now
   resolves to the exported `$TMPDIR` (ADR-0238 follow-up). A later attempt
   surfaced `python3 -c "print(repr(open(...)))"` being misread as the `open`
-  host launcher; ADR-0243 now splits parentheses only at shell boundaries.
+  host launcher; ADR-0243 now splits parentheses only at shell boundaries. A
+  Verifier `for` loop then exposed interpreter `-c` code being re-parsed as
+  shell (`print('$variant', ...)`); ADR-0243's follow-up skips that re-parse
+  and keeps the bounded interpreter markers.
 - **Mid-plan pause/verification loss was not reproduced in the deterministic
   path.** `a_paused_plan_worker_still_verifies_and_merges_completed_work`
   pauses a two-task plan while a Worker is between its write and final turns,

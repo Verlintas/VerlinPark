@@ -1457,10 +1457,10 @@ fn assess_interpreter(
         .position(|arg| matches!(arg.as_str(), "-c" | "-e" | "-r" | "--eval"))
         && let Some(code) = args.get(index + 1)
     {
-        let nested = assess_shell_from(code, cwd, worktree);
-        if nested.risk.requires_human() || nested.blocked {
-            return nested;
-        }
+        // Interpreter `-c`/`-e` code is not shell. Re-parsing it as shell made
+        // Python lines such as `print('$variant', ...)` look like a command
+        // whose name is a shell expansion. Keep the bounded host/destructive
+        // marker checks instead; the sandbox still contains the process.
         if let Some(assessment) = assess_interpreter_code(code) {
             return assessment;
         }
@@ -2111,6 +2111,38 @@ mod tests {
         assert_eq!(
             shell("( cd \"$VERLINPARK_SCRATCH\" && rm -rf app/__pycache__ )").risk,
             RiskLevel::WorkspaceWrite
+        );
+    }
+
+    #[test]
+    fn interpreter_code_is_not_reparsed_as_shell() {
+        let command = r#"for variant in original no_bang strip; do
+  PYTHONDONTWRITEBYTECODE=1 python3 -B -c "
+import sys, pathlib, unittest
+sys.path.insert(0, str(pathlib.Path('.').resolve()))
+import app.greet as g
+v = '$variant'
+if v == 'no_bang':
+    g.greet = lambda name: 'Hello, ' + str(name)
+elif v == 'strip':
+    g.greet = lambda name: f'Hello, {str(name).strip()}!'
+suite = unittest.defaultTestLoader.loadTestsFromName('tests.test_greet')
+r = unittest.TextTestRunner(verbosity=0, stream=open('/dev/null','w')).run(suite)
+print('$variant', '-> testsRun:', r.testsRun)
+"
+done"#;
+        assert_eq!(shell(command).risk, RiskLevel::WorkspaceWrite);
+        assert_eq!(
+            shell("python3 -c \"print('$value', 'ok')\"").risk,
+            RiskLevel::WorkspaceWrite
+        );
+        assert_eq!(
+            shell("python3 -c \"import os; os.system('id')\"").risk,
+            RiskLevel::HostState
+        );
+        assert_eq!(
+            shell("python3 -c \"import subprocess; subprocess.run(['id'])\"").risk,
+            RiskLevel::HostState
         );
     }
 
