@@ -915,13 +915,18 @@ This is partial evidence, not a clean two-task merge:
     ancestor directory of an allowed path.
   - Worker commit/scope checks ignore generated Python caches; `git add` no
     longer stages them, so a test-generated `.pyc` cannot fail integration.
-- **Still open**: scratch commands that use a locally assigned variable
-  (`SCRATCH="$VERLINPARK_SCRATCH/..."`) still trigger host-state approvals and
-  `EFFECT_UNKNOWN` receipts; a mid-plan completion-reserve pause followed by
-  resume returned the session to idle without creating a Verifier/Integrator
-  for already-completed tasks. The legacy hidden 20-turn cap was removed in
+- **Scratch alias approvals are closed.** ADR-0238 resolves simple chained
+  aliases rooted in `$VERLINPARK_SCRATCH`, `$VERLINPARK_WORKTREE`, or `$TMPDIR`
+  before permission/contract analysis. Unknown variables, `$HOME`, traversal,
+  and arbitrary host paths remain conservative. This removes the observed
+  approval/`EFFECT_UNKNOWN` loop for routine scratch verification.
+- **Still open**: a mid-plan completion-reserve pause followed by resume
+  returned the session to idle without creating a Verifier/Integrator for
+  already-completed tasks. The legacy hidden 20-turn cap was removed in
   ADR-0236: per-run ceilings are now operator-owned (`VERLINPARK_MAX_TURNS`,
   `runtime-config-set --max-turns`, or Auto Budget) and default to none.
+  Completion reserve is task-aware (ADR-0237): active work may finish and
+  pending critical-path p90 drives the reserve.
 - The plan run used the live key in the daemon environment only; the key was
   never stored in the repo or session data.
 - **The completion reserve was blind to remaining work.** ADR-0237 makes it

@@ -464,7 +464,7 @@ Worker→Verifier→merge-queue→Integrator path and merged T2; T1 was verified
 blocked by scratch-probe effect receipts, and a retry exposed generated Python
 caches as a write-scope violation. In-worktree Python cache cleanup and commit
 staging were fixed and unit-tested. Mid-plan pause/resume verification loss,
-scratch-variable approval loops remain open. Per-run turn ceilings are now
+scratch alias approvals are fixed for simple daemon-scratch aliases (ADR-0238); mid-plan pause/resume remains open. Per-run turn ceilings are now
 operator-owned (default none), with budgets/no-progress/approvals/cancel as the
 normal bounds. The completion reserve is task-aware: running tasks can finish,
 pending critical-path p90 estimates drive the reserve, and missing estimates

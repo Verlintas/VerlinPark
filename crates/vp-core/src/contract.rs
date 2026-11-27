@@ -1649,7 +1649,9 @@ fn analyze_shell_inner(
         analysis.ambiguous = true;
         return analysis;
     }
-    let trimmed = command.trim();
+    let aliases = crate::shell_alias::scratch_aliases(command);
+    let expanded = crate::shell_alias::expand_scratch_aliases(command, &aliases);
+    let trimmed = expanded.trim();
     if trimmed.is_empty() {
         analysis.ambiguous = true;
         return analysis;
@@ -1905,7 +1907,7 @@ fn shell_path_in_scope(contract: &TaskContract, raw: &str, worktree: &Path) -> b
         "$TMPDIR",
         "${TMPDIR}",
     ] {
-        if raw.starts_with(prefix) {
+        if raw.starts_with(prefix) && !raw.contains("..") {
             return true;
         }
     }
@@ -2873,6 +2875,13 @@ mod tests {
         assert!(traversal.destructive, "{traversal:?}");
         let outside = analyze_shell_command("rm -rf /tmp/__pycache__", &contract, worktree);
         assert!(outside.writes_outside_scope, "{outside:?}");
+        let alias = analyze_shell_command(
+            "S=\"$VERLINPARK_SCRATCH/t1\"; rm -rf \"$S\"; mkdir -p \"$S/app\"",
+            &contract,
+            worktree,
+        );
+        assert!(!alias.destructive, "{alias:?}");
+        assert!(!alias.writes_outside_scope, "{alias:?}");
     }
 
     #[test]

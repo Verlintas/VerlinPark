@@ -585,10 +585,13 @@ pub fn assess_shell_command(command: &str, worktree: &Path) -> PermissionAssessm
 }
 
 fn assess_shell_from(command: &str, start_cwd: &Path, worktree: &Path) -> PermissionAssessment {
-    let trimmed = command.trim();
-    if trimmed.is_empty() {
+    let original = command.trim();
+    if original.is_empty() {
         return PermissionAssessment::new(RiskLevel::ReadOnly, "empty shell command");
     }
+    let aliases = crate::shell_alias::scratch_aliases(original);
+    let expanded = crate::shell_alias::expand_scratch_aliases(original, &aliases);
+    let trimmed = expanded.trim();
     if is_fork_bomb(trimmed) {
         return PermissionAssessment::blocked("fork bombs are never allowed");
     }
@@ -1863,6 +1866,19 @@ mod tests {
             decide(ApprovalMode::Smart, &write, true),
             ApprovalDecision::Allow { .. }
         ));
+    }
+
+    #[test]
+    fn chained_scratch_aliases_are_workspace_writes() {
+        assert_eq!(
+            shell("SCRATCH=\"$VERLINPARK_SCRATCH/t1\"; rm -rf \"$SCRATCH\"").risk,
+            RiskLevel::WorkspaceWrite
+        );
+        assert_eq!(
+            shell("S=\"$VERLINPARK_SCRATCH/a\"; D=\"$S/b\"; printf x > \"$D/out\"").risk,
+            RiskLevel::WorkspaceWrite
+        );
+        assert!(shell("D=/tmp/elsewhere; rm -rf \"$D\"").risk >= RiskLevel::HostState);
     }
 
     #[test]

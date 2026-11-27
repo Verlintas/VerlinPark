@@ -207,6 +207,8 @@ pub use rebuild::rebuild_database;
 pub mod tools;
 pub mod worktree;
 
+mod shell_alias;
+
 mod engine;
 
 // Lease guards moved into `engine::leases`; re-exported here so

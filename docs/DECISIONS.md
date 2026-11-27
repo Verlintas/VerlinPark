@@ -241,6 +241,7 @@
 | [0235](adr/0235-custos-observe-only-foundation.md) | CUSTOS observe-only foundation: separate `vp-custos` crate, `custosd` + `custos`, 0600 Unix socket, read-only SQLite probes, pinned draft charter, capacity/score/ring modules, launchd installer/watchdog, local diagnostic bundles, normal SwiftUI window with ASCII wordmark only, no mutation/agent surface | Accepted (2026-11-26); real ring install/verification, notices, signed vault, and L2–L4 actions open | Guardian/Security/Observability |
 | [0236](adr/0236-operator-owned-turn-budget.md) | Per-run turn ceiling is operator-owned (`Option<u32>`, default none); explicit env/CLI/Auto policy only, with budgets/no-progress/approvals/cancel as normal bounds | Accepted (2026-11-27) | Runtime/Budget/Reliability |
 | [0237](adr/0237-task-aware-completion-reserve.md) | Completion reserve protects only unstarted critical-path work: running tasks finish, pending p90 drives the reserve, missing estimates fall back to proportional | Accepted (2026-11-27) | Runtime/Budget/Resource Governance |
+| [0238](adr/0238-scratch-shell-aliases.md) | Bounded resolution of simple scratch/worktree shell aliases before permission/contract analysis; unknown variables and traversal stay conservative | Accepted (2026-11-27) | Security/Shell/Tooling |
 
 ---
 
