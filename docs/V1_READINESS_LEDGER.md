@@ -929,13 +929,12 @@ This is partial evidence, not a clean two-task merge:
   with no approval; it then failed honestly at the hard token cap before
   commit, not through a false reserve pause. A 1M live run is the next check.
   A subsequent 1M attempt surfaced the `cp` source/destination false positive
-  and was stopped before deciding its approval; ADR-0240 is unit-tested but has
-  not yet been exercised by a completed live run. A further 1M attempt surfaced
+  and was stopped before deciding its approval. ADR-0240 was then exercised by
+  the clean two-task rerun below. A further 1M attempt surfaced
   that `find . ... -exec rm -rf {} +` was classified as a worktree-root
   host-state write; ADR-0241 now treats the find root as a traversal scope,
   assesses `-exec` through the normal shell analyzer, and keeps outside roots
-  escalated. That fix is unit-tested; the completed live rerun is still
-  pending. The next 1M attempt then surfaced `rm ... 2>&1` being parsed with
+  escalated. The next 1M attempt then surfaced `rm ... 2>&1` being parsed with
   `2>&1` as a path target; ADR-0242 strips redirection tokens from contract
   argument checks while the separate redirect audit still enforces scope. The
   next attempt used `D=$(mktemp -d)` without a template; plain `mktemp` now
@@ -944,7 +943,8 @@ This is partial evidence, not a clean two-task merge:
   host launcher; ADR-0243 now splits parentheses only at shell boundaries. A
   Verifier `for` loop then exposed interpreter `-c` code being re-parsed as
   shell (`print('$variant', ...)`); ADR-0243's follow-up skips that re-parse
-  and keeps the bounded interpreter markers.
+  and keeps the bounded interpreter markers. The clean two-task rerun above
+  exercised all of these paths.
 - **Mid-plan pause/verification loss was not reproduced in the deterministic
   path.** `a_paused_plan_worker_still_verifies_and_merges_completed_work`
   pauses a two-task plan while a Worker is between its write and final turns,
@@ -961,6 +961,32 @@ This is partial evidence, not a clean two-task merge:
   may finish and pending critical-path p90 drives the reserve.
 - The plan run used the live key in the daemon environment only; the key was
   never stored in the repo or session data.
+
+### Clean live two-task plan rerun (2026-11-28)
+
+After the shell-analysis fixes above, an isolated DeepSeek `deepseek-flash`
+run completed both tasks end-to-end:
+
+- Fixed 1.5M token / 1800s session budget, hardened shell, task scheduler
+  disabled; provider key was environment-only.
+- T1 (`app/calc.py` + `tests/test_calc.py`) and T2 (`app/greet.py` +
+  `tests/test_greet.py`) ran as Workers, each delegating to Labour; two
+  distinct Verifiers approved, and the deterministic Integrator merged both:
+  T1 commit `0da7953`, integration `4eee490`; T2 commit `2154a65`, integration
+  `4809f77`.
+- Merge queue: 2/2 `merged` with `diff check passed`; plan tasks: 2/2
+  `completed`; all agents idle; the session worktree has both modules and both
+  test files, and `python3 -m unittest discover -s tests -v` passes 4/4 tests.
+- Effect receipts: 0 `unknown`, 9 `done`; no merge block. Exactly one approval
+  was denied: a Verifier's `mktemp -d /tmp/t1verify...` copy. `/tmp` is outside
+  the shell sandbox and the Verifier adapted to complete T2.
+- 67 provider calls, 941,744 tokens spent of 1.5M (558,256 remaining), 895,232
+  cache-read input tokens (~96.8% cache hit).
+- The run exercised the heredoc/`PYTHONPATH`, `cp` source, `find -exec`,
+  `2>&1`, plain `mktemp`, `open(...)` one-liner, and Verifier `$variant`
+  fixes with no host-state approval loop and no unknown-effect merge block.
+- This is a clean two-task merge, not Phase 2 10-Worker/soak/performance
+  evidence, and this run did not use the GUI.
 - **The completion reserve was blind to remaining work.** ADR-0237 makes it
   task-aware: a session with no pending non-running task gets a zero
   future-work reserve so the active task can finish; pending critical-path p90

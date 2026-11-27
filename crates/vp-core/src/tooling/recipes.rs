@@ -152,7 +152,7 @@ pub const RECIPES: &[ToolRecipe] = &[
             "Run the focused check first with run_project_task; it returns failures and next_actions.",
             "For a long-running server, use process and wait_for instead of a blocking shell call.",
             "Read the first real failure, fix it, and rerun only the affected check.",
-            "Shell commands already start in the worktree; use $VERLINPARK_SCRATCH for throwaway verification copies and never create scratch/verification directories inside the worktree.",
+            "Shell commands already start in the worktree; use $VERLINPARK_SCRATCH or $TMPDIR for throwaway verification copies. Never create scratch/verification directories inside the worktree or use an unconfined host path such as /tmp.",
             "Report the exact command, exit code, and the evidence you observed.",
         ],
         example: "run_project_task {\"kind\":\"test\",\"args\":[\"crates/vp-core\",\"tooling::errors\"]}",

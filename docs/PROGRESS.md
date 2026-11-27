@@ -92,7 +92,10 @@ heredoc/`PYTHONPATH="$(pwd)"` commands are analyzed as workspace writes
 (ADR-0239), and `cp`/`install`/`ln` sources are reads rather than writes
 (ADR-0240). A deterministic pause-before-verification plan test now asserts
 both tasks still get Verifier runs and merge; a dispatch deferral reports
-`Plan deferred` instead of `Plan complete`. Turn ceilings are
+`Plan deferred` instead of `Plan complete`. A clean live DeepSeek two-task run
+on 2026-11-28 merged both tasks (0 unknown effects, 4/4 tests, ~96.8% cache
+hit); the only denied approval was a Verifier `/tmp` copy, which it adapted
+around. Turn ceilings are
 now operator-owned (default none) rather than a hidden constant. Completion
 reserve is now task-aware (ADR-0237): running tasks are not interrupted,
 pending critical-path p90 estimates drive the reserve, and missing estimates or

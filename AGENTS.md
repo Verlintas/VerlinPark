@@ -159,10 +159,11 @@ a Leader `write_file` session ending idle with the exact 18-byte file, and
 `HOST_STATE` shell approval cards: an approval was recorded but the sandbox
 still blocked an outside-worktree write, and a retry denial returned
 `PERMISSION_DENIED` without running the command. The existing app instance and
-owner data were untouched. A live two-task TeamPlan reached the full T2
-Worker→Verifier→merge-queue→Integrator path and merged T2; T1 was verified but
-blocked by effect receipts from scratch probes, and a retry exposed generated
-`__pycache__/*.pyc` as a write-scope violation. Contract shell analysis and
+owner data were untouched. A clean live two-task TeamPlan on 2026-11-28
+completed both tasks through Worker→distinct Verifier→merge queue→Integrator
+with 0 unknown effects and 4/4 tests passing; an earlier run merged only T2
+because T1 was blocked by scratch-probe effect receipts, and a retry exposed
+generated `__pycache__/*.pyc` as a write-scope violation. Contract shell analysis and
 Worker commit/scope checks now treat in-worktree Python cache cleanup and
 generated caches as sandbox-local rather than destructive or task output.
 Mid-plan pause/resume now has a deterministic regression test asserting

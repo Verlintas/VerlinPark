@@ -166,8 +166,9 @@ pub(in crate::agent) fn role_prompt_parts(
         "Security and output contract:\n\
          - The project root is read-only; all writes stay inside the worktree.\n\
          - Shell commands already start in the worktree; do not cd to the git root. Use \
-         $VERLINPARK_SCRATCH for throwaway verification copies, never a scratch/verification \
-         directory inside the worktree. Use the full 64-character sha256 returned by read tools \
+         $VERLINPARK_SCRATCH (or $TMPDIR) for throwaway verification copies, never a \
+         scratch/verification directory inside the worktree or an unconfined host path such as \
+         /tmp. Use the full 64-character sha256 returned by read tools \
          for expected hashes; never copy a shortened display prefix.\n\
          - Do not claim success without evidence.\n\
          - Project knowledge sources may be indexed: call search_sources before source-grounded \

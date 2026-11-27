@@ -459,17 +459,19 @@ cache-bench; the key was environment-only. A real-machine GUI smoke also
 verified the first-run probe/tool calling, hardened trust, an exact
 `GUI_LIVE.md` write, and host-state shell approval cards where approval was
 recorded but the sandbox still blocked an outside-worktree write, and a retry
-denial did not run the command. A live two-task TeamPlan reached the full T2
-Worker→Verifier→merge-queue→Integrator path and merged T2; T1 was verified but
-blocked by scratch-probe effect receipts, and a retry exposed generated Python
-caches as a write-scope violation. In-worktree Python cache cleanup and commit
-staging were fixed and unit-tested. Simple daemon-scratch aliases (including
-mktemp) are fixed (ADR-0238) and heredoc/`PYTHONPATH="$(pwd)"` commands no
-longer trigger shell-expansion approvals (ADR-0239). A deterministic
-pause-before-verification plan test now asserts Verifier and merge completion
-after resume; a dispatch deferral reports `Plan deferred` rather than
-`Plan complete`. Per-run turn ceilings are now operator-owned (default none),
-with budgets/no-progress/approvals/cancel as the normal bounds. The completion reserve is task-aware: running tasks can finish,
+denial did not run the command. A clean live two-task TeamPlan (2026-11-28)
+completed both tasks end-to-end: Workers→distinct Verifiers→merge queue→
+deterministic Integrator, 0 unknown effect receipts, 4/4 tests passing, and
+~96.8% cache hit; exactly one `/tmp` scratch approval was correctly denied and
+the Verifier adapted. An earlier run merged T2 but left T1 blocked by
+scratch-probe effect receipts and generated caches; those shell/cache paths and
+the follow-on heredoc, `cp` source, `find -exec`, `2>&1`, plain `mktemp`, and
+interpreter-code misclassifications are now fixed and unit-tested (ADR-0238,
+0239, 0240, 0241, 0242, 0243). A deterministic pause-before-verification plan
+test asserts Verifier and merge completion after resume; a dispatch deferral
+reports `Plan deferred` rather than `Plan complete`. Per-run turn ceilings are
+now operator-owned (default none), with budgets/no-progress/approvals/cancel as
+the normal bounds. The completion reserve is task-aware: running tasks can finish,
 pending critical-path p90 estimates drive the reserve, and missing estimates
 fall back to the proportional guard (ADR-0237). Native computer/Code Mode remain open S1 items, the live run is not a
 10-Worker/soak proof, and Keychain/TCC first-run still needs a real-machine
