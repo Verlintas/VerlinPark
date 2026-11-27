@@ -803,7 +803,7 @@ struct AutoBudgetSettingsCard: View {
                     )
                 }
                 Text(
-                    "Ratios are fractions from 0 to 1. Pause must not exceed warn. Turns per run is capped at 200 by the daemon. Disabled policies may exist without a cap, but enabling Auto requires one."
+                    "Ratios are fractions from 0 to 1. Pause must not exceed warn. Turns per run: 0 disables the per-run ceiling; explicit values are capped at 200 by the daemon. Disabled policies may exist without a cap, but enabling Auto requires one."
                 )
                 .font(VPTheme.mono(7))
                 .foregroundStyle(VPTheme.textTertiary)

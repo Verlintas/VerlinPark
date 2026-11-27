@@ -3139,7 +3139,7 @@ impl Default for AutoBudgetPolicy {
             min_runway_turns: 4,
             warn_at_ratio: 0.20,
             pause_at_ratio: 0.05,
-            max_turns_per_run: 60,
+            max_turns_per_run: 0,
             max_total_turns: None,
             no_progress_turns: 6,
             no_progress_action: NoProgressAction::Pause,
@@ -3264,14 +3264,14 @@ impl AutoBudgetPolicy {
                 "pause_at_ratio must not exceed warn_at_ratio",
             ));
         }
-        if !(1..=200).contains(&self.max_turns_per_run) {
+        if self.max_turns_per_run > 200 {
             return Err(BudgetValidationError::new(
                 auto_budget_codes::INVALID_AUTO_BUDGET_POLICY,
-                "max_turns_per_run must be between 1 and 200",
+                "max_turns_per_run must be 0 (no per-run cap) or 1-200",
             ));
         }
         if let Some(total) = self.max_total_turns
-            && (total == 0 || total < self.max_turns_per_run)
+            && (total == 0 || (self.max_turns_per_run > 0 && total < self.max_turns_per_run))
         {
             return Err(BudgetValidationError::new(
                 auto_budget_codes::INVALID_AUTO_BUDGET_POLICY,
@@ -27752,7 +27752,7 @@ mod auto_budget_type_tests {
         assert_eq!(policy.min_runway_turns, 4);
         assert_eq!(policy.warn_at_ratio, 0.20);
         assert_eq!(policy.pause_at_ratio, 0.05);
-        assert_eq!(policy.max_turns_per_run, 60);
+        assert_eq!(policy.max_turns_per_run, 0);
         assert_eq!(policy.no_progress_turns, 6);
         assert_eq!(policy.no_progress_action, NoProgressAction::Pause);
         assert!(policy.auto_tool_bundle);

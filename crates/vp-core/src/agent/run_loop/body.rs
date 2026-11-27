@@ -631,7 +631,7 @@ pub(in crate::agent) async fn run_loop_body(
     let explicit_max_turns = if owns_turns {
         auto_budget
             .as_ref()
-            .map(AutoBudgetRuntime::per_run_turn_limit)
+            .and_then(AutoBudgetRuntime::per_run_turn_limit)
             .or(config.max_turns)
     } else {
         config.max_turns

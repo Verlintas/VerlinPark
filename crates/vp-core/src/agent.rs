@@ -2452,8 +2452,8 @@ impl AutoBudgetRuntime {
 
     /// Auto sessions use the policy's per-run turn ceiling, not the provider
     /// adapter's global default. The hard clamp is part of the policy contract.
-    pub(in crate::agent) fn per_run_turn_limit(&self) -> u32 {
-        self.policy.max_turns_per_run.clamp(1, 200)
+    pub(in crate::agent) fn per_run_turn_limit(&self) -> Option<u32> {
+        (self.policy.max_turns_per_run > 0).then(|| self.policy.max_turns_per_run.clamp(1, 200))
     }
 
     /// Cumulative provider-turn ordinal for the current top-level session.
@@ -3453,7 +3453,12 @@ fn auto_turn_seconds(
         .effective_time_budget_secs
         .or(policy.initial_wall_clock_secs)
         .unwrap_or(1);
-    (initial / u64::from(policy.max_turns_per_run.max(1))).max(1)
+    let turns = if policy.max_turns_per_run > 0 {
+        policy.max_turns_per_run
+    } else {
+        policy.no_progress_turns.max(1)
+    };
+    (initial / u64::from(turns)).max(1)
 }
 
 fn auto_time_runway_turns(

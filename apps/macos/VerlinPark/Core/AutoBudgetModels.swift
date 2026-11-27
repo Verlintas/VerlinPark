@@ -221,7 +221,7 @@ struct AutoBudgetPolicy: Codable, Hashable, Sendable {
         minRunwayTurns: UInt32 = 4,
         warnAtRatio: Double = 0.20,
         pauseAtRatio: Double = 0.05,
-        maxTurnsPerRun: UInt32 = 60,
+        maxTurnsPerRun: UInt32 = 0,
         maxTotalTurns: UInt32? = nil,
         noProgressTurns: UInt32 = 6,
         noProgressAction: NoProgressAction = .pause,
@@ -267,7 +267,7 @@ struct AutoBudgetPolicy: Codable, Hashable, Sendable {
         minRunwayTurns = try container.decodeIfPresent(UInt32.self, forKey: .minRunwayTurns) ?? 4
         warnAtRatio = try container.decodeIfPresent(Double.self, forKey: .warnAtRatio) ?? 0.20
         pauseAtRatio = try container.decodeIfPresent(Double.self, forKey: .pauseAtRatio) ?? 0.05
-        maxTurnsPerRun = try container.decodeIfPresent(UInt32.self, forKey: .maxTurnsPerRun) ?? 60
+        maxTurnsPerRun = try container.decodeIfPresent(UInt32.self, forKey: .maxTurnsPerRun) ?? 0
         maxTotalTurns = try container.decodeIfPresent(UInt32.self, forKey: .maxTotalTurns)
         noProgressTurns = try container.decodeIfPresent(UInt32.self, forKey: .noProgressTurns) ?? 6
         noProgressAction =
@@ -364,13 +364,15 @@ struct AutoBudgetPolicy: Codable, Hashable, Sendable {
                 message: "Pause ratio must not exceed the warn ratio."
             )
         }
-        if !(1 ... 200).contains(maxTurnsPerRun) {
+        if maxTurnsPerRun > 200 {
             throw BudgetValidationIssue(
                 code: "INVALID_AUTO_BUDGET_POLICY",
-                message: "Turns per run must be between 1 and 200."
+                message: "Turns per run must be 0 (no cap) or 1-200."
             )
         }
-        if let maxTotalTurns, maxTotalTurns == 0 || maxTotalTurns < maxTurnsPerRun {
+        if let maxTotalTurns, maxTotalTurns == 0
+            || (maxTurnsPerRun > 0 && maxTotalTurns < maxTurnsPerRun)
+        {
             throw BudgetValidationIssue(
                 code: "INVALID_AUTO_BUDGET_POLICY",
                 message: "Total turns must be at least the per-run turn limit."
@@ -1446,7 +1448,7 @@ struct AutoBudgetPolicyDraft: Equatable {
     var minRunwayTurns = 4
     var warnAtRatio = 0.20
     var pauseAtRatio = 0.05
-    var maxTurnsPerRun = 60
+    var maxTurnsPerRun = 0
     var maxTotalTurnsText = ""
     var noProgressTurns = 6
     var noProgressAction = NoProgressAction.pause
@@ -1537,11 +1539,11 @@ struct AutoBudgetPolicyDraft: Equatable {
             )
         }
         guard let maxTurnsPerRun = UInt32(exactly: maxTurnsPerRun),
-              maxTurnsPerRun > 0
+              maxTurnsPerRun <= 200
         else {
             throw BudgetValidationIssue(
                 code: "INVALID_AUTO_BUDGET_POLICY",
-                message: "Turns per run must be between 1 and 200."
+                message: "Turns per run must be 0 (no cap) or 1-200."
             )
         }
         guard let noProgressTurns = UInt32(exactly: noProgressTurns) else {

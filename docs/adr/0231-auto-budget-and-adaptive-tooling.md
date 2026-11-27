@@ -1,6 +1,7 @@
 # 0231 — Auto budget and adaptive tooling
 
 - Status: Accepted
+- Per-run default superseded by: ADR-0236 (0/no ceiling; explicit 1-200)
 - Date: 2026-11-21
 - Scope: deterministic session budgets, forecast, hard caps, cumulative wall clock, no-progress pause/escalate, program/milestone reservations, conditional tool capabilities, Leader orchestrator bundle, operator surfaces
 - Depends on: ADR-0003 (manual model/budget configuration), ADR-0018 (session budget and cooperative cancel), ADR-0047 (in-flight budget reservations), ADR-0133 (explicit unlimited mode), ADR-0157 (programs and milestones), ADR-0190 (tool bundle partition), ADR-0229 (budget preflight estimation)

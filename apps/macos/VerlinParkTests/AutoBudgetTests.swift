@@ -77,7 +77,7 @@ final class AutoBudgetTests: XCTestCase {
         XCTAssertEqual(policy.minRunwayTurns, 4)
         XCTAssertEqual(policy.warnAtRatio, 0.20, accuracy: 0.0001)
         XCTAssertEqual(policy.pauseAtRatio, 0.05, accuracy: 0.0001)
-        XCTAssertEqual(policy.maxTurnsPerRun, 60)
+        XCTAssertEqual(policy.maxTurnsPerRun, 0)
         XCTAssertNil(policy.maxTotalTurns)
         XCTAssertEqual(policy.noProgressTurns, 6)
         XCTAssertEqual(policy.noProgressAction, .pause)

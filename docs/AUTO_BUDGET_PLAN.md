@@ -49,7 +49,7 @@ Project-scoped policy with session-level overrides at creation:
 - `min_runway_turns: u32` (default 4)
 - `warn_at_ratio: f64` (default 0.20)
 - `pause_at_ratio: f64` (default 0.05)
-- `max_turns_per_run: u32` (default 60, hard max 200)
+- `max_turns_per_run: u32` (default 0 = no per-run ceiling; explicit 1-200)
 - `max_total_turns: Option<u32>`
 - `no_progress_turns: u32` (default 6)
 - `no_progress_action: pause | escalate` (default pause)
