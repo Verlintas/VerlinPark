@@ -842,6 +842,7 @@ scale/soak evidence.
 | `just verify-dmg` | checksum, image, helpers, layout, signature passed |
 | live DeepSeek smoke | provider probe + `tool_calling=true`; full E2E idle; 93.85% cache hit |
 | live GUI smoke | wizard probe/tool calling, hardened trust, write_file idle, denied host-state shell |
+| live multi-agent plan | T2 merged via Verifier/Integrator; T1 verified but blocked by effect receipts; cache fixes added |
 
 The first preflight run exposed one load-sensitive ACP WebSocket timeout
 (20s) and two locale-dependent Swift assertions. The timeout was raised to 60s
@@ -889,3 +890,33 @@ this test.
   command did not run, and the session returned to `idle`.
 - Temp app data/repository were removed and the onboarding preference was
   restored after the test.
+
+### Live multi-agent plan validation (2026-11-27)
+
+A real DeepSeek two-task plan was created through the GUI in an isolated repo.
+This is partial evidence, not a clean two-task merge:
+
+- **T2 merged end-to-end**: Worker commit → independent Verifier approval →
+  `merge_queue.enqueued` → `integrator.started` → `merge_queue.updated` and
+  `plan_task.finished` with `merged: true` (session branch commit `d4dc6f4`).
+- **T1 verified, not merged**: the Verifier approved the isolated T1 commit
+  (`60d4a32`) with the correct `app/calc.py` diff, but integration was blocked
+  by `EFFECT_UNKNOWN` receipts from approved scratch shell probes. The Leader
+  asked the operator with bounded options; effect reconciliation and an answer
+  were recorded, then the Leader hit its **20-turn cap** before retrying T1.
+- A fresh T1 retry exposed generated `app/__pycache__/calc*.pyc` as a
+  write-scope violation. Two bounded fixes were added and unit-tested:
+  - Contract shell analysis no longer treats `rm -rf` of `__pycache__` /
+    `.pytest_cache` / `.mypy_cache` / `.ruff_cache` / `.pyc` inside the
+    worktree as destructive or out-of-scope, and permits `mkdir` of an
+    ancestor directory of an allowed path.
+  - Worker commit/scope checks ignore generated Python caches; `git add` no
+    longer stages them, so a test-generated `.pyc` cannot fail integration.
+- **Still open**: scratch commands that use a locally assigned variable
+  (`SCRATCH="$VERLINPARK_SCRATCH/..."`) still trigger host-state approvals and
+  `EFFECT_UNKNOWN` receipts; a mid-plan completion-reserve pause followed by
+  resume returned the session to idle without creating a Verifier/Integrator
+  for already-completed tasks; and the default 20-turn Leader cap is too low
+  for a two-task plan with operator reconciliation.
+- The plan run used the live key in the daemon environment only; the key was
+  never stored in the repo or session data.

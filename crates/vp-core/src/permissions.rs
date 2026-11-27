@@ -983,6 +983,25 @@ fn assess_target(raw: &str, cwd: &Path, worktree: &Path, recursive: bool) -> Per
     if raw == "~" || raw == "$HOME" || raw == "${HOME}" {
         return PermissionAssessment::new(RiskLevel::Destructive, "the home directory");
     }
+    // The daemon exports these stable scratch/worktree roots. A direct write
+    // below them is still sandbox-confined and should not look like an
+    // unanalyzable host expansion (which otherwise creates an approval/effect
+    // loop for routine Worker verification).
+    for prefix in [
+        "$VERLINPARK_SCRATCH",
+        "${VERLINPARK_SCRATCH}",
+        "$VERLINPARK_WORKTREE",
+        "${VERLINPARK_WORKTREE}",
+        "$TMPDIR",
+        "${TMPDIR}",
+    ] {
+        if raw.starts_with(prefix) && !raw.contains("..") {
+            return PermissionAssessment::new(
+                RiskLevel::WorkspaceWrite,
+                "scratch or worktree path inside the sandbox",
+            );
+        }
+    }
     if raw.contains('$') || raw.contains('~') || raw.contains('*') {
         return PermissionAssessment::new(RiskLevel::HostState, "path contains a shell expansion");
     }
@@ -1844,6 +1863,19 @@ mod tests {
             decide(ApprovalMode::Smart, &write, true),
             ApprovalDecision::Allow { .. }
         ));
+    }
+
+    #[test]
+    fn scratch_and_worktree_expansions_are_workspace_writes() {
+        assert_eq!(
+            shell("mkdir -p \"$VERLINPARK_SCRATCH/t1v2\"").risk,
+            RiskLevel::WorkspaceWrite
+        );
+        assert_eq!(
+            shell("echo x > \"$TMPDIR/verlinpark-check.txt\"").risk,
+            RiskLevel::WorkspaceWrite
+        );
+        assert!(shell("echo x > \"$HOME/verlinpark-check.txt\"").risk >= RiskLevel::HostState);
     }
 
     #[test]

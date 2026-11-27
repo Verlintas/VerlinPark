@@ -79,6 +79,19 @@ The wizard also gained a **Test current provider** button for env-configured
 daemons. Test data was removed and the owner's default project/app data was
 untouched.
 
+A live two-task TeamPlan test on 2026-11-27 reached the full T2 path:
+Worker → Verifier → merge queue → deterministic Integrator, with T2 merged on
+the session branch (`d4dc6f4`). T1 was independently approved but blocked by
+`EFFECT_UNKNOWN` receipts from approved scratch probes; operator reconciliation
+and a GNU-style operator question worked, but the Leader hit its 20-turn cap
+before retrying. A retry then exposed generated `app/__pycache__/*.pyc` as a
+write-scope violation. Fixed and unit-tested: contract shell analysis now treats
+in-worktree `__pycache__`/`.pytest_cache`/`.pyc` cleanup as a
+workspace write and permits ancestor `mkdir`; Worker commit/scope checks ignore
+generated Python caches and do not stage them. Still open: scratch-variable
+alias approvals/unknown effects, mid-plan pause/resume skipping Verifier for
+already-completed tasks, and the low default Leader turn cap.
+
 ---
 
 ## 2026-11-26 CUSTOS observe-only foundation

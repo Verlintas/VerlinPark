@@ -1690,6 +1690,13 @@ fn analyze_shell_inner(
                     if target == "/" || target == "~" || target == "/*" || target.contains("..") {
                         analysis.destructive = true;
                         analysis.writes_outside_scope = true;
+                    } else if is_workspace_cache_cleanup(target) {
+                        // Python/pytest cache cleanup inside the sandbox is a
+                        // routine workspace write, not host-state destruction.
+                        // Letting this escalate would make every test turn ask
+                        // for a destructive approval and create an unknown
+                        // effect receipt that blocks the merge.
+                        analysis.destructive = false;
                     } else if !shell_path_in_scope(contract, target, worktree) {
                         analysis.writes_outside_scope = true;
                         if recursive {
@@ -1698,8 +1705,16 @@ fn analyze_shell_inner(
                     }
                 }
             }
-            "mv" | "cp" | "install" | "ln" | "tee" | "touch" | "mkdir" | "truncate" | "unlink"
-            | "rmdir" => {
+            "mkdir" => {
+                for target in args.iter().filter(|arg| !arg.starts_with('-')) {
+                    if !shell_path_in_scope(contract, target, worktree)
+                        && !shell_path_is_scope_parent(contract, target)
+                    {
+                        analysis.writes_outside_scope = true;
+                    }
+                }
+            }
+            "mv" | "cp" | "install" | "ln" | "tee" | "touch" | "truncate" | "unlink" | "rmdir" => {
                 for target in args.iter().filter(|arg| !arg.starts_with('-')) {
                     if !shell_path_in_scope(contract, target, worktree) {
                         analysis.writes_outside_scope = true;
@@ -1806,6 +1821,65 @@ fn merge_analysis(target: &mut ShellAnalysis, nested: ShellAnalysis) {
     target.privileged |= nested.privileged;
     target.destructive |= nested.destructive;
     target.ambiguous |= nested.ambiguous;
+}
+
+/// Bounded cache-only cleanup exception for shell analysis. Only relative,
+/// traversal-free targets whose path components are known tool caches (or a
+/// `.pyc` file) qualify; the shell sandbox still confines the actual write.
+fn is_workspace_cache_cleanup(target: &str) -> bool {
+    let target = target.trim_matches(|ch| ch == '\'' || ch == '"');
+    if target.is_empty()
+        || target.starts_with('/')
+        || target.starts_with('~')
+        || target.contains("..")
+        || target.contains('$')
+        || target.contains('`')
+    {
+        return false;
+    }
+    let path = Path::new(target);
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pyc"))
+    {
+        return true;
+    }
+    path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(name)
+                if matches!(
+                    name.to_string_lossy().as_ref(),
+                    "__pycache__" | ".pytest_cache" | ".mypy_cache" | ".ruff_cache"
+                )
+        )
+    })
+}
+
+/// A directory creation is in scope when it is an ancestor of an allowed
+/// path (for example `mkdir -p app` for a task scoped to `app/calc.py`).
+/// Traversal, absolute paths, and shell expansion are never treated as parents.
+fn shell_path_is_scope_parent(contract: &TaskContract, raw: &str) -> bool {
+    if contract.unrestricted_scope {
+        return false;
+    }
+    let target = raw
+        .trim_matches(|ch| ch == '\'' || ch == '"')
+        .trim_end_matches('/');
+    if target.is_empty()
+        || target.starts_with('/')
+        || target.starts_with('~')
+        || target.contains("..")
+        || target.contains('$')
+        || target.contains('`')
+    {
+        return false;
+    }
+    let prefix = format!("{target}/");
+    contract
+        .allowed_paths
+        .iter()
+        .any(|allowed| allowed != "." && (allowed == target || allowed.starts_with(&prefix)))
 }
 
 fn shell_path_in_scope(contract: &TaskContract, raw: &str, worktree: &Path) -> bool {
@@ -2776,6 +2850,29 @@ mod tests {
             "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n*** Add File: docs/new.md\n",
         );
         assert_eq!(paths, vec!["docs/new.md", "src/lib.rs"]);
+    }
+
+    #[test]
+    fn shell_cache_cleanup_is_not_destructive_or_out_of_scope() {
+        let contract = derive_contract(derivation(vec!["app/calc.py".into()])).unwrap();
+        let worktree = Path::new(".");
+        let benign = analyze_shell_command("rm -rf app/__pycache__", &contract, worktree);
+        assert!(!benign.destructive, "{benign:?}");
+        assert!(!benign.writes_outside_scope, "{benign:?}");
+        let pyc = analyze_shell_command("rm -f app/calc.pyc", &contract, worktree);
+        assert!(!pyc.destructive, "{pyc:?}");
+        assert!(!pyc.writes_outside_scope, "{pyc:?}");
+        let mkdir = analyze_shell_command("mkdir -p app", &contract, worktree);
+        assert!(!mkdir.writes_outside_scope, "{mkdir:?}");
+        let unrelated = analyze_shell_command("mkdir -p docs", &contract, worktree);
+        assert!(unrelated.writes_outside_scope, "{unrelated:?}");
+        let scope = analyze_shell_command("rm -rf app", &contract, worktree);
+        assert!(scope.destructive, "{scope:?}");
+        assert!(scope.writes_outside_scope, "{scope:?}");
+        let traversal = analyze_shell_command("rm -rf app/__pycache__/../..", &contract, worktree);
+        assert!(traversal.destructive, "{traversal:?}");
+        let outside = analyze_shell_command("rm -rf /tmp/__pycache__", &contract, worktree);
+        assert!(outside.writes_outside_scope, "{outside:?}");
     }
 
     #[test]

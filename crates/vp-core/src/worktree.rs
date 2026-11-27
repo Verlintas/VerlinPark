@@ -418,6 +418,7 @@ pub fn changed_paths(worktree: &Path, base: &str) -> Result<Vec<String>> {
         .chain(untracked.lines())
         .map(str::trim)
         .filter(|path| !path.is_empty())
+        .filter(|path| !is_generated_cache_artifact(path))
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
     paths.sort();
@@ -430,9 +431,40 @@ pub fn commit_all(worktree: &Path, message: &str) -> Result<Option<String>> {
     if status.trim().is_empty() {
         return Ok(None);
     }
-    run_git(worktree, &["add", "-A"])?;
+    // Python/pytest caches are generated artifacts, not task output. Staging
+    // them makes an otherwise clean Worker commit fail write-scope integration
+    // (for example `app/__pycache__/calc.pyc` for a task scoped to
+    // `app/calc.py`). Keep them out of the commit and leave them untracked.
+    run_git(
+        worktree,
+        &[
+            "add",
+            "-A",
+            "--",
+            ".",
+            ":(exclude)**/__pycache__/**",
+            ":(exclude)**/*.pyc",
+            ":(exclude)**/.pytest_cache/**",
+            ":(exclude)**/.mypy_cache/**",
+            ":(exclude)**/.ruff_cache/**",
+        ],
+    )?;
+    let staged = git_output(worktree, &["diff", "--cached", "--name-only"])?;
+    if staged.trim().is_empty() {
+        return Ok(None);
+    }
     run_git(worktree, &["commit", "-m", message])?;
     Ok(Some(git_output(worktree, &["rev-parse", "HEAD"])?))
+}
+
+fn is_generated_cache_artifact(path: &str) -> bool {
+    path.ends_with(".pyc")
+        || path.split('/').any(|component| {
+            matches!(
+                component,
+                "__pycache__" | ".pytest_cache" | ".mypy_cache" | ".ruff_cache"
+            )
+        })
 }
 
 /// Merge an exact commit, not a mutable branch name. Callers should use this
@@ -958,6 +990,43 @@ mod tests {
             std::fs::read_to_string(session.path.join("worker.txt")).ok(),
             None
         );
+    }
+
+    #[test]
+    fn generated_python_caches_are_not_committed_or_scope_checked() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let session = create(repo.path(), data.path(), "project-1", "session-1").unwrap();
+        let task = create_task(
+            repo.path(),
+            data.path(),
+            "project-1",
+            "session-1",
+            "task-1",
+            &session.branch,
+        )
+        .unwrap();
+        std::fs::create_dir_all(task.path.join("app/__pycache__")).unwrap();
+        std::fs::write(
+            task.path.join("app/calc.py"),
+            "def add(a, b):\n    return a + b\n",
+        )
+        .unwrap();
+        std::fs::write(task.path.join("app/__pycache__/calc.pyc"), b"generated").unwrap();
+        let paths = changed_paths(&task.path, &task.base_commit).unwrap();
+        assert_eq!(paths, vec!["app/calc.py"]);
+        let commit = commit_all(&task.path, "task work").unwrap().unwrap();
+        let tree = git_output(&task.path, &["ls-tree", "-r", "--name-only", "HEAD"]).unwrap();
+        assert!(tree.contains("app/calc.py"));
+        assert!(!tree.contains("__pycache__"));
+        assert!(!tree.contains(".pyc"));
+        assert_eq!(
+            tree.lines().filter(|line| *line == "app/calc.py").count(),
+            1
+        );
+        assert!(task.path.join("app/__pycache__/calc.pyc").exists());
+        assert_eq!(commit.len(), 40);
     }
 
     #[test]
