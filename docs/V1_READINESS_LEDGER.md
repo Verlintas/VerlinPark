@@ -924,13 +924,20 @@ This is partial evidence, not a clean two-task merge:
   variables, `$HOME`, traversal, and arbitrary host paths remain conservative.
   Unit and contract tests cover the exact live-plan shape; a live plan has not
   yet been rerun after this change.
-- **Still open**: a mid-plan completion-reserve pause followed by resume
-  returned the session to idle without creating a Verifier/Integrator for
-  already-completed tasks. The legacy hidden 20-turn cap was removed in
-  ADR-0236: per-run ceilings are now operator-owned (`VERLINPARK_MAX_TURNS`,
-  `runtime-config-set --max-turns`, or Auto Budget) and default to none.
-  Completion reserve is task-aware (ADR-0237): active work may finish and
-  pending critical-path p90 drives the reserve.
+- **Mid-plan pause/verification loss was not reproduced in the deterministic
+  path.** `a_paused_plan_worker_still_verifies_and_merges_completed_work`
+  pauses a two-task plan while a Worker is between its write and final turns,
+  resumes, and asserts both tasks are verified by distinct Verifier agents and
+  merged. The reported live sequence could not be replayed because that
+  isolated data directory was removed, so this is a regression test for the
+  invariant, not proof that the original live state is fully explained. A plan
+  run that defers new work at dispatch now reports `Plan deferred: N task(s)
+  remain undispatched` instead of `Plan complete`; the pending rows stay for
+  the project scheduler or an explicit resume-plan. The legacy hidden 20-turn
+  cap was removed in ADR-0236: per-run ceilings are now operator-owned
+  (`VERLINPARK_MAX_TURNS`, `runtime-config-set --max-turns`, or Auto Budget)
+  and default to none. Completion reserve is task-aware (ADR-0237): active work
+  may finish and pending critical-path p90 drives the reserve.
 - The plan run used the live key in the daemon environment only; the key was
   never stored in the repo or session data.
 - **The completion reserve was blind to remaining work.** ADR-0237 makes it

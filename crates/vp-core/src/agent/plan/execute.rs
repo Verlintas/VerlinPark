@@ -1232,6 +1232,16 @@ pub(in crate::agent) async fn execute_team_plan(
         return Ok(PlanRunResult::Done(summary));
     }
 
+    if deferred_by_governor && !remaining.is_empty() {
+        // A resource/governor pause is not plan completion. Leave the pending
+        // rows pending for the scheduler or an explicit resume-plan, and make
+        // the tool result say so instead of printing "Plan complete".
+        reports.push(format!(
+            "Plan deferred: {} task(s) remain undispatched. Resume the plan when the resource block clears; the project task scheduler may also resume it.",
+            remaining.len()
+        ));
+        return Ok(PlanRunResult::Done(reports.join("\n")));
+    }
     let completed = statuses
         .values()
         .filter(|status| status.as_str() == "completed")

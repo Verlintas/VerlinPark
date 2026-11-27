@@ -705,6 +705,142 @@ impl Provider for PlanRoutingProvider {
     }
 }
 
+/// A real tool-driven two-task plan used to verify pause/resume around the
+/// verification boundary. The first Worker turn writes its file; the second
+/// turn can be held until the test has paused the session.
+struct PausableMergePlanProvider {
+    leader_calls: std::sync::atomic::AtomicUsize,
+    wrote: Mutex<std::collections::HashSet<String>>,
+    worker_ready: Arc<tokio::sync::Notify>,
+    release_worker: Arc<tokio::sync::Notify>,
+}
+
+impl PausableMergePlanProvider {
+    fn new() -> Self {
+        Self {
+            leader_calls: std::sync::atomic::AtomicUsize::new(0),
+            wrote: Mutex::new(std::collections::HashSet::new()),
+            worker_ready: Arc::new(tokio::sync::Notify::new()),
+            release_worker: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for PausableMergePlanProvider {
+    fn id(&self) -> &str {
+        "pausable-merge-plan"
+    }
+
+    async fn stream_chat(&self, request: ChatRequest) -> Result<EventStream, ProviderError> {
+        let last = request.messages.last();
+        let last_role = last.map(|message| message.role.as_str());
+        let last_content = last
+            .map(|message| message.content.clone())
+            .unwrap_or_default();
+        let user_text = request
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .map(|message| message.content.clone())
+            .unwrap_or_default();
+        let events = if user_text.contains("Verify Worker") {
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "verdict".into(),
+                    name: "submit_verdict".into(),
+                    arguments: serde_json::json!({
+                        "approved": true,
+                        "summary": "the task file exists and matches acceptance"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ]
+        } else if user_text.contains("Execute plan task T1")
+            || user_text.contains("Execute plan task T2")
+        {
+            let task = if user_text.contains("Execute plan task T1") {
+                "T1"
+            } else {
+                "T2"
+            };
+            let write = {
+                let mut wrote = self.wrote.lock().unwrap();
+                wrote.insert(task.to_string())
+            };
+            if write {
+                let (path, content) = if task == "T1" {
+                    ("src/t1.txt", "task one\n")
+                } else {
+                    ("src/t2.txt", "task two\n")
+                };
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: format!("write-{task}"),
+                        name: "write_file".into(),
+                        arguments: serde_json::json!({"path": path, "content": content})
+                            .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ]
+            } else {
+                if task == "T1" {
+                    self.worker_ready.notify_one();
+                    self.release_worker.notified().await;
+                }
+                vec![
+                    StreamEvent::TextDelta(format!("{task} done")),
+                    StreamEvent::Done,
+                ]
+            }
+        } else if last_role == Some("tool") && last_content.contains("Plan complete") {
+            vec![
+                StreamEvent::TextDelta("leader done".into()),
+                StreamEvent::Done,
+            ]
+        } else if last_role == Some("tool") {
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "run_plan".into(),
+                    name: "run_team_plan".into(),
+                    arguments: "{}".into(),
+                }),
+                StreamEvent::Done,
+            ]
+        } else {
+            let plan = serde_json::json!({
+                "goal": "pause around verification",
+                "departments": [{
+                    "name": "impl",
+                    "manager_title": "Implementation",
+                    "profile": "coding",
+                    "objective": "write both files"
+                }],
+                "tasks": [
+                    {"id": "T1", "department": "impl", "title": "One", "kind": "coding", "deps": [], "acceptance": ["src/t1.txt exists"], "write_scope": ["src/t1.txt"]},
+                    {"id": "T2", "department": "impl", "title": "Two", "kind": "coding", "deps": [], "acceptance": ["src/t2.txt exists"], "write_scope": ["src/t2.txt"]}
+                ]
+            });
+            let _ = self
+                .leader_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "submit_plan".into(),
+                    name: "submit_team_plan".into(),
+                    arguments: plan.to_string(),
+                }),
+                StreamEvent::Done,
+            ]
+        };
+        Ok(Box::pin(futures_util::stream::iter(
+            events.into_iter().map(Ok),
+        )))
+    }
+}
+
 struct BudgetPlanProvider {
     department_tokens: Option<u64>,
 }
@@ -5716,6 +5852,76 @@ async fn auto_dispatches_a_team_plan_in_dependency_batches() {
         .await
         .unwrap();
     assert_eq!(sessions[0].status, "idle");
+}
+
+#[tokio::test]
+async fn a_paused_plan_worker_still_verifies_and_merges_completed_work() {
+    let dir = TempDir::new().unwrap();
+    let provider = Arc::new(PausableMergePlanProvider::new());
+    let provider_trait: Arc<dyn Provider> = provider.clone();
+    let (engine, service, project) = test_service_with_provider(&dir, provider_trait);
+    let session = engine
+        .create_session(project.id.clone(), "pause and merge".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service.start(&session.id, "pause and merge").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), provider.worker_ready.notified())
+        .await
+        .expect("T1 should reach its second provider turn");
+    assert!(service.pause(&session.id).await.unwrap());
+    // Pause first, then let the Worker finish its turn. The Verifier must still
+    // run after the operator resumes; the paused session must not settle the
+    // task as completed without verification or integration.
+    provider.release_worker.notify_one();
+    let paused = engine
+        .list_sessions(Some(project.id.clone()))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.id == session.id)
+        .unwrap();
+    assert_eq!(paused.status, "paused");
+    assert!(service.resume(&session.id).await.unwrap());
+    let session = wait_until_idle(&engine, &session).await;
+    assert_eq!(session.status, "idle");
+
+    let queue = engine
+        .task_queue(Some(project.id.clone()), Some(session.id.clone()))
+        .await
+        .unwrap();
+    assert!(
+        queue.tasks.iter().all(|task| task.status == "completed"),
+        "both tasks must complete: {:?}",
+        queue.tasks
+    );
+    let merge_queue = engine.list_merge_queue(&session.id).await.unwrap();
+    assert_eq!(
+        merge_queue
+            .iter()
+            .filter(|entry| entry.status == "merged")
+            .count(),
+        2,
+        "both completed tasks must be merged: {merge_queue:?}"
+    );
+    let agents = engine.list_agents(&session.id).await.unwrap();
+    assert_eq!(
+        agents
+            .iter()
+            .filter(|agent| agent.role == "verifier")
+            .count(),
+        2,
+        "each completed task must have a Verifier run"
+    );
+    assert!(
+        agents
+            .iter()
+            .all(|agent| agent.role != "verifier" || agent.status == "idle"),
+        "Verifier runs must settle: {agents:?}"
+    );
 }
 
 #[tokio::test]
