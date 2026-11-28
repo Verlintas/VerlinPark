@@ -829,7 +829,7 @@ scale/soak evidence.
 
 | Check | Result |
 |---|---|
-| `cargo test -p vp-core --lib` | 2,757 passed / 0 failed / 2 ignored |
+| `cargo test -p vp-core --lib` | 2,761 passed / 0 failed / 2 ignored |
 | `cargo test -p vp-core --test secret_redaction` | 3 passed |
 | `cargo test -p vp-bench` | 164 passed / 1 ignored |
 | `cargo test -p vp-cli` | unit + integration suites passed |
@@ -841,7 +841,7 @@ scale/soak evidence.
 | `cargo clippy ... -D warnings` | passed |
 | `swiftformat --lint` | passed |
 | `just release-preflight full` | passed repeatedly, including after the shell-analysis fixes |
-| `cargo test --workspace` | 4,838 passed / 0 failed / 6 ignored |
+| `cargo test --workspace` | 4,842 passed / 0 failed / 6 ignored |
 | `xcodebuild test` | 544 app + 132 helper passed |
 | `scripts/package-release.sh` | DMG created (universal, ad-hoc signed) |
 | `just verify-dmg` | checksum, image, helpers, layout, signature passed |
