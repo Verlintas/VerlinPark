@@ -865,8 +865,9 @@ four-tier path with a deliberately non-human spatial output.
   installing it. The final DMG was rebuilt after the Python-cache, operator-owned
   turn ceiling, task-aware completion-reserve, shell-analysis, clean live
   two-task validation, supervisor-delegated approvals, live 10-task scale/crash
-  recovery, and contract-cwd/lease-recovery changes and reverified; SHA-256
-  `0a10575cae7e3c43f18d36ab375be4c52e9880875db5479ebf42f7bd1e127e17`.
+  recovery, contract-cwd/lease-recovery, CUSTOS Observer gate/root-selftest,
+  and tool-call schema-hardening changes and reverified; SHA-256
+  `cab9ba138e02bd11221234f464cc6cc81aeb2c427f337e87f8be672e0f98c0c8`.
   This is not Developer ID signing or notarization.
 - **A bad project entry could not be removed.** `project.remove` /
   `vp project-remove --yes` removes only an empty project (no sessions,
@@ -898,7 +899,7 @@ harness does not replace live multi-Worker, merge-conflict, daemon restart, or
 72-hour soak evidence. The live DeepSeek run is one small session, not that
 scale/soak evidence.
 
-### Evidence run (2026-11-28)
+### Evidence run (2026-11-29)
 
 | Check | Result |
 |---|---|
