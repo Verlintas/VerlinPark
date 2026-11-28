@@ -1,10 +1,10 @@
 # ◇ CUSTOS — deterministic integrity and repair supervisor
 
-Status: **observe-only foundation implemented** (ADR-0235): read-only server,
-four-role launchd installer/heartbeats/watchdog, local standard/forensic
-diagnostics, and a normal SwiftUI window with only the wordmark as ASCII art.
-The ring has not been installed/verified on a real machine; release signing
-and L2–L4 mutation classes remain open.
+Status: **observe-only foundation implemented** (ADR-0235); **v2 direction
+accepted** (ADR-0247): CUSTOS Observer by default and CUSTOS Advanced as a
+one-time, local-only root guardian with L2–L4. The current code is still
+observe-only; Advanced is not implemented, the ring has not been
+installed/verified on a real machine, and release signing/L2–L4 remain open.
 Process sampling is read-only shadow evidence and never signals; sealed one-way
 notices are delivered at turn boundaries and route to the owning agent/task when
 `supervised_process_owners` is present (Leader fallback otherwise); the hash vault
@@ -31,6 +31,18 @@ Branch: `Verlintas/m3-round`
 > VerlinPark app, not a separate `.app`. The owner declined a privileged
 > `custos-guard`; same-user residual is accepted. No stack samples or full
 > paths in diagnostics. See §16 and §17.
+>
+> **Round 5 owner direction (2026-11-29):** split the product into **CUSTOS
+> Observer** (default, no admin, read-only) and **CUSTOS Advanced** (one admin
+> installation, all capabilities at once). Advanced is a local-only Tier C
+> guardian: root monitor/executor, `_custos_core/_warden/_anchor/_sentinel`
+> independent users and keys, 2-of-3 signed intents, L2–L4, root-owned
+> audit/vault, and a local anti-rollback generation anchor. It does not use
+> Apple notarization/Developer ID, a local LLM, generative AI, or a network
+> dependency. Intelligence is deterministic (multi-signal, statistical,
+> causal/counterfactual, expected loss, incident learning); explanations are
+> fixed templates. Unattended/large/high-value work is gated on Advanced or an
+> explicit acknowledgement of Observer limits. See ADR-0247.
 
 This file is both the current-context handoff and the first Custos design
 proposal. It is intentionally outside the agent tool surface.

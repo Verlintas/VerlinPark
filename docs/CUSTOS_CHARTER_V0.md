@@ -45,6 +45,26 @@ Custos is symbolized as `◇CUSTOS`. The sigil is a seal, not a brand mascot.
   evidence.
 - **Action class**: L0–L5 authority level defined in Article 3.
 
+## v2 amendment (2026-11-29)
+
+- CUSTOS has two product surfaces: **Observer** (default, no admin, read-only)
+  and **CUSTOS Advanced** (one explicit admin installation, all L2–L4
+  capabilities enabled by default with evidence/quorum gates).
+- Advanced is a **local-only Tier C** guardian: root monitor/executor,
+  independent `_custos_*` role users/keys, 2-of-3 signed intents, root-owned
+  audit/vault, local monotonic generation anchor. It does not require Apple
+  Developer ID/notarization and does not use EndpointSecurity.
+- Authority remains L0–L4. The user configures/installs and can enter safe mode
+  or uninstall with explicit admin consent; there is no per-action operator
+  approval or runtime policy authorship.
+- **No generative AI/local LLM**, no provider key, no dynamic code. Diagnosis
+  and explanations are deterministic algorithms and fixed templates.
+- **No network dependency** in the default authority path. A future outbound
+  security anchor is optional, cannot send actions, cannot widen policy, and
+  has no inbound control plane.
+- The current implementation is still Observer-only; Advanced actions are not
+  implemented until their fault-injection/shadow/rollback gates pass.
+
 ## Article 1 — Mission and protected assets
 
 Custos protects, in priority order:

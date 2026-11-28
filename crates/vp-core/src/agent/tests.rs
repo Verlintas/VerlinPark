@@ -1925,6 +1925,61 @@ async fn smart_policy_denies_blocked_shell_without_asking() {
 }
 
 #[tokio::test]
+async fn agent_shell_cannot_signal_processes_even_in_smart_mode() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_kill".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "kill -9 1"}).to_string(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::TextDelta("the signal command was refused".into()),
+                StreamEvent::Done,
+            ],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "refuse process signaling".into(), None)
+        .await
+        .unwrap();
+    service
+        .start(&session.id, "refuse process signaling")
+        .await
+        .unwrap();
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+    let events = engine
+        .list_events(session.id.clone(), 0, 200)
+        .await
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "approval.requested"),
+        "a blocked signal command must never ask the user"
+    );
+    assert!(events.iter().any(|event| {
+        event.kind == "permission.denied"
+            && event.payload["tool"] == "shell"
+            && event.payload["risk"] == "destructive"
+    }));
+    assert!(events.iter().any(|event| {
+        event.kind == "tool.finished"
+            && event.payload["name"] == "shell"
+            && event.payload["is_error"] == true
+            && event.payload["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("Blocked by the local permission policy"))
+    }));
+}
+
+#[tokio::test]
 async fn writes_a_persisted_plan() {
     let dir = TempDir::new().unwrap();
     let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
@@ -7498,6 +7553,7 @@ fn shell_secret_roots_cover_session_scoped_daemon_state() {
         "media-transcode",
         "worktrees",
         "tmp",
+        "custos",
         "backup-keys",
     ] {
         std::fs::create_dir_all(data.path().join(relative)).unwrap();

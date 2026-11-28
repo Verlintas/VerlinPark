@@ -832,9 +832,17 @@ fn assess_shell_segment(
         "chmod" | "chown" | "chflags" | "xattr" | "setfacl" => {
             Some(assess_targets(args, cwd, worktree, false))
         }
-        "shutdown" | "reboot" | "halt" | "poweroff" | "killall" | "pkill" | "kill" => Some(
-            PermissionAssessment::new(RiskLevel::Destructive, "process or system power control"),
-        ),
+        "shutdown" | "reboot" | "halt" | "poweroff" => Some(PermissionAssessment::new(
+            RiskLevel::Destructive,
+            "process or system power control",
+        )),
+        // Agents must not signal arbitrary processes. `process` is the only
+        // supported path, and it can stop only processes it owns. Blocking
+        // here is deliberate and applies even in smart mode, so a prompt
+        // injection cannot kill the resident CUSTOS observer/guardian.
+        "killall" | "pkill" | "kill" => Some(PermissionAssessment::blocked(
+            "agent shell cannot signal processes; use the process tool for owned processes",
+        )),
         "diskutil" => Some(assess_diskutil(args)),
         "mkfs" | "newfs" | "fsck" => Some(PermissionAssessment::new(
             RiskLevel::Destructive,
@@ -1196,7 +1204,10 @@ fn assess_launchctl(args: &[String]) -> PermissionAssessment {
     if matches!(subcommand, "list" | "print" | "print-disabled" | "version") {
         PermissionAssessment::new(RiskLevel::ReadOnly, "launchctl inspection")
     } else {
-        PermissionAssessment::new(RiskLevel::Destructive, "host service management")
+        // Unloading/restarting a user LaunchAgent is exactly how an agent
+        // could disable the observer. Host service management is not a tool
+        // capability; read-only inspection remains allowed.
+        PermissionAssessment::blocked("agent shell cannot manage host services")
     }
 }
 
@@ -1497,6 +1508,9 @@ fn assess_interpreter_code(code: &str) -> Option<PermissionAssessment> {
         "child_process",
         "ctypes",
         "system(",
+        "os.kill",
+        "killpg",
+        "process.kill",
         "defaults write",
         "osascript",
         "security ",
@@ -2218,6 +2232,44 @@ done"#;
             decide(ApprovalMode::Smart, &assessment, false),
             ApprovalDecision::Deny { .. }
         ));
+    }
+
+    #[test]
+    fn process_signaling_commands_are_blocked() {
+        for command in [
+            "kill -9 1",
+            "pkill -f custos",
+            "killall custosd",
+            "kill -TERM $PPID",
+        ] {
+            let assessment = shell(command);
+            assert!(assessment.blocked, "{command}: {assessment:?}");
+            assert!(matches!(
+                decide(ApprovalMode::Smart, &assessment, false),
+                ApprovalDecision::Deny { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn mutating_launchctl_is_blocked_but_inspection_is_read_only() {
+        assert!(shell("launchctl bootstrap gui/501 ~/Library/LaunchAgents/x.plist").blocked);
+        assert!(shell("launchctl bootout gui/501/com.verlintas.custos").blocked);
+        assert!(shell("launchctl kickstart -k gui/501/com.verlintas.custos").blocked);
+        assert_eq!(shell("launchctl list").risk, RiskLevel::ReadOnly);
+        assert_eq!(shell("launchctl print gui/501").risk, RiskLevel::ReadOnly);
+    }
+
+    #[test]
+    fn interpreter_process_signaling_is_host_state() {
+        assert_eq!(
+            shell("python3 -c \"import os; os.kill(1, 9)\"").risk,
+            RiskLevel::HostState
+        );
+        assert_eq!(
+            shell("node -e 'process.kill(1)'").risk,
+            RiskLevel::HostState
+        );
     }
 
     #[test]

@@ -431,6 +431,46 @@ Tests: **4,686 Rust passed / 0 failed / 6 ignored**; `vp-store` 436; Swift
 659; clippy/fmt/SwiftFormat/xcodebuild pass. Remaining carried groups are
 listed below; Phase 0/2 live and scale evidence is still required.
 
+## CUSTOS v2 direction and Phase 1 (2026-11-29)
+
+ADR-0247 splits CUSTOS into **Observer** (default, no admin, read-only) and
+**CUSTOS Advanced** (one explicit admin install, all capabilities at once). The
+current code remains observe-only; Advanced is not implemented or installed.
+
+Direction:
+
+- Advanced is a local-only Tier C guardian: root monitor/executor,
+  `_custos_core/_warden/_anchor/_sentinel` independent users/keys, 2-of-3
+  signed intents, L2–L4, root-owned audit/vault, safe mode, and a local
+  monotonic generation anchor.
+- No Apple Developer ID/notarization, no local/generative LLM, and no network
+  dependency. Ad-hoc/source distribution with a documented Gatekeeper warning.
+- Intelligence is deterministic: evidence quality tiers, project/session
+  graph, statistical baselines, differential diagnosis, counterfactual
+  dependency closure, expected-loss decisions, cooldown/quorum, local incident
+  memory, and fixed-template explanations.
+- Unattended/large/high-value work is gated on Advanced or an explicit
+  acknowledgement of Observer limits.
+- Threat model: AI loss of control, prompt injection, agent mistakes, daemon
+  bugs, resource exhaustion, state/worktree corruption. Root/admin, kernel
+  compromise, and Apple supply-chain trust are explicit non-goals.
+
+Phase 1 backend slice implemented now:
+
+- agent shell `kill`/`pkill`/`killall` are always blocked (not user-approvable);
+  `process` remains the owned-process path;
+- mutating `launchctl` is blocked; `launchctl list/print/version` stays
+  read-only;
+- interpreter markers reject `os.kill`, `killpg`, and `process.kill`;
+- `custos/` is added to the shell secret/read-deny roots;
+- tests cover the permission decisions, shell read roots, and an end-to-end
+  smart-mode denial with no approval request.
+
+Still open: Observer/Advanced UI and gating, root monitor/executor, role
+users/keys, 2-of-3, root-owned audit/vault, L2–L4 actions, action-specific
+fault injection, local installer/safe mode, real-machine install/verify.
+These are not claimed as implemented.
+
 ## Carried findings from the V1 plan
 
 The following groups are carried from [V1_FINAL_PLAN.md](V1_FINAL_PLAN.md) §6.

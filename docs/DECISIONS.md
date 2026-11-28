@@ -250,6 +250,7 @@
 | [0244](adr/0244-supervisor-delegated-approvals.md) | Routine non-asset approvals are reviewed by the nearest supervisor agent; hardware/account/host/destructive requests stay with the operator; reviewer is one bounded provider call with a decision tool and audit events | Accepted (2026-11-28) | Runtime/Approvals/Security |
 | [0245](adr/0245-dead-process-lease-recovery.md) | Startup recovery releases unexpired session leases owned by a dead PID of the same daemon identity; live/foreign leases are preserved | Accepted (2026-11-28) | Runtime/Recovery/Leases |
 | [0246](adr/0246-contract-cd-scope.md) | Contract shell analysis follows `cd`/`pushd`; scratch/TMPDIR sentinels allow relative sandbox writes, worktree subdirectories resolve to real scope, and absolute/`..` paths stay conservative | Accepted (2026-11-28) | Security/Shell/Contracts |
+| [0247](adr/0247-custos-v2-local-guardian.md) | CUSTOS splits into Observer (default read-only) and Advanced (one admin install, local-only Tier C: root monitor/executor, 3 role users/2-of-3, L2–L4, root audit/vault); no Apple fee, no LLM, no network dependency; deterministic diagnosis + hard gate for unattended/high-value work | Accepted (2026-11-29) | CUSTOS/Guardian/Operations |
 
 ---
 

@@ -171,6 +171,31 @@ The four-role launchd ring is implemented but not yet installed/verified on a
 real machine; release signing and L2–L4 mutation classes remain open and are
 not claimed.
 
+## 2026-11-29 CUSTOS v2 direction: Observer and CUSTOS Advanced
+
+ADR-0247 replaces the same-user-ring-as-guardian direction with two explicit
+product surfaces:
+
+- **CUSTOS Observer** (default, no admin): read-only, same deterministic
+  diagnosis engine, notifications/shadow only; it teaches the user what it can
+  and cannot do and detects large/high-value/unattended work.
+- **CUSTOS Advanced** (one explicit admin install, all capabilities on): local
+  Tier C guardian with root monitor/executor, `_custos_core/_warden/_anchor/
+  _sentinel` independent users/keys, 2-of-3 signed intents, L2–L4, root-owned
+  audit/vault, safe mode, and a local generation anchor.
+- No Apple Developer ID/notarization, no local/generative LLM, and no network
+  dependency. Ad-hoc/source distribution; Gatekeeper warning is documented.
+- Intelligence is deterministic: multi-source evidence with quality tiers,
+  project/session graph, statistical baselines, differential diagnosis,
+  counterfactual dependency closure, expected-loss decisions, cooldown/quorum,
+  incident memory, and fixed-template explanations.
+- Unattended/large/high-value work is gated: install Advanced or explicitly
+  acknowledge Observer's limits. The Phase 1 backend slice now blocks agent
+  process-signaling commands and mutating `launchctl` and adds `custos/` to the
+  shell read-deny roots; the Observer/Advanced UI and gate remain to implement.
+- The current code is still observe-only; Advanced L2–L4 and the root ring are
+  not implemented or installed yet, and no L2–L4 behavior is claimed.
+
 ## 2026-11-26 V1 Phase 1 closure batch
 
 按 `V1_FINAL_PLAN.md` Phase 1 gate 先关闭一组本地可验证的 S0/S1：

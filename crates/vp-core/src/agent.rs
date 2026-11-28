@@ -3885,6 +3885,11 @@ pub(crate) fn shell_secret_roots(data_dir: &std::path::Path) -> Vec<PathBuf> {
         // re-allowed after the denies in `tools::sandboxed_command`.
         data_dir.join("worktrees"),
         data_dir.join("tmp"),
+        // CUSTOS state, audit, notices, vault, ring heartbeats, and discovery.
+        // Observer/Advanced must not be readable or signal-addressable by an
+        // agent shell; root-owned Advanced state will use a separate root path
+        // outside this data directory.
+        data_dir.join("custos"),
         // Backup signing keyring; it is 0600 for the daemon, not for a shell.
         data_dir.join("backup-keys"),
         data_dir.join("projects.jsonl"),
