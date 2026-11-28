@@ -509,6 +509,7 @@ fn build_agent_config(
         provider_idle_timeout_secs: 30,
         question_timeout_secs: 30,
         approval_mode: ApprovalMode::Unattended,
+        delegate_approvals: false,
         approval_timeout_secs: 30,
         compact_after_tokens: config.compact_after_tokens,
         compact_keep_messages: config.compact_keep_messages,

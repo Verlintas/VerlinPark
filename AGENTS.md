@@ -174,7 +174,14 @@ trigger shell-expansion approvals (ADR-0239). Per-run turn ceilings are now opt-
 `runtime-config-set --max-turns`, or Auto Budget); there is no hidden default.
 The completion reserve is task-aware (ADR-0237): running tasks can finish, and
 pending critical-path p90 estimates drive the reserve; missing estimates or a
-plan-less session fall back to the proportional guard.
+plan-less session fall back to the proportional guard. Routine non-asset
+approvals are now reviewed by the requesting agent's supervisor (ADR-0244):
+Labour→Worker, Worker→Manager, Manager→Leader, with one bounded tool-less
+provider review, `approval.review.*` events, and a 20s timeout. Hardware,
+account/credential, host-system, remote/ACP, mutating MCP, and destructive
+requests always stay with the operator. Delegation defaults on and can be
+disabled with `VERLINPARK_DELEGATE_APPROVALS=0`; the setting is visible in
+`agent.info`. Review fallbacks leave the approval pending for the operator.
 
 ## Commands
 

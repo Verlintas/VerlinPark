@@ -963,6 +963,46 @@ This is partial evidence, not a clean two-task merge:
 - The plan run used the live key in the daemon environment only; the key was
   never stored in the repo or session data.
 
+### Supervisor-delegated approvals (2026-11-28)
+
+Routine approval fatigue is now handled by the requesting agent's supervisor
+instead of the operator (ADR-0244):
+
+- **Asset-risk gate first.** `Destructive`, hardware/disk/firmware/power,
+  keychain/credentials/cloud logins, force-push, host-system commands, native
+  `computer`, sensitive browser, mutating MCP, remote ACP, and `remote_*`
+  requests always create a normal pending operator approval.
+- **Hierarchy.** Non-asset requests route to the nearest ancestor agent
+  (Labour→Worker, Worker→Manager, Manager→Leader; Verifier/Scout to their
+  manager). Leader, missing parent, lookup failure, or disabled delegation
+  falls back to the operator.
+- **Bounded reviewer.** One tool-less provider call, `temperature=0`, 256
+  output tokens, 20s timeout, redacted/bounded input preview, JSON
+  `{decision,reason}`. The reviewer cannot execute the action or approve a
+  blocked/denied request. Insufficient budget, provider failure, timeout, or
+  invalid JSON leaves the approval pending for the operator.
+- **Audit.** `approval.review.started|decided|failed` events carry
+  reviewer/decision/tokens/latency without raw input or secrets; review usage
+  is recorded as untasked coordination cost. The approval reason includes
+  `[delegated to <role> <name>]`.
+- **Default on.** `VERLINPARK_DELEGATE_APPROVALS=0/false/off/no/disabled`
+  restores user-only approvals; `agent.info` exposes the setting. Test harnesses
+  set it off so scripted providers are unaffected.
+- **Dialectical reasoning.** The reviewer prompt requires the strongest
+  counterargument; the shared agent prompt now asks every agent to consider the
+  task owner, operator/asset owner, security, maintainability, and failure
+  modes, and to report dissenting evidence.
+- **Tests.** Asset classification, supervisor selection, reply parsing, prompt
+  safety, and a real Leader→Manager→Worker Strict-mode write that the Manager
+  approves, after which the Worker is verified and merged without operator
+  action.
+
+Limits: the reviewer is an LLM and can be wrong or prompt-injected; the asset
+classifier is a bounded heuristic; reviewer identity is in events and the
+approval reason, not a dedicated approval row column/UI; ACP/remote approvals
+remain user-owned; review adds one provider call per delegated approval; this
+does not replace the sandbox, contract, effect, Verifier, or Integrator gates.
+
 ### Clean live two-task plan rerun (2026-11-28)
 
 After the shell-analysis fixes above, an isolated DeepSeek `deepseek-flash`

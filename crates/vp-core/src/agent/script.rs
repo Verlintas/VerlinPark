@@ -344,6 +344,7 @@ pub(super) async fn execute_script_inner_call(
         session,
         spec,
         control,
+        None,
         journal,
         &call_id,
         tool_name,

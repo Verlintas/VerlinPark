@@ -65,6 +65,113 @@ impl Provider for QueueProvider {
     }
 }
 
+/// Leader delegates one Worker. In Strict mode the Worker's write_file asks for
+/// approval; the Leader supervisor answers with a JSON approve, so no operator
+/// action is needed.
+struct SupervisorReviewProvider {
+    worker_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl Provider for SupervisorReviewProvider {
+    fn id(&self) -> &str {
+        "supervisor-review"
+    }
+
+    async fn stream_chat(&self, request: ChatRequest) -> Result<EventStream, ProviderError> {
+        let system = request.system.clone().unwrap_or_default();
+        let last = request.messages.last();
+        let last_role = last.map(|message| message.role.as_str());
+        let events = if system.contains("supervisor agent reviewing") {
+            vec![
+                StreamEvent::TextDelta(
+                    r#"{"decision":"approve","reason":"within the delegated worker scope"}"#.into(),
+                ),
+                StreamEvent::Done,
+            ]
+        } else if system.contains("You are a Verifier") {
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "verdict".into(),
+                    name: "submit_verdict".into(),
+                    arguments: serde_json::json!({
+                        "approved": true,
+                        "summary": "the supervised file matches acceptance"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ]
+        } else if system.contains("You are a department Manager") {
+            if last_role == Some("tool") {
+                vec![
+                    StreamEvent::TextDelta("manager done".into()),
+                    StreamEvent::Done,
+                ]
+            } else {
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "manager-delegate-worker".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({
+                            "role": "worker",
+                            "objective": "write the supervised file",
+                            "write_scope": ["worker.txt"]
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ]
+            }
+        } else if system.contains("You are a Worker") {
+            if last_role == Some("tool") {
+                vec![
+                    StreamEvent::TextDelta("worker wrote the file".into()),
+                    StreamEvent::Done,
+                ]
+            } else {
+                let _ = self
+                    .worker_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "worker-write".into(),
+                        name: "write_file".into(),
+                        arguments: serde_json::json!({
+                            "path": "worker.txt",
+                            "content": "supervised\n"
+                        })
+                        .to_string(),
+                    }),
+                    StreamEvent::Done,
+                ]
+            }
+        } else if last_role == Some("tool") {
+            vec![
+                StreamEvent::TextDelta("leader done".into()),
+                StreamEvent::Done,
+            ]
+        } else {
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "leader-delegate-manager".into(),
+                    name: "delegate".into(),
+                    arguments: serde_json::json!({
+                        "role": "manager",
+                        "title": "Implementation",
+                        "objective": "deliver the supervised file"
+                    })
+                    .to_string(),
+                }),
+                StreamEvent::Done,
+            ]
+        };
+        Ok(Box::pin(futures_util::stream::iter(
+            events.into_iter().map(Ok),
+        )))
+    }
+}
+
 struct RecordingProvider {
     requests: Arc<Mutex<Vec<ChatRequest>>>,
     responses: Mutex<VecDeque<Vec<StreamEvent>>>,
@@ -155,6 +262,7 @@ fn test_service_with_provider_cap(
         provider_idle_timeout_secs: 300,
         question_timeout_secs: 1800,
         approval_mode: ApprovalMode::default(),
+        delegate_approvals: false,
         approval_timeout_secs: 600,
         compact_after_tokens: 0,
         compact_keep_messages: 8,
@@ -203,6 +311,18 @@ fn set_approval_mode(service: &AgentService, mode: ApprovalMode) {
         .expect("test service is configured")
         .clone();
     config.approval_mode = mode;
+    *service.config.write().unwrap() = Some(config);
+}
+
+fn set_delegate_approvals(service: &AgentService, enabled: bool) {
+    let mut config = service
+        .config
+        .read()
+        .unwrap()
+        .as_ref()
+        .expect("test service is configured")
+        .clone();
+    config.delegate_approvals = enabled;
     *service.config.write().unwrap() = Some(config);
 }
 
@@ -14787,6 +14907,7 @@ fn leader_config(dir: &TempDir) -> AgentConfig {
         provider_idle_timeout_secs: 10,
         question_timeout_secs: 10,
         approval_mode: ApprovalMode::default(),
+        delegate_approvals: false,
         approval_timeout_secs: 10,
         compact_after_tokens: 0,
         compact_keep_messages: 4,
@@ -19357,6 +19478,7 @@ fn configured_service_for_test(
         provider_idle_timeout_secs: 300,
         question_timeout_secs: 1800,
         approval_mode: ApprovalMode::default(),
+        delegate_approvals: false,
         approval_timeout_secs: 600,
         compact_after_tokens: 0,
         compact_keep_messages: 8,
@@ -22916,6 +23038,76 @@ async fn a_fast_run_finishes_normally_before_the_wall_clock_deadline() {
     assert!(events.iter().any(|event| {
         event.kind == "agent.message" && event.payload["text"] == "finished in time"
     }));
+}
+
+#[tokio::test]
+async fn strict_worker_write_is_reviewed_by_its_supervisor() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(SupervisorReviewProvider {
+        worker_calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    set_approval_mode(&service, ApprovalMode::Strict);
+    set_delegate_approvals(&service, true);
+    let session = engine
+        .create_session(project.id, "supervised approval".into(), None)
+        .await
+        .unwrap();
+    service
+        .start(&session.id, "supervised approval")
+        .await
+        .unwrap();
+    let session = wait_until_idle(&engine, &session).await;
+    assert_eq!(session.status, "idle");
+    let worktree = session.worktree.clone().unwrap();
+    for event in engine
+        .list_events(session.id.clone(), 0, 400)
+        .await
+        .unwrap()
+    {
+        if event.kind.contains("approval")
+            || event.kind == "tool.finished"
+            || event.kind == "agent.finished"
+        {
+            eprintln!(
+                "DBG {} {}",
+                event.kind,
+                serde_json::to_string(&event.payload).unwrap_or_default()
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(std::path::Path::new(&worktree).join("worker.txt")).unwrap(),
+        "supervised\n"
+    );
+    let approvals = engine
+        .list_approvals(Some(session.id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(approvals[0].status, "approved");
+    assert!(
+        approvals[0]
+            .approval_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("[delegated to manager")),
+        "unexpected approval reason: {:?}",
+        approvals[0].approval_reason
+    );
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    let started = events
+        .iter()
+        .find(|event| event.kind == "approval.review.started")
+        .expect("review start event");
+    assert_eq!(started.payload["reviewer"]["agent_role"], "manager");
+    let decided = events
+        .iter()
+        .find(|event| event.kind == "approval.review.decided")
+        .expect("review decision event");
+    assert_eq!(decided.payload["decision"], "approve");
 }
 
 #[tokio::test]

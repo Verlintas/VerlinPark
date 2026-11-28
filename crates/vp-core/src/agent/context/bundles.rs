@@ -910,6 +910,7 @@ mod tool_surface_tests {
             provider_idle_timeout_secs: 300,
             question_timeout_secs: 1800,
             approval_mode: ApprovalMode::default(),
+            delegate_approvals: false,
             approval_timeout_secs: 600,
             compact_after_tokens: 0,
             compact_keep_messages: 8,

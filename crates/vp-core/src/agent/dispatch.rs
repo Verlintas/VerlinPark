@@ -252,6 +252,7 @@ pub(super) async fn authorize_tool_call(
     session: &Session,
     spec: &AgentSpec,
     control: &RunControl,
+    budget: Option<&SessionBudget>,
     journal: &crate::run_journal::RunJournal,
     call_id: &str,
     tool_name: &str,
@@ -409,6 +410,33 @@ pub(super) async fn authorize_tool_call(
                 .clone()
                 .unwrap_or_else(|| serde_json::json!({}));
             agent_fields(&mut context, spec);
+            // Asset-damaging requests (hardware, accounts/credentials, host
+            // system, destructive actions) always stay with the operator.
+            // Routine scope/attention requests go to the nearest supervisor
+            // agent for one bounded review instead of interrupting the user.
+            let asset_risk =
+                super::approval_review::classify_asset_risk(tool_name, input, risk, &reason);
+            let approval_route = super::approval_review::route_approval(
+                engine,
+                &session.id,
+                &spec.id,
+                asset_risk.as_ref(),
+                config.delegate_approvals,
+            )
+            .await;
+            let reviewer = match &approval_route {
+                super::approval_review::ApprovalRoute::Supervisor(reviewer) => {
+                    Some(reviewer.clone())
+                }
+                super::approval_review::ApprovalRoute::User => None,
+            };
+            let request_reason = match &reviewer {
+                Some(reviewer) => format!(
+                    "{reason} [delegated to {} {}]",
+                    reviewer.role, reviewer.name
+                ),
+                None => reason.clone(),
+            };
             let (approval, receiver) = Box::pin(engine.request_approval_with_risk(
                 &session.id,
                 call_id,
@@ -416,7 +444,7 @@ pub(super) async fn authorize_tool_call(
                 input.clone(),
                 Some(context),
                 Some(risk.as_str()),
-                Some(&reason),
+                Some(&request_reason),
             ))
             .await?;
             let approval_step = match journal
@@ -438,6 +466,37 @@ pub(super) async fn authorize_tool_call(
                 }
             };
             let wait_started = Instant::now();
+            let mut supervisor_denial: Option<String> = None;
+            if let (Some(reviewer), Some(budget)) = (&reviewer, budget)
+                && !control.is_cancelled()
+            {
+                let review = super::approval_review::review_approval(
+                    engine, config, session, budget, reviewer, &approval, spec, tool_name, input,
+                    risk, &reason, contract,
+                )
+                .await;
+                match &review {
+                    super::approval_review::ReviewOutcome::Approved => {
+                        let _ = engine.resolve_approval(&approval.id, true).await;
+                    }
+                    super::approval_review::ReviewOutcome::Denied {
+                        reason: review_reason,
+                    } => {
+                        supervisor_denial = Some(format!(
+                            "Supervisor {} ({}) denied this tool call: {review_reason}",
+                            reviewer.name, reviewer.role
+                        ));
+                        let _ = engine.resolve_approval(&approval.id, false).await;
+                    }
+                    super::approval_review::ReviewOutcome::Failed(kind) => {
+                        tracing::warn!(
+                            approval_id = %approval.id,
+                            kind,
+                            "supervisor review failed; leaving the approval for the operator"
+                        );
+                    }
+                }
+            }
             let outcome = match wait_for_approval(
                 receiver,
                 control,
@@ -447,7 +506,11 @@ pub(super) async fn authorize_tool_call(
             {
                 ApprovalOutcome::Approved => "approved",
                 ApprovalOutcome::Denied => {
-                    denied_reason = Some("The user denied this tool call.".to_string());
+                    denied_reason = Some(
+                        supervisor_denial
+                            .clone()
+                            .unwrap_or_else(|| "The user denied this tool call.".to_string()),
+                    );
                     "denied"
                 }
                 ApprovalOutcome::TimedOut => {

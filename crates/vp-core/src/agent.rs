@@ -66,6 +66,7 @@ use crate::worktree;
 // The agent runtime is split into cohesive submodules. Shared state/control
 // types stay in this parent module; the private re-exports below keep sibling
 // access flat across the split without widening the public API.
+mod approval_review;
 mod context;
 mod delegation;
 mod dispatch;
@@ -221,6 +222,11 @@ pub struct AgentConfig {
     pub question_timeout_secs: u64,
     /// Risk-based approval policy for tool calls.
     pub approval_mode: ApprovalMode,
+    /// Review non-asset permission requests with the requesting agent's
+    /// supervisor instead of sending every routine prompt to the operator.
+    /// Asset-risk requests (hardware/account/host/destructive) always stay
+    /// with the operator.
+    pub delegate_approvals: bool,
     /// Maximum time a tool/ACP approval may wait for a human.
     pub approval_timeout_secs: u64,
     /// Compact the active conversation after this many estimated tokens.

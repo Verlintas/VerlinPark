@@ -238,6 +238,7 @@ pub(super) async fn execute_tool_calls(
             session,
             spec,
             control,
+            Some(budget),
             journal,
             &call_id,
             &call.name,

@@ -121,6 +121,7 @@ fn test_service_with_compaction(
         provider_idle_timeout_secs: 30,
         question_timeout_secs: 60,
         approval_mode: ApprovalMode::default(),
+        delegate_approvals: false,
         approval_timeout_secs: 60,
         compact_after_tokens: 0,
         compact_keep_messages,

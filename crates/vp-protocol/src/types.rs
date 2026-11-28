@@ -9793,6 +9793,10 @@ pub struct AgentInfo {
     pub context_window: Option<u64>,
     #[serde(default)]
     pub approval_mode: ApprovalMode,
+    /// Routine approvals are reviewed by the requester's supervisor; asset-risk
+    /// requests always stay with the operator.
+    #[serde(default)]
+    pub delegate_approvals: bool,
     /// Static tool-bundle matrix. Additive in protocol v1; older clients that
     /// do not know the field ignore it.
     #[serde(default)]

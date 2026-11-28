@@ -247,6 +247,7 @@
 | [0241](adr/0241-find-root-shell-scope.md) | `find` roots are traversal scopes, not writes; `-exec` is assessed through the existing shell analyzer and `-delete` is a sandbox-confined write, while outside roots still escalate | Accepted (2026-11-28) | Security/Shell/Tooling |
 | [0242](adr/0242-redirection-token-shell-analysis.md) | Shell redirection operators/targets are removed from contract argument checks; the separate redirect audit still enforces scope | Accepted (2026-11-28) | Security/Shell/Tooling |
 | [0243](adr/0243-function-call-parentheses-shell.md) | Parentheses split shell segments only at a real boundary; function-call syntax in interpreter `-c` code is not misread as a command | Accepted (2026-11-28) | Security/Shell/Tooling |
+| [0244](adr/0244-supervisor-delegated-approvals.md) | Routine non-asset approvals are reviewed by the nearest supervisor agent; hardware/account/host/destructive requests stay with the operator; reviewer is one bounded, tool-less provider call with audit events | Accepted (2026-11-28) | Runtime/Approvals/Security |
 
 ---
 

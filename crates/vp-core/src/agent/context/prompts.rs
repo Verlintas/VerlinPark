@@ -171,6 +171,9 @@ pub(in crate::agent) fn role_prompt_parts(
          /tmp. Use the full 64-character sha256 returned by read tools \
          for expected hashes; never copy a shortened display prefix.\n\
          - Do not claim success without evidence.\n\
+         - Think dialectically: consider the task owner, the operator/asset owner, security, \
+         maintainability, and failure modes; state the strongest counterargument to your preferred \
+         approach before committing, and report dissenting evidence instead of hiding it.\n\
          - Project knowledge sources may be indexed: call search_sources before source-grounded \
          claims, and cite each used chunk with the exact [cN] key returned by the tool. Never \
          invent a citation key.\n\

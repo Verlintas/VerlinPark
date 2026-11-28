@@ -42,6 +42,17 @@ fn approval_mode_from_env() -> ApprovalMode {
     }
 }
 
+fn delegate_approvals_from_env() -> bool {
+    env::var("VERLINPARK_DELEGATE_APPROVALS")
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no" | "disabled"
+            )
+        })
+        .unwrap_or(true)
+}
+
 fn provider_env_is_usable(base_url: Option<&str>, api_key: Option<&str>) -> bool {
     if base_url.is_none() && api_key.is_none() {
         return false;
@@ -143,6 +154,7 @@ impl AgentService {
                     .unwrap_or(1800)
                     .clamp(60, 86400),
                 approval_mode: approval_mode_from_env(),
+                delegate_approvals: delegate_approvals_from_env(),
                 approval_timeout_secs: env::var("VERLINPARK_APPROVAL_TIMEOUT_SECS")
                     .ok()
                     .and_then(|value| value.parse().ok())
@@ -250,6 +262,12 @@ impl AgentService {
                 .unwrap_or(1800)
                 .clamp(60, 86400),
             approval_mode: params.approval_mode.unwrap_or_else(approval_mode_from_env),
+            delegate_approvals: self
+                .config
+                .read()
+                .ok()
+                .and_then(|config| config.as_ref().map(|config| config.delegate_approvals))
+                .unwrap_or_else(delegate_approvals_from_env),
             approval_timeout_secs: env::var("VERLINPARK_APPROVAL_TIMEOUT_SECS")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -337,6 +355,7 @@ impl AgentService {
                 capacity: self.capacity.snapshot(),
                 context_window: Some(config.context_window),
                 approval_mode: config.approval_mode,
+                delegate_approvals: config.delegate_approvals,
                 tool_bundles: tool_bundle_catalog_rows(),
             },
             None => AgentInfo {
@@ -348,6 +367,7 @@ impl AgentService {
                 capacity: self.capacity.snapshot(),
                 context_window: None,
                 approval_mode: ApprovalMode::default(),
+                delegate_approvals: true,
                 tool_bundles: tool_bundle_catalog_rows(),
             },
         }

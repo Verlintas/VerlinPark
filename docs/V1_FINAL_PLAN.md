@@ -469,7 +469,10 @@ the follow-on heredoc, `cp` source, `find -exec`, `2>&1`, plain `mktemp`, and
 interpreter-code misclassifications are now fixed and unit-tested (ADR-0238,
 0239, 0240, 0241, 0242, 0243). A deterministic pause-before-verification plan
 test asserts Verifier and merge completion after resume; a dispatch deferral
-reports `Plan deferred` rather than `Plan complete`. Per-run turn ceilings are
+reports `Plan deferred` rather than `Plan complete`. Routine non-asset
+approvals are delegated to the nearest supervisor agent (ADR-0244); asset-risk
+requests (hardware, accounts/credentials, host system, remote/ACP, mutating
+MCP, destructive) stay with the operator. Per-run turn ceilings are
 now operator-owned (default none), with budgets/no-progress/approvals/cancel as
 the normal bounds. The completion reserve is task-aware: running tasks can finish,
 pending critical-path p90 estimates drive the reserve, and missing estimates
