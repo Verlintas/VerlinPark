@@ -751,6 +751,52 @@ impl Store {
         Ok(row.lease)
     }
 
+    /// Release leases owned by a dead process of this same daemon identity.
+    ///
+    /// A `kill -9` leaves an unexpired session lease. Startup recovery would
+    /// otherwise treat that row as a live foreign process and keep the session
+    /// `running` until the TTL. The owner instance is `instance_id:pid`; only a
+    /// canonical UUID instance and a dead PID are reclaimed. A live process
+    /// (including another daemon sharing the data directory) and any
+    /// non-canonical/foreign owner label are preserved.
+    pub fn release_dead_process_runtime_leases(&self) -> Result<usize> {
+        let identity = self.daemon_identity.instance_id.clone();
+        let now = now_rfc3339();
+        let conn = self.lock()?;
+        let rows = {
+            let mut stmt = conn.prepare(
+                "SELECT lease_key, owner_instance FROM runtime_leases WHERE released_at IS NULL",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut released = 0usize;
+        for (id, owner_instance) in rows {
+            let Some((instance, pid)) = owner_instance.rsplit_once(':') else {
+                continue;
+            };
+            if instance != identity || Uuid::parse_str(instance).is_err() {
+                continue;
+            }
+            let Ok(pid) = pid.parse::<u32>() else {
+                continue;
+            };
+            if process_alive(pid) {
+                continue;
+            }
+            let changed = conn.execute(
+                "UPDATE runtime_leases
+                 SET released_at = ?1, heartbeat_at = ?1, expires_at = ?1
+                 WHERE lease_key = ?2 AND released_at IS NULL",
+                params![now, id],
+            )?;
+            released = released.saturating_add(changed);
+        }
+        Ok(released)
+    }
+
     /// Release a held lease. Release is token-fenced but intentionally allowed
     /// after expiry: if nobody has reacquired the key, cleaning up an expired
     /// row is harmless. A stale token can never delete a newer generation.
@@ -1015,6 +1061,19 @@ impl Store {
         })?;
         Ok(rows.collect::<Result<HashSet<_>, _>>()?)
     }
+}
+
+fn process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: `kill(pid, 0)` performs only an existence/permission check and
+    // does not send a signal.
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 #[cfg(test)]

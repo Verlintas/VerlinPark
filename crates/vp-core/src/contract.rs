@@ -1660,6 +1660,7 @@ fn analyze_shell_inner(
     if trimmed.starts_with("$(") || trimmed.starts_with('`') {
         analysis.ambiguous = true;
     }
+    let mut cwd = worktree.to_path_buf();
     for segment in split_shell_segments(trimmed) {
         let words = strip_shell_redirections(shell_words(&segment));
         if words.is_empty() {
@@ -1676,9 +1677,24 @@ fn analyze_shell_inner(
             }
         }
         let Some(name) = words.get(index).map(|value| basename(value)) else {
-            analysis.ambiguous = true;
+            // A bare assignment (`S=...`) is a valid no-op command segment.
+            // Only an assignment carrying command substitution is ambiguous:
+            // the contract analyzer does not execute the substitution.
+            if words
+                .iter()
+                .any(|word| word.contains("$(") || word.contains('`'))
+            {
+                analysis.ambiguous = true;
+            }
             continue;
         };
+        if matches!(name.as_str(), "cd" | "pushd")
+            && let Some(target) = words.get(index + 1)
+            && !target.starts_with('-')
+            && let Some(next) = resolve_contract_cwd(target, &cwd, worktree)
+        {
+            cwd = next;
+        }
         let args = &words[index + 1..];
         match name.as_str() {
             "sudo" | "su" | "doas" | "pkexec" => {
@@ -1700,7 +1716,7 @@ fn analyze_shell_inner(
                         // for a destructive approval and create an unknown
                         // effect receipt that blocks the merge.
                         analysis.destructive = false;
-                    } else if !shell_path_in_scope(contract, target, worktree) {
+                    } else if !path_in_contract_scope(contract, target, &cwd, worktree) {
                         analysis.writes_outside_scope = true;
                         if recursive {
                             analysis.destructive = true;
@@ -1710,7 +1726,7 @@ fn analyze_shell_inner(
             }
             "mkdir" => {
                 for target in args.iter().filter(|arg| !arg.starts_with('-')) {
-                    if !shell_path_in_scope(contract, target, worktree)
+                    if !path_in_contract_scope(contract, target, &cwd, worktree)
                         && !shell_path_is_scope_parent(contract, target)
                     {
                         analysis.writes_outside_scope = true;
@@ -1724,14 +1740,14 @@ fn analyze_shell_inner(
                 // look like an out-of-scope write. A move still writes every
                 // source path and keeps the conservative all-args rule.
                 for target in copy_like_write_targets(args) {
-                    if !shell_path_in_scope(contract, target, worktree) {
+                    if !path_in_contract_scope(contract, target, &cwd, worktree) {
                         analysis.writes_outside_scope = true;
                     }
                 }
             }
             "mv" | "tee" | "touch" | "truncate" | "unlink" | "rmdir" => {
                 for target in args.iter().filter(|arg| !arg.starts_with('-')) {
-                    if !shell_path_in_scope(contract, target, worktree) {
+                    if !path_in_contract_scope(contract, target, &cwd, worktree) {
                         analysis.writes_outside_scope = true;
                     }
                 }
@@ -1769,7 +1785,7 @@ fn analyze_shell_inner(
                     if target.contains(':') {
                         continue;
                     }
-                    if !shell_path_in_scope(contract, target, worktree) {
+                    if !path_in_contract_scope(contract, target, &cwd, worktree) {
                         analysis.writes_outside_scope = true;
                     }
                 }
@@ -1819,7 +1835,7 @@ fn analyze_shell_inner(
             _ => {}
         }
         if let Some(redirect) = redirection_target(&segment)
-            && !shell_path_in_scope(contract, &redirect, worktree)
+            && !path_in_contract_scope(contract, &redirect, &cwd, worktree)
         {
             analysis.writes_outside_scope = true;
         }
@@ -1927,6 +1943,67 @@ fn copy_like_write_targets(args: &[String]) -> Vec<&str> {
         .find(|arg| !arg.starts_with('-'))
         .map(|target| vec![target.as_str()])
         .unwrap_or_default()
+}
+
+const CONTRACT_SCRATCH_CWD: &str = "/__verlinpark_contract_scratch__";
+const CONTRACT_TMPDIR_CWD: &str = "/__verlinpark_contract_tmpdir__";
+
+fn resolve_contract_cwd(target: &str, cwd: &Path, worktree: &Path) -> Option<PathBuf> {
+    let target = target.trim_matches(|ch| ch == '"' || ch == '\'');
+    if target.is_empty() || target == "-" || target.contains("..") || target.contains('~') {
+        return None;
+    }
+    if target.starts_with("$VERLINPARK_SCRATCH") || target.starts_with("${VERLINPARK_SCRATCH}") {
+        return Some(PathBuf::from(CONTRACT_SCRATCH_CWD));
+    }
+    if target.starts_with("$VERLINPARK_WORKTREE") || target.starts_with("${VERLINPARK_WORKTREE}") {
+        return Some(worktree.to_path_buf());
+    }
+    if target.starts_with("$TMPDIR") || target.starts_with("${TMPDIR}") {
+        return Some(PathBuf::from(CONTRACT_TMPDIR_CWD));
+    }
+    if target.contains('$') || target.contains('`') {
+        return None;
+    }
+    let normalized = normalize_contract_path(target).ok()?;
+    if normalized.contains("..") {
+        return None;
+    }
+    if target.starts_with('/') {
+        return Some(PathBuf::from(normalized));
+    }
+    Some(cwd.join(normalized))
+}
+
+/// Scope check relative to the current shell directory. A relative path under
+/// an exported scratch/TMPDIR root is a sandbox-local write; a relative path
+/// under a worktree subdirectory is resolved back to a worktree-relative path.
+fn path_in_contract_scope(contract: &TaskContract, raw: &str, cwd: &Path, worktree: &Path) -> bool {
+    let raw = raw.trim();
+    let sandbox_cwd = cwd.starts_with(CONTRACT_SCRATCH_CWD) || cwd.starts_with(CONTRACT_TMPDIR_CWD);
+    if sandbox_cwd
+        && !raw.starts_with('/')
+        && !raw.starts_with('~')
+        && !raw.contains('$')
+        && !raw.contains("..")
+    {
+        return true;
+    }
+    if cwd != worktree
+        && !sandbox_cwd
+        && !raw.starts_with('/')
+        && !raw.starts_with('~')
+        && !raw.contains('$')
+        && !raw.contains("..")
+        && let Ok(normalized) = normalize_contract_path(raw)
+        && let Ok(relative) = cwd
+            .join(normalized)
+            .strip_prefix(worktree)
+            .map(Path::to_path_buf)
+    {
+        return shell_path_in_scope(contract, &relative.to_string_lossy(), worktree);
+    }
+    shell_path_in_scope(contract, raw, worktree)
 }
 
 fn shell_path_in_scope(contract: &TaskContract, raw: &str, worktree: &Path) -> bool {
@@ -2966,6 +3043,16 @@ mod tests {
         );
         assert!(!alias.destructive, "{alias:?}");
         assert!(!alias.writes_outside_scope, "{alias:?}");
+        let default_parameter = analyze_shell_command(
+            "SCRATCH=\"${VERLINPARK_SCRATCH:-$TMPDIR}/t10-review-$$\"; rm -rf \"$SCRATCH\"; mkdir -p \"$SCRATCH\"; cp -R app tests \"$SCRATCH\"/; cd \"$SCRATCH\" && python3 -m unittest discover -s tests -p 'test_m10.py' -v",
+            &contract,
+            worktree,
+        );
+        assert!(!default_parameter.destructive, "{default_parameter:?}");
+        assert!(
+            !default_parameter.writes_outside_scope,
+            "{default_parameter:?}"
+        );
         let heredoc = analyze_shell_command(
             "cat > \"$VERLINPARK_SCRATCH/test_ok.py\" <<'EOF'\nrm -rf /etc\nself.assertEqual(\"x\", \"y\")\nEOF\nPYTHONPATH=\"$(pwd)\" python3 \"$VERLINPARK_SCRATCH/test_ok.py\"\n",
             &contract,
@@ -2990,6 +3077,38 @@ mod tests {
         );
         assert!(!analysis.destructive, "{analysis:?}");
         assert!(!analysis.writes_outside_scope, "{analysis:?}");
+    }
+
+    #[test]
+    fn contract_scope_tracks_cd_into_scratch_and_worktree_subdirs() {
+        let contract = derive_contract(derivation(vec![
+            "app/m07.py".into(),
+            "tests/test_m07.py".into(),
+        ]))
+        .unwrap();
+        let worktree = Path::new(".");
+        let scratch = analyze_shell_command(
+            "cd \"$VERLINPARK_SCRATCH\" 2>/dev/null || cd \"$TMPDIR\"; rm -rf t07check; mkdir t07check; cd t07check; cp -R \"$OLDPWD\"/app \"$OLDPWD\"/tests .; python3 -m unittest discover -s tests -p 'test_m07.py' -v",
+            &contract,
+            worktree,
+        );
+        assert!(!scratch.destructive, "{scratch:?}");
+        assert!(!scratch.writes_outside_scope, "{scratch:?}");
+        let absolute = analyze_shell_command("cd /tmp; rm -rf x", &contract, worktree);
+        assert!(
+            absolute.destructive || absolute.writes_outside_scope,
+            "{absolute:?}"
+        );
+        let t10 = analyze_shell_command(
+            "set -e\nS=\"${VERLINPARK_SCRATCH:-$TMPDIR}/t10-mutcheck.$$\"\nrm -rf \"$S\"; mkdir -p \"$S/app\" \"$S/tests\"\ncp app/m10.py \"$S/app/m10.py\"; cp tests/test_m10.py \"$S/tests/test_m10.py\"\nsed -i '' 's/return 10/return 11/' \"$S/app/m10.py\"\nexport PYTHONDONTWRITEBYTECODE=1\ncd \"$S\"\npython3 -m unittest discover -s tests",
+            &contract,
+            worktree,
+        );
+        assert!(!t10.ambiguous, "{t10:?}");
+        assert!(!t10.writes_outside_scope, "{t10:?}");
+        assert!(!t10.destructive, "{t10:?}");
+        let subdir = analyze_shell_command("cd app; rm -rf other.py", &contract, worktree);
+        assert!(subdir.writes_outside_scope, "{subdir:?}");
     }
 
     #[test]

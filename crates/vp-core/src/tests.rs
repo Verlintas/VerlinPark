@@ -10982,6 +10982,53 @@ async fn restart_recovery_does_not_fail_a_session_with_a_live_foreign_lease() {
 }
 
 #[tokio::test]
+async fn restart_recovery_releases_a_dead_same_host_lease() {
+    let data = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    init_repo(repo.path());
+    let first = Engine::new(Store::open(data.path()).unwrap());
+    let project = first
+        .add_project(
+            repo.path().to_string_lossy().to_string(),
+            Some("dead lease".into()),
+        )
+        .await
+        .unwrap();
+    let session = first
+        .create_session(project.id, "dead lease".into(), None)
+        .await
+        .unwrap();
+    first
+        .update_session_status(&session.id, "running")
+        .await
+        .unwrap();
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let dead_pid = child.id();
+    child.wait().unwrap();
+    let instance = first.store().daemon_identity().instance_id.clone();
+    let store = first.store().clone();
+    store
+        .acquire_runtime_lease(
+            &format!("session:{}", session.id),
+            "dead-owner",
+            &format!("{instance}:{dead_pid}"),
+            "session",
+            Some(&session.id),
+            600,
+        )
+        .unwrap();
+    let restarted = Engine::new(Store::open(data.path()).unwrap());
+    restarted.recover_interrupted_sessions().await.unwrap();
+    let after = restarted.store().get_session(&session.id).unwrap().unwrap();
+    assert_eq!(after.status, "failed");
+    let leases = restarted.store().list_runtime_leases().unwrap();
+    assert!(
+        leases.iter().all(|lease| lease.released_at.is_some()),
+        "dead-process lease must be released: {leases:?}"
+    );
+}
+
+#[tokio::test]
 async fn continuation_claim_metadata_survives_replay_repair_bundle_and_rebuild() {
     let data = TempDir::new().unwrap();
     let repo = TempDir::new().unwrap();

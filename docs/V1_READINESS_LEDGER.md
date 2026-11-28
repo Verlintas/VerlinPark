@@ -1004,6 +1004,48 @@ approval reason, not a dedicated approval row column/UI; ACP permission
 bridges and remote approvals remain user-owned; review adds one provider call per delegated approval; this
 does not replace the sandbox, contract, effect, Verifier, or Integrator gates.
 
+### Live 10-task scale and crash recovery (2026-11-28)
+
+- Isolated DeepSeek `deepseek-flash` run: one department `impl`, exact 10-task
+  TeamPlan T01–T10, 10 disjoint write scopes, 8M fixed budget, hardened shell,
+  task scheduler off.
+- Initial batch: **10 concurrent Workers** (peak 10 before the first crash).
+  Result: **10/10 plan tasks completed, 10/10 merge-queue entries merged, 10
+  merge commits, 10/10 unit tests passing, 0 unknown effect receipts** (41
+  done). 343 provider calls, 5,462,152 input / 115,961 output tokens,
+  5,060,864 cache-read (92.65%); 2.42M of 8M budget remained.
+- 21 Worker spawns across retries, 5 durable runs interrupted, wall clock
+  2,784s including three `kill -9` restarts and operator decisions. This is not
+  a clean uninterrupted throughput benchmark.
+- Crash path: the first `kill -9` left the session `running` because its
+  unexpired lease looked foreign and `resume-plan` refused. ADR-0245 releases
+  an unexpired lease only when its `instance_id:pid` matches the persisted
+  daemon identity and the PID is dead. After that fix, restarts marked the
+  session failed, plan tasks interrupted, and `resume-plan` completed the
+  remaining tasks with no duplicate merge entries.
+- 10 approvals were denied during the run: malformed comma-separated cleanup,
+  `/tmp` copies, `${VERLINPARK_SCRATCH:-$TMPDIR}`/chained-mktemp/cwd shapes
+  before the fixes, and approval timeouts. The asset gate correctly kept these
+  out of delegated review; this is model/tooling friction, not a merge failure.
+- Limits: one host, one session; no live merge-conflict injection, no 72h soak,
+  and no 10-Worker GUI observation. The wall clock is not a throughput claim.
+
+### Live supervisor approval validation (2026-11-28)
+
+- Strict-mode one-task plan (1.5M budget, hardened shell, scheduler off): T1
+  merged commit `65ac7f8`, tests passing.
+- **7/7 supervisor reviews returned a valid decision, 0 failed** (5 approve,
+  2 deny). Reviewer latency 984–3,804ms (average 2,185ms); 7,477 input / 2,560
+  output reviewer tokens. Whole run: 33 calls, 361,344 input / 11,644 output,
+  87.46% cache hit.
+- The Manager denied a Worker's `git status` through shell (narrower `git` tool)
+  and a Verifier inline-code command; both agents adapted and the task still
+  merged. One Leader Strict approval had no supervisor and was manually
+  approved, demonstrating the user fallback.
+- The 10-task run's two review failures were the pre-fix 256-token truncation;
+  the 768-token + `review_approval` tool-call path has now been exercised live
+  with zero failures.
+
 ### Clean live two-task plan rerun (2026-11-28)
 
 After the shell-analysis fixes above, an isolated DeepSeek `deepseek-flash`

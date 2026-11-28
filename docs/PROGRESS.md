@@ -94,10 +94,12 @@ heredoc/`PYTHONPATH="$(pwd)"` commands are analyzed as workspace writes
 both tasks still get Verifier runs and merge; a dispatch deferral reports
 `Plan deferred` instead of `Plan complete`. A clean live DeepSeek two-task run
 on 2026-11-28 merged both tasks (0 unknown effects, 4/4 tests, ~96.8% cache
-hit); the only denied approval was a Verifier `/tmp` copy, which it adapted
-around. Routine non-asset approvals are now reviewed by the requester's
-supervisor (ADR-0244); only hardware/account/host/destructive requests remain
-with the operator. Turn ceilings are
+hit). A live 10-task/10-Worker run then completed 10/10 merges with 10/10 tests
+and 0 unknown effects; three `kill -9` restarts exercised dead-process lease
+recovery (ADR-0245), and a Strict one-task run exercised 7/7 supervisor review
+decisions with 0 failures. Routine non-asset approvals are now reviewed by the
+requester's supervisor (ADR-0244); only hardware/account/host/destructive
+requests remain with the operator. Turn ceilings are
 now operator-owned (default none) rather than a hidden constant. Completion
 reserve is now task-aware (ADR-0237): running tasks are not interrupted,
 pending critical-path p90 estimates drive the reserve, and missing estimates or

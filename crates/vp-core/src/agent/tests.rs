@@ -84,9 +84,15 @@ impl Provider for SupervisorReviewProvider {
         let last_role = last.map(|message| message.role.as_str());
         let events = if system.contains("supervisor agent reviewing") {
             vec![
-                StreamEvent::TextDelta(
-                    r#"{"decision":"approve","reason":"within the delegated worker scope"}"#.into(),
-                ),
+                StreamEvent::ToolCall(ToolCall {
+                    id: "review-decision".into(),
+                    name: "review_approval".into(),
+                    arguments: serde_json::json!({
+                        "decision": "approve",
+                        "reason": "within the delegated worker scope"
+                    })
+                    .to_string(),
+                }),
                 StreamEvent::Done,
             ]
         } else if system.contains("You are a Verifier") {

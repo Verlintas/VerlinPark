@@ -14,7 +14,7 @@ use crate::permissions::RiskLevel;
 use vp_protocol::types::{AgentRecord, Approval};
 
 const REVIEW_TIMEOUT: Duration = Duration::from_secs(20);
-const REVIEW_MAX_TOKENS: u32 = 256;
+const REVIEW_MAX_TOKENS: u32 = 768;
 const REVIEW_INPUT_PREVIEW_CHARS: usize = 1_600;
 const REVIEW_REASON_CHARS: usize = 240;
 const SUPERVISOR_MAX_DEPTH: usize = 4;
@@ -278,8 +278,25 @@ fn review_system_prompt() -> String {
      security, and failure modes; state the strongest counterargument to approval \
      before deciding. If the evidence is incomplete or the action could be replaced by \
      a narrower one, deny.\n\
-     Reply with JSON only, exactly: {\"decision\":\"approve\"|\"deny\",\"reason\":\"...\"}."
+     Call the review_approval tool exactly once with decision approve or deny and a reason under 200 characters. Do not answer with prose; call the tool."
         .to_string()
+}
+
+fn review_tool_schema() -> ToolSchema {
+    ToolSchema {
+        name: "review_approval".to_string(),
+        description: "Submit the supervisor's approve/deny decision for the permission request."
+            .to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "decision": {"type": "string", "enum": ["approve", "deny"]},
+                "reason": {"type": "string", "maxLength": 240}
+            },
+            "required": ["decision", "reason"],
+            "additionalProperties": false
+        }),
+    }
 }
 
 fn input_preview(tool: &str, input: &Value) -> String {
@@ -483,15 +500,21 @@ pub(in crate::agent) async fn review_approval(
         cache: None,
         max_tokens: Some(REVIEW_MAX_TOKENS),
         temperature: Some(0.0),
-        tools: Vec::new(),
+        tools: vec![review_tool_schema()],
     };
     let call = async {
         let mut stream = config.provider.stream_chat(request).await?;
         let mut text = String::new();
+        let mut tool_call: Option<(String, String)> = None;
         let mut usage = (0u64, 0u64, 0u64, 0u64);
         while let Some(item) = stream.next().await {
             match item? {
                 StreamEvent::TextDelta(delta) => text.push_str(&delta),
+                StreamEvent::ToolCall(call) => {
+                    if tool_call.is_none() {
+                        tool_call = Some((call.name, call.arguments));
+                    }
+                }
                 StreamEvent::Usage {
                     input_tokens,
                     output_tokens,
@@ -503,13 +526,13 @@ pub(in crate::agent) async fn review_approval(
                     usage.2 = usage.2.saturating_add(u64::from(cache_read_tokens));
                     usage.3 = usage.3.saturating_add(u64::from(cache_write_tokens));
                 }
-                StreamEvent::Done | StreamEvent::ToolCall(_) => {}
+                StreamEvent::Done => {}
             }
         }
-        Ok::<_, ProviderError>((text, usage))
+        Ok::<_, ProviderError>((text, tool_call, usage))
     };
     let result = timeout(REVIEW_TIMEOUT, call).await;
-    let (text, mut usage) = match result {
+    let (text, tool_call, mut usage) = match result {
         Ok(Ok(value)) => value,
         Ok(Err(error)) => {
             tracing::warn!(%error, session_id = %session.id, "supervisor review provider failed");
@@ -577,7 +600,11 @@ pub(in crate::agent) async fn review_approval(
     }
     budget.add_cost(cost);
     let latency_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-    let Some((approved, reply_reason)) = parse_review_reply(&text) else {
+    let reply = tool_call
+        .and_then(|(name, arguments)| (name == "review_approval").then_some(arguments))
+        .and_then(|arguments| parse_review_reply(&arguments))
+        .or_else(|| parse_review_reply(&text));
+    let Some((approved, reply_reason)) = reply else {
         let _ = engine
             .append_event(
                 &session.id,

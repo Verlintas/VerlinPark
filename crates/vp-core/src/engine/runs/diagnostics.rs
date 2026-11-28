@@ -2,6 +2,19 @@ use super::*;
 
 impl Engine {
     pub async fn recover_interrupted_sessions(&self) -> Result<usize> {
+        // A same-host crash leaves an unexpired session lease owned by a PID
+        // that no longer exists. Release only those dead local leases before
+        // session recovery; live or foreign owners stay untouched.
+        let lease_store = self.store.clone();
+        let released_leases =
+            tokio::task::spawn_blocking(move || lease_store.release_dead_process_runtime_leases())
+                .await??;
+        if released_leases > 0 {
+            tracing::warn!(
+                leases = released_leases,
+                "released dead-process runtime leases after daemon recovery"
+            );
+        }
         let store = self.store.clone();
         let (sessions, events) =
             tokio::task::spawn_blocking(move || store.recover_state()).await??;

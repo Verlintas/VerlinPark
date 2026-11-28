@@ -163,7 +163,11 @@ owner data were untouched. A clean live two-task TeamPlan on 2026-11-28
 completed both tasks through Worker→distinct Verifier→merge queue→Integrator
 with 0 unknown effects and 4/4 tests passing; an earlier run merged only T2
 because T1 was blocked by scratch-probe effect receipts, and a retry exposed
-generated `__pycache__/*.pyc` as a write-scope violation. Contract shell analysis and
+generated `__pycache__/*.pyc` as a write-scope violation. A live
+10-task/10-Worker run then completed 10/10 merges with 10/10 tests and 0 unknown
+effects, and three `kill -9` restarts exercised dead-process lease recovery
+(ADR-0245); a Strict one-task run exercised 7/7 supervisor review decisions with
+0 failures (ADR-0244). Contract shell analysis and
 Worker commit/scope checks now treat in-worktree Python cache cleanup and
 generated caches as sandbox-local rather than destructive or task output.
 Mid-plan pause/resume now has a deterministic regression test asserting

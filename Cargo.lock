@@ -4182,6 +4182,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "dirs",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

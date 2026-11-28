@@ -462,8 +462,10 @@ recorded but the sandbox still blocked an outside-worktree write, and a retry
 denial did not run the command. A clean live two-task TeamPlan (2026-11-28)
 completed both tasks end-to-end: Workers→distinct Verifiers→merge queue→
 deterministic Integrator, 0 unknown effect receipts, 4/4 tests passing, and
-~96.8% cache hit; exactly one `/tmp` scratch approval was correctly denied and
-the Verifier adapted. An earlier run merged T2 but left T1 blocked by
+~96.8% cache hit. A live 10-task/10-Worker run completed 10/10 merges with
+10/10 tests and 0 unknown effects, including three `kill -9` restarts that
+exercised dead-process lease recovery; a Strict one-task run exercised 7/7
+supervisor review decisions with 0 failures. An earlier run merged T2 but left T1 blocked by
 scratch-probe effect receipts and generated caches; those shell/cache paths and
 the follow-on heredoc, `cp` source, `find -exec`, `2>&1`, plain `mktemp`, and
 interpreter-code misclassifications are now fixed and unit-tested (ADR-0238,

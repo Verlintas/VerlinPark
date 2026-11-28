@@ -17,7 +17,9 @@ const EXPANSION_ROUNDS: usize = 8;
 /// direct `$NAME`/`${NAME}` references are resolved.
 pub(crate) fn scratch_aliases(command: &str) -> HashMap<String, String> {
     let mut aliases = HashMap::new();
-    let normalized = command.replace("&&", ";").replace("||", ";");
+    let normalized = normalize_sandbox_parameter_expansions(command)
+        .replace("&&", ";")
+        .replace("||", ";");
     for raw in normalized.split([';', '\n']) {
         let raw = raw.trim();
         let Some((name, value)) = raw.split_once('=') else {
@@ -27,12 +29,7 @@ pub(crate) fn scratch_aliases(command: &str) -> HashMap<String, String> {
         if !is_shell_variable(name) {
             continue;
         }
-        let value = value.trim();
-        if let Some(scratch) = scratch_mktemp_substitution(value) {
-            aliases.insert(name.to_string(), scratch.to_string());
-            continue;
-        }
-        let value = unquote(value);
+        let value = unquote(value.trim());
         let mut resolved = value.to_string();
         for _ in 0..EXPANSION_ROUNDS {
             let next = expand_variables(&resolved, &aliases);
@@ -40,6 +37,10 @@ pub(crate) fn scratch_aliases(command: &str) -> HashMap<String, String> {
                 break;
             }
             resolved = next;
+        }
+        if let Some(scratch) = scratch_mktemp_substitution(&resolved) {
+            aliases.insert(name.to_string(), scratch.to_string());
+            continue;
         }
         if is_scratch_root(&resolved) {
             aliases.insert(name.to_string(), resolved);
@@ -51,10 +52,67 @@ pub(crate) fn scratch_aliases(command: &str) -> HashMap<String, String> {
 /// Replace direct `$NAME` and `${NAME}` references for already-resolved scratch
 /// aliases. Unknown variables and shell metacharacters are left untouched.
 pub(crate) fn expand_scratch_aliases(command: &str, aliases: &HashMap<String, String>) -> String {
+    let normalized = normalize_sandbox_parameter_expansions(command);
     if aliases.is_empty() {
-        return command.to_string();
+        return normalized;
     }
-    expand_variables(command, aliases)
+    expand_variables(&normalized, aliases)
+}
+
+/// `NAME="${VERLINPARK_SCRATCH:-$TMPDIR}/x"` is a common safe idiom. Both
+/// branches are sandbox roots, but the `:-` form looked like an arbitrary
+/// expansion to the contract. Replace the whole parameter expansion with the
+/// named sandbox variable when the expression uses a default-value operator.
+/// Unrelated parameters are left untouched.
+fn normalize_sandbox_parameter_expansions(command: &str) -> String {
+    let bytes = command.as_bytes();
+    let mut output = String::with_capacity(command.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] != b'$' || bytes.get(index + 1) != Some(&b'{') {
+            output.push(bytes[index] as char);
+            index += 1;
+            continue;
+        }
+        let start = index + 2;
+        let mut depth = 1usize;
+        let mut cursor = start;
+        while cursor < bytes.len() {
+            match bytes[cursor] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            cursor += 1;
+        }
+        if cursor >= bytes.len() {
+            output.push('$');
+            index += 1;
+            continue;
+        }
+        let body = &command[start..cursor];
+        if let Some((name, _)) = body.split_once(":-").or_else(|| body.split_once('-')) {
+            let name = name.trim();
+            let replacement = match name {
+                "VERLINPARK_SCRATCH" | "VERLINPARK_WORKTREE" => Some("$VERLINPARK_SCRATCH"),
+                "TMPDIR" => Some("$TMPDIR"),
+                _ => None,
+            };
+            if let Some(replacement) = replacement {
+                output.push_str(replacement);
+                index = cursor + 1;
+                continue;
+            }
+        }
+        output.push_str(&command[index..=cursor]);
+        index = cursor + 1;
+    }
+    output
 }
 
 fn expand_variables(input: &str, aliases: &HashMap<String, String>) -> String {
@@ -211,6 +269,43 @@ mod tests {
         );
         let expanded = expand_scratch_aliases(command, &aliases);
         assert!(expanded.contains("cp app/x.py \"$VERLINPARK_SCRATCH/x.py\""));
+    }
+
+    #[test]
+    fn chained_mktemp_expands_prior_sandbox_aliases() {
+        let command = "S=\"${VERLINPARK_SCRATCH:-$TMPDIR}\"; M=$(mktemp -d \"$S/mut.XXXXXX\") || exit 1; cp -R app tests \"$M\"/";
+        let aliases = scratch_aliases(command);
+        assert_eq!(
+            aliases.get("S").map(String::as_str),
+            Some("$VERLINPARK_SCRATCH")
+        );
+        assert_eq!(
+            aliases.get("M").map(String::as_str),
+            Some("$VERLINPARK_SCRATCH")
+        );
+        let expanded = expand_scratch_aliases(command, &aliases);
+        assert!(expanded.contains("cp -R app tests \"$VERLINPARK_SCRATCH\"/"));
+    }
+
+    #[test]
+    fn sandbox_default_parameter_expansions_are_normalized() {
+        let command = "S=\"${VERLINPARK_SCRATCH:-$TMPDIR}/x\"; rm -rf \"$S\"";
+        let aliases = scratch_aliases(command);
+        assert_eq!(
+            aliases.get("S").map(String::as_str),
+            Some("$VERLINPARK_SCRATCH/x")
+        );
+        let expanded = expand_scratch_aliases(command, &aliases);
+        assert!(expanded.contains("rm -rf \"$VERLINPARK_SCRATCH/x\""));
+        let direct = expand_scratch_aliases(
+            "rm -rf \"${VERLINPARK_SCRATCH:-$TMPDIR}/y\"",
+            &HashMap::new(),
+        );
+        assert!(direct.contains("$VERLINPARK_SCRATCH/y"));
+        let tmp = expand_scratch_aliases("echo \"${TMPDIR:-/tmp}/z\"", &HashMap::new());
+        assert!(tmp.contains("$TMPDIR/z"));
+        let unrelated = expand_scratch_aliases("echo \"${HOME:-/tmp}\"", &HashMap::new());
+        assert_eq!(unrelated, "echo \"${HOME:-/tmp}\"");
     }
 
     #[test]

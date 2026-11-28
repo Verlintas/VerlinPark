@@ -2019,6 +2019,10 @@ mod tests {
             shell("D=$(mktemp -d); cp -R app \"$D\"/; echo x > \"$D/app/calc.py\"").risk,
             RiskLevel::WorkspaceWrite
         );
+        assert_eq!(
+            shell("SCRATCH=\"${VERLINPARK_SCRATCH:-$TMPDIR}/t10-review-$$\"; rm -rf \"$SCRATCH\"; mkdir -p \"$SCRATCH\"; cp -R app tests \"$SCRATCH\"/").risk,
+            RiskLevel::WorkspaceWrite
+        );
     }
 
     #[test]
