@@ -20,7 +20,9 @@ pub mod charter;
 pub mod client;
 pub mod diagnostics;
 pub mod discovery;
+pub mod gating;
 pub mod launchd;
+pub mod mode;
 pub mod notice;
 pub mod probe;
 pub mod process_probe;
@@ -32,6 +34,8 @@ pub mod vault;
 
 pub use capacity::{EffectiveCaps, MachineCapacity};
 pub use charter::{ActionClass, ActionSpec, CharterView};
+pub use gating::{evaluate, evaluate_plan};
+pub use mode::{advanced_marker_path, detect_tier, detect_tier_at};
 pub use probe::{ProbeReport, database_path, probe};
 pub use protocol::RingView;
 pub use protocol::{

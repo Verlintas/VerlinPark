@@ -5,6 +5,8 @@ import Foundation
 struct CustosStatus: Decodable, Sendable, Equatable {
     let state: CustosState
     let observeOnly: Bool
+    let tier: String?
+    let advancedInstalled: Bool?
     let role: String
     let charterHash: String
     let dimensions: [CustosDimension]
@@ -15,12 +17,20 @@ struct CustosStatus: Decodable, Sendable, Equatable {
     enum CodingKeys: String, CodingKey {
         case state
         case observeOnly = "observe_only"
+        case tier
+        case advancedInstalled = "advanced_installed"
         case role
         case charterHash = "charter_hash"
         case dimensions
         case counts
         case ring
         case generatedAt = "generated_at"
+    }
+}
+
+extension CustosStatus {
+    var tierWord: String {
+        tier == "advanced" ? "ADVANCED" : "OBSERVER"
     }
 }
 

@@ -76,6 +76,7 @@ private struct CustosHeaderBar: View {
             Spacer(minLength: 20)
 
             HStack(spacing: 14) {
+                CustosHeaderDatum(label: "TIER", value: model.tierLabel)
                 CustosHeaderDatum(label: "MODE", value: model.observeOnlyLabel)
                 CustosHeaderDatum(label: "ROLE", value: model.roleLabel)
                 Button("DIAGNOSTICS", action: onDiagnostics)

@@ -512,6 +512,8 @@ fn build_status(
         generated_at: vp_protocol::now_rfc3339(),
         state: overall,
         observe_only: state.observe_only,
+        tier: crate::mode::detect_tier().as_str().to_string(),
+        advanced_installed: crate::mode::detect_tier() == vp_protocol::custos::CustosTier::Advanced,
         role: state.role.as_str().to_string(),
         protocol: CUSTOS_PROTOCOL_VERSION,
         version: CUSTOS_VERSION.to_string(),

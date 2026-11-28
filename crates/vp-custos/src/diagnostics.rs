@@ -501,6 +501,8 @@ fn status_snapshot(context: &Collected) -> Status {
         generated_at: context.generated_at.clone(),
         state,
         observe_only: true,
+        tier: "observer".to_string(),
+        advanced_installed: false,
         role: "core".to_string(),
         protocol: CUSTOS_PROTOCOL_VERSION,
         version: CUSTOS_VERSION.to_string(),

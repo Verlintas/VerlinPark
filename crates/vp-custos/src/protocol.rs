@@ -158,6 +158,12 @@ pub struct Status {
     pub generated_at: String,
     pub state: CustosState,
     pub observe_only: bool,
+    /// `observer` or `advanced`; Advanced is recognized only from the
+    /// root-owned marker and is not granted by this field.
+    #[serde(default = "default_custos_tier")]
+    pub tier: String,
+    #[serde(default)]
+    pub advanced_installed: bool,
     pub role: String,
     pub protocol: u32,
     pub version: String,
@@ -167,6 +173,10 @@ pub struct Status {
     pub counts: Counts,
     pub ring: RingView,
     pub last_action: Option<ActionSummary>,
+}
+
+fn default_custos_tier() -> String {
+    "observer".to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

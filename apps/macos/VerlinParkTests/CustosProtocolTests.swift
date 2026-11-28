@@ -8,6 +8,9 @@ final class CustosProtocolTests: XCTestCase {
 
         XCTAssertEqual(status.state, .degraded)
         XCTAssertTrue(status.observeOnly)
+        XCTAssertEqual(status.tier, "observer")
+        XCTAssertEqual(status.advancedInstalled, false)
+        XCTAssertEqual(status.tierWord, "OBSERVER")
         XCTAssertEqual(status.role, "core")
         XCTAssertEqual(status.charterHash, "sha256:0123456789abcdef0123456789abcdef")
         XCTAssertEqual(status.dimensions.count, 7)
@@ -47,6 +50,15 @@ final class CustosProtocolTests: XCTestCase {
         XCTAssertEqual(status.generatedLabel, "2026-11-26 12:00:00")
         XCTAssertEqual(status.shortCharter, "sha256:0123456789abcdef...")
         XCTAssertTrue(status.sentence.contains("One dimension is degraded"))
+    }
+
+    func testAdvancedTierDecodesAsLabelOnly() throws {
+        let json = Self.statusJSON
+            .replacingOccurrences(of: #""tier": "observer""#, with: #""tier": "advanced""#)
+            .replacingOccurrences(of: #""advanced_installed": false"#, with: #""advanced_installed": true"#)
+        let status = try JSONDecoder().decode(CustosStatus.self, from: Data(json.utf8))
+        XCTAssertEqual(status.tierWord, "ADVANCED")
+        XCTAssertEqual(status.advancedInstalled, true)
     }
 
     func testUnknownStateFailsClosedToUnknownPresentation() throws {
@@ -140,6 +152,8 @@ final class CustosProtocolTests: XCTestCase {
       "generated_at": "2026-11-26T12:00:00Z",
       "state": "degraded",
       "observe_only": true,
+      "tier": "observer",
+      "advanced_installed": false,
       "role": "core",
       "protocol": 1,
       "version": "0.1.0",

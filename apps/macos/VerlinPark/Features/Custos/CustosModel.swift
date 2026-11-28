@@ -70,6 +70,13 @@ final class CustosModel {
         return status.observeOnly ? "OBSERVE ONLY" : "READ ONLY"
     }
 
+    /// Product tier, not the legacy observe-only flag. Advanced is only
+    /// reported when the root-owned marker is present; this label never grants
+    /// authority.
+    var tierLabel: String {
+        status?.tierWord ?? "OBSERVER"
+    }
+
     var charterLabel: String {
         status?.shortCharter ?? "--"
     }

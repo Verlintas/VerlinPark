@@ -191,10 +191,18 @@ product surfaces:
   incident memory, and fixed-template explanations.
 - Unattended/large/high-value work is gated: install Advanced or explicitly
   acknowledge Observer's limits. The Phase 1 backend slice now blocks agent
-  process-signaling commands and mutating `launchctl` and adds `custos/` to the
-  shell read-deny roots; the Observer/Advanced UI and gate remain to implement.
-- The current code is still observe-only; Advanced L2–L4 and the root ring are
-  not implemented or installed yet, and no L2–L4 behavior is claimed.
+  process-signaling commands and mutating `launchctl`, adds `custos/` to the
+  shell read-deny roots, and adds the shared `CustosTier`/`ProjectCustosPolicy`
+  gate model plus a read-only tier label. Daemon enforcement and the setup
+  sheet remain to implement.
+- `vp-custos-root` is a test-only SELFTEST-01 foundation: root layout and
+  no-follow ownership checks, Ed25519 role intents with 2-of-3 quorum,
+  expiry/epoch/target/replay checks, a closed `SELFTEST-01` executor with a
+  receipt and hash-chained audit, an installer **plan** (dry-run/yes contract),
+  and read-only Advanced status. It has no installer execution, role daemons,
+  monitor/executor, L2–L4, or real root install; 25 tests pass without root.
+- The current runtime remains observe-only; Advanced L2–L4 and the root ring
+  are not implemented or installed yet, and no L2–L4 behavior is claimed.
 
 ## 2026-11-26 V1 Phase 1 closure batch
 

@@ -464,12 +464,21 @@ Phase 1 backend slice implemented now:
 - interpreter markers reject `os.kill`, `killpg`, and `process.kill`;
 - `custos/` is added to the shell secret/read-deny roots;
 - tests cover the permission decisions, shell read roots, and an end-to-end
-  smart-mode denial with no approval request.
+  smart-mode denial with no approval request;
+- the shared `CustosTier`/`ProjectCustosPolicy` gate model is implemented
+  (unattended, scheduler, large plan, high-value; Observer ack; Advanced
+  required for high-value) and the CUSTOS window shows the read-only tier;
+- `vp-custos-root` adds a SELFTEST-01 foundation: root layout/no-follow
+  ownership checks, Ed25519 role intents with 2-of-3 quorum,
+  expiry/epoch/target/replay, a closed self-test executor with receipt and
+  hash-chained audit, an installer **plan** only, and read-only Advanced
+  status. 25 tests pass without root/sudo.
 
-Still open: Observer/Advanced UI and gating, root monitor/executor, role
-users/keys, 2-of-3, root-owned audit/vault, L2–L4 actions, action-specific
-fault injection, local installer/safe mode, real-machine install/verify.
-These are not claimed as implemented.
+Still open: daemon enforcement of the gate, Observer/Advanced setup UI,
+installer execution, role daemons, root monitor/executor, root-owned
+audit/vault/anchor wiring, L2–L4 actions, action-specific fault injection,
+safe mode/uninstall, real-machine install/verify. These are not claimed as
+implemented.
 
 ## Carried findings from the V1 plan
 
