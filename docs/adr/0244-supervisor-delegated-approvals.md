@@ -72,6 +72,9 @@ able to approve its own request.
 - The reviewer is an LLM and can be wrong or prompt-injected; the deterministic
   asset gate, contract/sandbox/effect gates, and operator-visible events bound
   the blast radius. This is not a guarantee.
+- Input redaction is the existing pattern/key redactor. An inline secret in a
+  shell command that does not match a known pattern can still reach the
+  reviewer provider; review inputs are bounded but not classified by entropy.
 
 ## Tests
 

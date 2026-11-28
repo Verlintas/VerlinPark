@@ -790,9 +790,10 @@ four-tier path with a deliberately non-human spatial output.
   `just verify-dmg` verified its checksum, image, app/helper layout, packaged
   `vp`/`verlinpadd`/`custos`/`custosd` entrypoints, and code signature without
   installing it. The final DMG was rebuilt after the Python-cache, operator-owned
-  turn ceiling, task-aware completion-reserve, shell-analysis, and clean live
-  two-task validation changes and reverified; SHA-256
-  `f27ecf80fd7934be0483d044f25aeda7cbe7a6ca0207215c8b1ea9d731e78b65`.
+  turn ceiling, task-aware completion-reserve, shell-analysis, clean live
+  two-task validation, and supervisor-delegated approval changes and
+  reverified; SHA-256
+  `e721d7367c54c98a3652990464ab007232c7b2cf6662ae0d22300acd5237aaff`.
   This is not Developer ID signing or notarization.
 - **A bad project entry could not be removed.** `project.remove` /
   `vp project-remove --yes` removes only an empty project (no sessions,
