@@ -305,13 +305,13 @@ pub fn classify_message(tool: &str, message: &str) -> Option<ToolErrorCode> {
 tool_error_codes! {
     // General
     TOOL_FAILED => "TOOL_FAILED", false, "general", "Inspect the error and evidence; do not retry an unknown failure unchanged.";
-    INVALID_ARGUMENT => "INVALID_ARGUMENT", false, "general", "Correct the tool arguments against the schema, then retry.";
+    INVALID_ARGUMENT => "INVALID_ARGUMENT", false, "general", "Compare the call with the advertised schema: exact field names, required fields, types, and enum values. Do not pass shell flags or positional arrays; fix the reported field and retry.";
     NOT_FOUND => "NOT_FOUND", false, "general", "Use find_files, list_dir, or a search tool to locate the target before retrying.";
-    PATH_ESCAPE => "PATH_ESCAPE", false, "general", "Use a path relative to the worktree that stays inside the project root.";
-    PERMISSION_DENIED => "PERMISSION_DENIED", false, "general", "Request the missing permission or choose a workspace-scoped alternative; do not repeat the denied call.";
+    PATH_ESCAPE => "PATH_ESCAPE", false, "general", "Use a path relative to the worktree that stays inside the project root; do not add .., an absolute prefix, or a symlink.";
+    PERMISSION_DENIED => "PERMISSION_DENIED", false, "general", "Request the missing permission or choose a workspace-scoped alternative; do not repeat the denied call or try to bypass the policy.";
     APPROVAL_TIMEOUT => "APPROVAL_TIMEOUT", true, "general", "Ask the user to resolve the approval, then retry the same call.";
     SKILL_TOOL_DENIED => "SKILL_TOOL_DENIED", false, "general", "Use a tool allowed by the active skill, or deactivate the skill before retrying.";
-    TOOL_NOT_AVAILABLE => "TOOL_NOT_AVAILABLE", false, "general", "Check the role/profile tool policy or call tool_search for an available alternative.";
+    TOOL_NOT_AVAILABLE => "TOOL_NOT_AVAILABLE", false, "general", "Use an exact advertised tool name from the current bundle; shell commands such as cat or ls are not tool names. Call tool_search with a short description to inspect an available tool.";
     BUDGET_EXHAUSTED => "BUDGET_EXHAUSTED", false, "general", "Stop expanding the run; report the partial result and let the operator raise the budget.";
     BUDGET_RESERVED => "BUDGET_RESERVED", false, "general", "A non-critical task was deferred to protect the critical path; retry after the critical path completes or raise the session budget.";
     BUDGET_THROTTLED => "BUDGET_THROTTLED", true, "general", "The session is inside the critical-path throttle zone; wait for critical work to finish or raise the budget.";
@@ -347,14 +347,14 @@ tool_error_codes! {
     GATE_LOOPBACK_DISABLED => "GATE_LOOPBACK_DISABLED", false, "gates", "The project has not enabled the loopback resolve endpoint. Use `vp gate resolve` or the authenticated gate.resolve RPC.";
 
     // File, read, write, edit, patch
-    FILE_NOT_FOUND => "FILE_NOT_FOUND", false, "file", "Verify the path relative to the worktree; use find_files or list_dir instead of guessing.";
-    FILE_TOO_LARGE => "FILE_TOO_LARGE", false, "file", "Read a bounded line range or search for the relevant region instead of loading the whole file.";
+    FILE_NOT_FOUND => "FILE_NOT_FOUND", false, "file", "Verify the worktree-relative path with find_files or list_dir; do not guess an absolute or host path.";
+    FILE_TOO_LARGE => "FILE_TOO_LARGE", false, "file", "Read a bounded offset/limit range or search for the relevant region instead of loading the whole file.";
     FILE_NOT_TEXT => "FILE_NOT_TEXT", false, "file", "Use read_pdf, read_image, read_document, or a binary-aware viewer instead.";
     BINARY_FILE => "BINARY_FILE", false, "file", "Do not load binary data as UTF-8; use the matching media or office tool.";
-    HASH_MISMATCH => "HASH_MISMATCH", true, "file", "Re-read the file to obtain the current sha256, then regenerate the edit.";
-    PATCH_CONFLICT => "PATCH_CONFLICT", true, "file", "Re-read the file and regenerate the patch from its current content; do not retry the stale patch.";
-    WRITE_FAILED => "WRITE_FAILED", false, "file", "Check the path and worktree permissions; use dry_run to validate the change first.";
-    READ_FAILED => "READ_FAILED", false, "file", "Check the path and file encoding; use file_info to inspect metadata first.";
+    HASH_MISMATCH => "HASH_MISMATCH", true, "file", "Re-read the file to obtain the current full 64-character sha256, then regenerate the edit; never reuse a shortened display prefix.";
+    PATCH_CONFLICT => "PATCH_CONFLICT", true, "file", "Re-read the file and regenerate the patch from its current content; use edit_file for one exact replacement or apply_patch for a unified diff, and do not retry the stale hunk.";
+    WRITE_FAILED => "WRITE_FAILED", false, "file", "Check the worktree-relative path and permissions; use edit_file for an existing file, write_file for a new file or full rewrite, and dry_run to validate first.";
+    READ_FAILED => "READ_FAILED", false, "file", "Check the worktree-relative path and encoding; use read_file for one file, read_files for several, and file_info to inspect metadata first.";
     SYMLINK_REFUSED => "SYMLINK_REFUSED", false, "file", "Target the real path inside the worktree; symlink writes are deliberately refused.";
     NOT_A_DIRECTORY => "NOT_A_DIRECTORY", false, "file", "Pass a directory path, or use a file tool for the file.";
     NOT_A_FILE => "NOT_A_FILE", false, "file", "Pass a file path; directory mutations use file_manage.";
@@ -389,7 +389,7 @@ tool_error_codes! {
     GIT_DIRTY => "GIT_DIRTY", false, "git", "Commit or discard worktree changes before the requested Git operation.";
 
     // Shell and project tasks
-    COMMAND_FAILED => "COMMAND_FAILED", false, "shell", "Read the exit code and stderr, fix the first real error, then rerun the smallest failing check.";
+    COMMAND_FAILED => "COMMAND_FAILED", false, "shell", "Read the exit code and stderr, fix the first real error, then rerun the smallest failing check. Prefer run_project_task for detected build/test/lint commands.";
     COMMAND_TIMEOUT => "COMMAND_TIMEOUT", false, "shell", "Reduce the command scope or raise timeout_secs explicitly; do not blindly retry a command with side effects.";
     SHELL_DENIED => "SHELL_DENIED", false, "shell", "Use an allowed workspace command or request approval; do not bypass the policy.";
     SHELL_SANDBOX_FAILED => "SHELL_SANDBOX_FAILED", false, "shell", "Report the sandbox failure; do not run the command unsandboxed.";

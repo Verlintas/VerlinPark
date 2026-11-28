@@ -993,7 +993,7 @@ impl AgentTool for ReadFile {
     }
 
     fn description(&self) -> &'static str {
-        "Read a UTF-8 text file from the project. Returns line-numbered content and a content hash for stale-read checks."
+        "Read one UTF-8 text file from the project. Returns line-numbered content and the full sha256 for stale-read checks. Use read_files for two or more files; do not call read_file once per path."
     }
 
     fn schema(&self) -> Value {
@@ -1203,7 +1203,7 @@ impl AgentTool for Grep {
     }
 
     fn description(&self) -> &'static str {
-        "Search project files with a regular expression. Returns path:line matches plus machine-readable context."
+        "Search project files with a regular expression. Returns path:line matches plus machine-readable context. Use this instead of shell rg/grep; use find_files to discover paths by glob."
     }
 
     fn schema(&self) -> Value {
@@ -1385,7 +1385,7 @@ impl AgentTool for EditFile {
     }
 
     fn description(&self) -> &'static str {
-        "Replace an exact string in an existing UTF-8 file atomically. Returns a bounded diff and content hashes."
+        "Replace exact text in an existing UTF-8 file atomically. Returns a bounded diff and content hashes. Use write_file for a new file or a complete rewrite."
     }
 
     fn schema(&self) -> Value {
@@ -1396,7 +1396,7 @@ impl AgentTool for EditFile {
                 "old_string": {"type": "string", "description": "Exact text to replace"},
                 "new_string": {"type": "string", "description": "Replacement text"},
                 "replace_all": {"type": "boolean", "description": "Replace every match; default false"},
-                "expected_sha256": {"type": "string", "description": "Reject the edit if the current file hash differs"},
+                "expected_sha256": {"type": "string", "description": "Reject the edit if the current full 64-character sha256 differs; never pass the shortened display prefix"},
                 "dry_run": {"type": "boolean", "description": "Validate and return a diff without writing"}
             },
             "required": ["path", "old_string", "new_string"]
@@ -1521,7 +1521,7 @@ impl AgentTool for WriteFile {
     }
 
     fn description(&self) -> &'static str {
-        "Create, overwrite, or append to a UTF-8 file atomically in the worktree. Use append:true for bounded chunks when a file is too large for one provider turn. Returns the content hash and a bounded diff."
+        "Create, overwrite, or append to a UTF-8 file atomically in the worktree. Prefer edit_file for a targeted change to an existing file. Use append:true for bounded chunks when a file is too large for one provider turn. Returns the content hash and a bounded diff."
     }
 
     fn schema(&self) -> Value {
@@ -1531,7 +1531,7 @@ impl AgentTool for WriteFile {
                 "path": {"type": "string", "description": "Path relative to the worktree root"},
                 "content": {"type": "string", "description": "Content to write; at most 48 KiB per call"},
                 "append": {"type": "boolean", "description": "Append to an existing file instead of overwriting it"},
-                "expected_sha256": {"type": "string", "description": "Reject the write if the current file hash differs"},
+                "expected_sha256": {"type": "string", "description": "Reject the write if the current full 64-character sha256 differs; never pass the shortened display prefix"},
                 "dry_run": {"type": "boolean", "description": "Validate and return a diff without writing"}
             },
             "required": ["path", "content"]
@@ -1903,7 +1903,7 @@ impl AgentTool for Shell {
     }
 
     fn description(&self) -> &'static str {
-        "Run a non-interactive shell command in the agent worktree. The command already starts in the worktree; do not cd to the git root. Writes are confined to the worktree, its Git metadata, and runtime scratch; use $VERLINPARK_SCRATCH for throwaway verification copies, never a scratch directory inside the worktree. Host-level commands may require permission."
+        "Run a non-interactive shell command in the agent worktree. Prefer typed tools for file reads/writes/search, git inspection, and detected project checks; use shell for commands that have no typed tool. The command already starts in the worktree; do not cd to the git root. Writes are confined to the worktree, its Git metadata, and runtime scratch; use $VERLINPARK_SCRATCH for throwaway verification copies, never a scratch directory inside the worktree. Host-level commands may require permission."
     }
 
     fn schema(&self) -> Value {

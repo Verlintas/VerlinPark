@@ -3291,7 +3291,7 @@ fn permission_risk_classification_table() {
             "shell",
             json!({"command": "launchctl unload /x.plist"}),
             RiskLevel::Destructive,
-            false,
+            true,
         ),
         (
             "shell",

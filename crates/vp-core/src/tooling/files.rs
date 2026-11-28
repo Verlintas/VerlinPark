@@ -338,7 +338,7 @@ impl AgentTool for ReadFiles {
     }
 
     fn description(&self) -> &'static str {
-        "Read several UTF-8 files or line ranges in one call. Returns per-file hashes and truncation metadata."
+        "Read several UTF-8 files or line ranges in one call (at most 20). Returns per-file full sha256 hashes and truncation metadata. Use read_file for one file; there is no max_bytes field."
     }
 
     fn schema(&self) -> Value {

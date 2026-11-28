@@ -480,6 +480,30 @@ audit/vault/anchor wiring, L2–L4 actions, action-specific fault injection,
 safe mode/uninstall, real-machine install/verify. These are not claimed as
 implemented.
 
+## Tool-call reliability hardening (2026-11-29)
+
+The repository has no measured live tool success-rate metric, so this round fixed
+deterministic avoidable failures instead of claiming a statistic:
+
+- frozen-schema argument validation runs before duplicate-write/approval/
+  contract/effect work; missing required fields, wrong types, invalid enums, and
+  closed-schema extras return typed `INVALID_ARGUMENT` with a hint while
+  preserving provider history and the repeated-failure guard;
+- unknown tool names return `TOOL_NOT_AVAILABLE` with bounded closest-name
+  suggestions instead of falling through the External approval path;
+- `read_tool_output.output_ref` is accepted as a handle alias;
+- `tool_help` recipes/examples were corrected to match the schemas
+  (`read_tool_output` paging fields, `run_project_task` no `args`,
+  `browser.open`, `coordinate.message`, real `find_references` ids, no
+  `tool_help.format`, `git diff` scope/base);
+- sibling-tool descriptions and hash/test/path hints were tightened;
+- the adversarial corpus now expects mutating `launchctl` blocked.
+
+Verification: `cargo test -p vp-core` 2,775 lib passed / 0 failed / 2 ignored
+plus all integration suites; workspace clippy/fmt pass. Limits: the validator is
+not a full JSON Schema engine (`oneOf`/`$ref`/`pattern`/`format` are ignored);
+tool implementations remain authoritative; no live provider benchmark was run.
+
 ## Carried findings from the V1 plan
 
 The following groups are carried from [V1_FINAL_PLAN.md](V1_FINAL_PLAN.md) §6.

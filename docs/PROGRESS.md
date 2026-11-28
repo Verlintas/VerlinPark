@@ -204,6 +204,38 @@ product surfaces:
 - The current runtime remains observe-only; Advanced L2–L4 and the root ring
   are not implemented or installed yet, and no L2–L4 behavior is claimed.
 
+## 2026-11-29 Tool-call reliability hardening
+
+No real success-rate metric exists in the repo, so this round fixed deterministic
+failure sources rather than claiming a measured improvement:
+
+- Parsed tool arguments are validated against the frozen advertised schema
+  before duplicate-write, approval, contract, and effect work. Missing required
+  fields, wrong types, invalid enums, and closed-schema extras return typed
+  `INVALID_ARGUMENT` with an actionable hint; provider call/result history and
+  the repeated-failure guard are preserved.
+- Unknown tool names return `TOOL_NOT_AVAILABLE` with bounded closest-name
+  suggestions before the approval broker, instead of becoming
+  `PERMISSION_DENIED` through the External-risk path.
+- `read_tool_output` accepts the spilled-result `output_ref` as a handle alias.
+- The static `tool_help` recipes now match the advertised schemas:
+  `read_tool_output(handle/offset/limit/pattern)`, `run_project_task` without
+  `args`, `browser(action=open)`, `coordinate(message)`, real
+  `find_references` symbol ids, no `tool_help.format`, and `git diff` scope/base.
+- Descriptions distinguish `read_file`/`read_files`, `write_file`/`edit_file`,
+  `shell`/`run_project_task`, and `grep`/shell search; full-hash and
+  test-command hints are more explicit.
+- A shared `tooling::schema` validator is used by the normal dispatcher and Code
+  Mode, removing the previous private duplicate.
+- The adversarial corpus now expects mutating `launchctl` to be blocked, matching
+  the CUSTOS Phase 1 security change.
+
+Tests: `cargo test -p vp-core` 2,775 lib passed / 0 failed / 2 ignored and all
+integration suites passed; workspace clippy and fmt pass. The validator is a
+bounded usability guard, not a full JSON Schema implementation; tool
+implementations remain authoritative. No live provider success-rate benchmark
+was run.
+
 ## 2026-11-26 V1 Phase 1 closure batch
 
 按 `V1_FINAL_PLAN.md` Phase 1 gate 先关闭一组本地可验证的 S0/S1：

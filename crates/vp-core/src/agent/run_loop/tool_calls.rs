@@ -1,5 +1,79 @@
 use super::*;
 
+/// Record a deterministic argument failure without executing the tool. The
+/// provider still receives one result per call so its tool-call history stays
+/// valid, and the failure is auditable like any other `tool.finished` event.
+#[allow(clippy::too_many_arguments)]
+async fn reject_tool_arguments(
+    engine: &Engine,
+    config: &AgentConfig,
+    session: &Session,
+    spec: &AgentSpec,
+    top_level: bool,
+    call_id: &str,
+    call_name: &str,
+    code: crate::tooling::errors::ToolErrorCode,
+    reason: String,
+    hint: String,
+    tool_failure_guard: &mut ToolFailureGuard,
+    conversation: &mut Vec<ChatMessage>,
+    conversation_ids: &mut Vec<Option<String>>,
+) -> Result<()> {
+    let output = ToolOutput::error_coded(call_name, code, reason)
+        .with_failure_hint(hint)
+        .with_failure_evidence(format!("tool={call_name}"));
+    emit(
+        engine,
+        &session.id,
+        spec,
+        "tool.finished",
+        tool_finished_payload(
+            call_id,
+            call_name,
+            &output,
+            0,
+            None,
+            config.approval_mode,
+            None,
+        ),
+    )
+    .await?;
+    if top_level {
+        let stored = engine
+            .append_message(
+                &session.id,
+                "tool",
+                &output.content,
+                serde_json::json!([]),
+                Some(call_id.to_string()),
+            )
+            .await?;
+        conversation_ids.push(Some(stored.id));
+    }
+    if let Some(loop_stop) = tool_failure_guard.observe(call_name, &output) {
+        emit(
+            engine,
+            &session.id,
+            spec,
+            "agent.tool_failure_loop",
+            serde_json::json!({
+                "tool": loop_stop.tool,
+                "attempts": loop_stop.attempts,
+                "last_error": loop_stop.last_error,
+            }),
+        )
+        .await?;
+        return Err(anyhow!(
+            "TOOL_FAILURE_LOOP: tool '{}' failed {} consecutive times; last error: {}. Stop retrying this tool unchanged.",
+            loop_stop.tool,
+            loop_stop.attempts,
+            loop_stop.last_error
+        ));
+    }
+    conversation.push(ChatMessage::tool(call_id.to_string(), output.content));
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_tool_calls(
     engine: &Engine,
@@ -79,50 +153,101 @@ pub(super) async fn execute_tool_calls(
         } else {
             call.id.clone()
         };
-        let input: serde_json::Value = match parse_tool_arguments(&call.arguments) {
+        let mut input: serde_json::Value = match parse_tool_arguments(&call.arguments) {
             Ok(input) => input,
             Err(reason) => {
                 // Never execute a tool with guessed input. The provider still
                 // receives a tool result so its call/result history stays
                 // valid, and the failure is typed and auditable.
-                let output = ToolOutput::error_coded(
-                    call.name.as_str(),
+                let hint = crate::tooling::schema::parse_failure_hint(&call.name, &reason);
+                reject_tool_arguments(
+                    engine,
+                    config,
+                    session,
+                    spec,
+                    top_level,
+                    &call_id,
+                    &call.name,
                     crate::tooling::errors::ToolErrorCode::INVALID_ARGUMENT,
                     reason,
-                )
-                .with_failure_evidence("invalid_tool_arguments");
-                emit(
-                    engine,
-                    &session.id,
-                    spec,
-                    "tool.finished",
-                    tool_finished_payload(
-                        &call_id,
-                        &call.name,
-                        &output,
-                        0,
-                        None,
-                        config.approval_mode,
-                        None,
-                    ),
+                    hint,
+                    tool_failure_guard,
+                    conversation,
+                    conversation_ids,
                 )
                 .await?;
-                if top_level {
-                    let stored = engine
-                        .append_message(
-                            &session.id,
-                            "tool",
-                            &output.content,
-                            serde_json::json!([]),
-                            Some(call_id.clone()),
-                        )
-                        .await?;
-                    conversation_ids.push(Some(stored.id));
-                }
-                conversation.push(ChatMessage::tool(call_id, output.content));
                 continue;
             }
         };
+        // Only documented aliases are normalized; this does not widen the
+        // callable surface or bypass any later gate.
+        crate::tooling::schema::normalize_argument_aliases(&call.name, &mut input);
+        // Catch shape mistakes before duplicate/approval/effect work. The tool
+        // still validates its own arguments after dispatch; this only gives the
+        // model a precise, non-retryable field error instead of a later generic
+        // failure or a silently ignored extra field on a closed schema.
+        if let Some(schema) = tools.iter().find(|tool| tool.name == call.name)
+            && let Err(error) =
+                crate::tooling::schema::validate_arguments(&schema.parameters, &input, 0)
+        {
+            let reason = format!("invalid arguments for '{}': {error:#}", call.name);
+            let hint = crate::tooling::schema::validation_hint(&call.name, &format!("{error:#}"));
+            reject_tool_arguments(
+                engine,
+                config,
+                session,
+                spec,
+                top_level,
+                &call_id,
+                &call.name,
+                crate::tooling::errors::ToolErrorCode::INVALID_ARGUMENT,
+                reason,
+                hint,
+                tool_failure_guard,
+                conversation,
+                conversation_ids,
+            )
+            .await?;
+            continue;
+        }
+        // A name that is neither advertised nor a known registry/special/MCP
+        // tool can never execute. Reject it as a naming error before the risk
+        // broker turns it into an External approval request, and suggest only
+        // names from the current surface.
+        let known_tool = tools.iter().any(|tool| tool.name == call.name)
+            || crate::tool_bundle::catalog_entry(&call.name).is_some()
+            || config.tools.get(&call.name).is_some()
+            || dynamic_mcp_tools
+                .iter()
+                .any(|binding| binding.exposed_name == call.name);
+        if !known_tool {
+            let available = tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>();
+            let hint = crate::tooling::schema::unknown_tool_hint(&call.name, &available);
+            reject_tool_arguments(
+                engine,
+                config,
+                session,
+                spec,
+                top_level,
+                &call_id,
+                &call.name,
+                crate::tooling::errors::ToolErrorCode::TOOL_NOT_AVAILABLE,
+                format!(
+                    "tool '{}' is not available to {}",
+                    call.name,
+                    spec.role.as_str()
+                ),
+                hint,
+                tool_failure_guard,
+                conversation,
+                conversation_ids,
+            )
+            .await?;
+            continue;
+        }
         // The probe needs the original arguments after dispatch consumes
         // `input`; cloning one bounded JSON value is cheaper than threading
         // it through every tool branch.
@@ -1860,6 +1985,10 @@ pub(super) async fn execute_tool_calls(
                 Err((_name, error)) => ToolOutput::error(format!("tool error: {error}")),
             }
         } else {
+            let available = tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>();
             ToolOutput::error_coded(
                 call.name.as_str(),
                 crate::tooling::errors::ToolErrorCode::TOOL_NOT_AVAILABLE,
@@ -1869,6 +1998,9 @@ pub(super) async fn execute_tool_calls(
                     spec.role.as_str()
                 ),
             )
+            .with_failure_hint(crate::tooling::schema::unknown_tool_hint(
+                &call.name, &available,
+            ))
         };
         let mut output = output;
         output.normalize_failure(&call.name);

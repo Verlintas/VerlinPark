@@ -151,7 +151,8 @@ pub(super) fn read_tool_output_tool_schema() -> ToolSchema {
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
-                "handle": {"type": "string", "description": "Handle from an [output truncated] marker or an output_ref field"},
+                "handle": {"type": "string", "description": "Handle from an [output truncated] marker or the structured output_ref field"},
+                "output_ref": {"type": "string", "description": "Accepted alias for handle; use the output_ref from the spilled tool result"},
                 "offset": {"type": "integer", "minimum": 0, "description": "Zero-based line offset in the filtered line set"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Maximum lines to return"},
                 "max_bytes": {"type": "integer", "minimum": 256, "maximum": 65536, "description": "Maximum returned bytes; the daemon hard-caps this value"},
@@ -385,7 +386,7 @@ pub(super) fn tool_schemas_with_capabilities(
                     },
                     "task_id": {"type": "string", "maxLength": 40},
                     "target_agent_id": {"type": "string"},
-                    "message": {"type": "string", "maxLength": 2000},
+                    "message": {"type": "string", "maxLength": 2000, "description": "Required body text for every action except list (note, blocker, unblock, handoff, escalate, decision)"},
                     "severity": {
                         "type": "string",
                         "enum": ["info", "warning", "critical"]
@@ -880,7 +881,7 @@ pub(super) fn tool_schemas_with_capabilities(
     }
     tools.push(ToolSchema {
         name: "tool_help".to_string(),
-        description: "Return a bounded, role-filtered recipe for using tools safely (read many files, symbol navigation, safe edit, tests, output paging, GUI verification, remote operations, memory). Read-only; does not execute or route any tool."
+        description: "Return a bounded, role-filtered recipe for using tools safely (typed tools instead of shell, read many files, symbol navigation, safe edit, tests, output paging, GUI verification, remote operations, memory). Read-only; does not execute or route any tool. The response is text plus structured recipes; there is no separate format field."
             .to_string(),
         parameters: serde_json::json!({
             "type": "object",

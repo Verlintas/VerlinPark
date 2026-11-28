@@ -835,11 +835,18 @@ fn parse_u64(input: &serde_json::Value, key: &str) -> Result<Option<u64>> {
 
 impl ReadToolOutputParams {
     pub fn from_input(input: &serde_json::Value) -> Result<Self> {
-        let handle = input
-            .get("handle")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|handle| !handle.is_empty())
+        // `output_ref` is the field name in the tool's structured result and is
+        // a natural alias; the marker itself says `handle`. Accept both names,
+        // preferring the documented one.
+        let handle = ["handle", "output_ref"]
+            .iter()
+            .find_map(|key| {
+                input
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|handle| !handle.is_empty())
+            })
             .ok_or_else(|| anyhow!("handle is required"))?
             .to_string();
         let pattern = input
@@ -1321,6 +1328,25 @@ mod tests {
             );
         }
         assert!(validate_handle("out_00000000-0000-0000-0000-000000000000").is_ok());
+    }
+
+    #[test]
+    fn paging_params_accept_output_ref_as_a_handle_alias() {
+        let params = ReadToolOutputParams::from_input(&json!({
+            "output_ref": "out_00000000-0000-0000-0000-000000000000",
+            "pattern": "error:",
+            "limit": 25
+        }))
+        .expect("alias should parse");
+        assert_eq!(params.handle, "out_00000000-0000-0000-0000-000000000000");
+        assert_eq!(params.pattern.as_deref(), Some("error:"));
+        assert_eq!(params.limit, Some(25));
+        let explicit = ReadToolOutputParams::from_input(&json!({
+            "handle": "out_primary",
+            "output_ref": "out_alias"
+        }))
+        .expect("explicit handle should win");
+        assert_eq!(explicit.handle, "out_primary");
     }
 
     #[test]

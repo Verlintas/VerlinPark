@@ -22,5 +22,6 @@ pub mod project;
 pub mod recipes;
 pub mod redaction;
 pub mod remote;
+pub(crate) mod schema;
 pub mod search;
 pub mod web;

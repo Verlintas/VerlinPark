@@ -14946,6 +14946,65 @@ fn tool_help_is_read_only_role_filtered_and_bounded() {
     assert!(!help.parameters["properties"]["recipe"].is_null());
 }
 
+#[test]
+fn tool_recipe_examples_fit_the_advertised_schemas() {
+    let dir = TempDir::new().unwrap();
+    let config = leader_config(&dir);
+    let roles = [
+        AgentRole::Leader,
+        AgentRole::Manager,
+        AgentRole::Worker,
+        AgentRole::Labour,
+        AgentRole::Verifier,
+        AgentRole::Scout,
+    ];
+    let profiles = [
+        AgentProfile::Coding,
+        AgentProfile::Research,
+        AgentProfile::Verification,
+        AgentProfile::Generic,
+    ];
+    let mut schemas = std::collections::BTreeMap::new();
+    for role in roles {
+        for profile in profiles {
+            for schema in tool_schemas(&config, role, profile, true) {
+                schemas
+                    .entry(schema.name.clone())
+                    .or_insert(schema.parameters);
+            }
+        }
+    }
+    for recipe in crate::tooling::recipes::all_recipes() {
+        for part in recipe.example.split(" then ") {
+            let name = part
+                .trim()
+                .split([' ', '{'])
+                .next()
+                .unwrap_or_else(|| panic!("{} has an empty example segment", recipe.slug));
+            let schema = schemas
+                .get(name)
+                .unwrap_or_else(|| panic!("{} example names unknown tool '{name}'", recipe.slug));
+            let start = part
+                .find('{')
+                .unwrap_or_else(|| panic!("{} example for {name} has no JSON object", recipe.slug));
+            let arguments: Value = serde_json::from_str(&part[start..]).unwrap_or_else(|error| {
+                panic!(
+                    "{} example for {name} is not valid JSON: {error}: {}",
+                    recipe.slug, part
+                )
+            });
+            crate::tooling::schema::validate_arguments(schema, &arguments, 0).unwrap_or_else(
+                |error| {
+                    panic!(
+                        "{} example for {name} violates the advertised schema: {error:#}",
+                        recipe.slug
+                    )
+                },
+            );
+        }
+    }
+}
+
 fn leader_config(dir: &TempDir) -> AgentConfig {
     AgentConfig {
         provider: Arc::new(QueueProvider {
@@ -14977,6 +15036,87 @@ fn leader_config(dir: &TempDir) -> AgentConfig {
         compact_prepare_ratio: 0.6,
         context_window: 0,
     }
+}
+
+#[tokio::test]
+async fn invalid_tool_arguments_are_rejected_before_execution_with_a_hint() {
+    let dir = TempDir::new().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+        responses: Mutex::new(VecDeque::from(vec![
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "bad-shape".into(),
+                    name: "read_files".into(),
+                    // read_files requires files:[...], not path.
+                    arguments: r#"{"path":"README.md"}"#.into(),
+                }),
+                StreamEvent::ToolCall(ToolCall {
+                    id: "unknown-name".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"README.md"}"#.into(),
+                }),
+                StreamEvent::Done,
+            ],
+            vec![StreamEvent::TextDelta("done".into()), StreamEvent::Done],
+        ])),
+    });
+    let (engine, service, project) = test_service_with_provider(&dir, provider);
+    let session = engine
+        .create_session(project.id, "invalid args".into(), None)
+        .await
+        .unwrap();
+    engine
+        .create_leader_agent(&session.id, "test")
+        .await
+        .unwrap();
+    service
+        .start(&session.id, "check invalid arguments")
+        .await
+        .unwrap();
+    let sessions = wait_until_idle(&engine, &session).await;
+    assert_eq!(sessions.status, "idle");
+
+    let events = engine
+        .list_events(session.id.clone(), 0, 300)
+        .await
+        .unwrap();
+    let bad_shape = events
+        .iter()
+        .find(|event| event.kind == "tool.finished" && event.payload["tool_call_id"] == "bad-shape")
+        .expect("invalid argument result");
+    assert_eq!(bad_shape.payload["is_error"], true);
+    assert_eq!(bad_shape.payload["error_code"], "INVALID_ARGUMENT");
+    assert_eq!(bad_shape.payload["retryable"], false);
+    assert!(
+        bad_shape.payload["error_hint"]
+            .as_str()
+            .unwrap()
+            .contains("read_file")
+    );
+    assert!(
+        bad_shape.payload["output"]
+            .as_str()
+            .unwrap()
+            .contains("missing required field")
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "tool.started"
+                && event.payload["tool_call_id"] == "bad-shape"),
+        "invalid arguments must not start the tool"
+    );
+
+    let unknown = events
+        .iter()
+        .find(|event| {
+            event.kind == "tool.finished" && event.payload["tool_call_id"] == "unknown-name"
+        })
+        .expect("unknown tool result");
+    assert_eq!(unknown.payload["error_code"], "TOOL_NOT_AVAILABLE");
+    let hint = unknown.payload["error_hint"].as_str().unwrap();
+    assert!(hint.contains("read_file"), "{hint}");
+    assert!(hint.contains("tool_search"), "{hint}");
 }
 
 #[tokio::test]

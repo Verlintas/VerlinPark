@@ -36,6 +36,7 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use vp_providers::ToolSchema;
 
+use crate::tooling::schema::validate_arguments;
 use crate::tools::ToolOutput;
 
 /// Hard cap on user script source. Scripts are glue, not programs: anything
@@ -909,123 +910,6 @@ fn truncate_utf8(value: &str, limit: usize) -> String {
         end -= 1;
     }
     value[..end].to_string()
-}
-
-/// Minimal typed checking against the advertised JSON schema. This is a
-/// usability guard, not authoritative validation: the tool still validates its
-/// own arguments after dispatch.
-fn validate_arguments(schema: &Value, value: &Value, depth: usize) -> Result<()> {
-    if depth > 8 {
-        bail!("argument nesting exceeds 8 levels");
-    }
-    if let Some(options) = schema.get("enum").and_then(Value::as_array)
-        && !options.iter().any(|option| option == value)
-    {
-        bail!("value is not one of the allowed enum values");
-    }
-    let Some(kind) = schema.get("type") else {
-        return Ok(());
-    };
-    let allowed = match kind {
-        Value::String(kind) => vec![kind.as_str()],
-        Value::Array(kinds) => kinds.iter().filter_map(Value::as_str).collect(),
-        _ => Vec::new(),
-    };
-    if !allowed.is_empty() && !allowed.iter().any(|kind| type_matches(kind, value)) {
-        bail!(
-            "expected {}, got {}",
-            allowed.join(" or "),
-            json_type(value)
-        );
-    }
-    if value.is_object() {
-        let object = value.as_object().expect("object");
-        if let Some(required) = schema.get("required").and_then(Value::as_array) {
-            for name in required.iter().filter_map(Value::as_str) {
-                if !object.contains_key(name) {
-                    bail!("missing required field `{name}`");
-                }
-            }
-        }
-        let properties = schema.get("properties").and_then(Value::as_object);
-        if schema.get("additionalProperties") == Some(&Value::Bool(false))
-            && let Some(properties) = properties
-        {
-            for key in object.keys() {
-                if !properties.contains_key(key) {
-                    bail!("unknown field `{key}`");
-                }
-            }
-        }
-        if let Some(properties) = properties {
-            for (key, item) in object {
-                if let Some(property) = properties.get(key) {
-                    validate_arguments(property, item, depth + 1)
-                        .with_context(|| format!("field `{key}`"))?;
-                }
-            }
-        }
-    }
-    if value.is_array() {
-        let items = value.as_array().expect("array");
-        if let Some(max) = schema.get("maxItems").and_then(Value::as_u64)
-            && items.len() as u64 > max
-        {
-            bail!("array exceeds maxItems {max}");
-        }
-        if let Some(item_schema) = schema.get("items") {
-            for item in items.iter().take(64) {
-                validate_arguments(item_schema, item, depth + 1)?;
-            }
-        }
-    }
-    if let Some(text) = value.as_str()
-        && let Some(max) = schema.get("maxLength").and_then(Value::as_u64)
-        && text.chars().count() as u64 > max
-    {
-        bail!("string exceeds maxLength {max}");
-    }
-    if let Some(number) = value.as_f64() {
-        if let Some(max) = schema.get("maximum").and_then(Value::as_f64)
-            && number > max
-        {
-            bail!("number exceeds maximum {max}");
-        }
-        if let Some(min) = schema.get("minimum").and_then(Value::as_f64)
-            && number < min
-        {
-            bail!("number is below minimum {min}");
-        }
-    }
-    Ok(())
-}
-
-fn type_matches(kind: &str, value: &Value) -> bool {
-    match kind {
-        "object" => value.is_object(),
-        "array" => value.is_array(),
-        "string" => value.is_string(),
-        "number" => value.is_number(),
-        "integer" => {
-            value.is_i64()
-                || value.is_u64()
-                || value.as_f64().is_some_and(|value| value.fract() == 0.0)
-        }
-        "boolean" => value.is_boolean(),
-        "null" => value.is_null(),
-        _ => true,
-    }
-}
-
-fn json_type(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
 }
 
 #[cfg(test)]

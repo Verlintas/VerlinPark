@@ -153,7 +153,7 @@ impl AgentTool for RunProjectTask {
     }
 
     fn description(&self) -> &'static str {
-        "Run the project's detected build, test, lint, format, typecheck, or check task under the shell sandbox. Returns parsed failures and a bounded raw tail. Test/lint/check results may be reused from the content-addressed cache when every input matches."
+        "Run the project's detected build, test, lint, format, typecheck, or check task under the shell sandbox. Prefer this over shell for detected checks: there is no generic args field; narrow with package/filter/paths, or use kind=custom plus command for an exact command. Returns parsed failures and a bounded raw tail. Test/lint/check results may be reused from the content-addressed cache when every input matches."
     }
 
     fn schema(&self) -> Value {
@@ -171,7 +171,8 @@ impl AgentTool for RunProjectTask {
                 "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 1800, "description": "Default 300"},
                 "dry_run": {"type": "boolean", "description": "Resolve and report the command without running it"}
             },
-            "required": ["kind"]
+            "required": ["kind"],
+            "additionalProperties": false
         })
     }
 
