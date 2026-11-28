@@ -67,8 +67,8 @@ able to approve its own request.
 - The approval row/reason includes `[delegated to <role> <name>]`; the decision
   event carries the reviewer identity. A dedicated reviewer column/UI is not
   added in this phase.
-- ACP/remote delegation approvals remain user-owned because they cross a trust
-  boundary.
+- ACP permission bridges (including stdio) and remote delegation approvals
+  remain user-owned in this phase; remote ACP is asset-risk in the classifier.
 - The reviewer is an LLM and can be wrong or prompt-injected; the deterministic
   asset gate, contract/sandbox/effect gates, and operator-visible events bound
   the blast radius. This is not a guarantee.

@@ -828,7 +828,7 @@ scale/soak evidence.
 
 | Check | Result |
 |---|---|
-| `cargo test -p vp-core --lib` | 2,750 passed / 0 failed / 2 ignored |
+| `cargo test -p vp-core --lib` | 2,757 passed / 0 failed / 2 ignored |
 | `cargo test -p vp-core --test secret_redaction` | 3 passed |
 | `cargo test -p vp-bench` | 164 passed / 1 ignored |
 | `cargo test -p vp-cli` | unit + integration suites passed |
@@ -840,7 +840,7 @@ scale/soak evidence.
 | `cargo clippy ... -D warnings` | passed |
 | `swiftformat --lint` | passed |
 | `just release-preflight full` | passed repeatedly, including after the shell-analysis fixes |
-| `cargo test --workspace` | 4,831 passed / 0 failed / 6 ignored |
+| `cargo test --workspace` | 4,838 passed / 0 failed / 6 ignored |
 | `xcodebuild test` | 544 app + 132 helper passed |
 | `scripts/package-release.sh` | DMG created (universal, ad-hoc signed) |
 | `just verify-dmg` | checksum, image, helpers, layout, signature passed |
@@ -999,8 +999,8 @@ instead of the operator (ADR-0244):
 
 Limits: the reviewer is an LLM and can be wrong or prompt-injected; the asset
 classifier is a bounded heuristic; reviewer identity is in events and the
-approval reason, not a dedicated approval row column/UI; ACP/remote approvals
-remain user-owned; review adds one provider call per delegated approval; this
+approval reason, not a dedicated approval row column/UI; ACP permission
+bridges and remote approvals remain user-owned; review adds one provider call per delegated approval; this
 does not replace the sandbox, contract, effect, Verifier, or Integrator gates.
 
 ### Clean live two-task plan rerun (2026-11-28)

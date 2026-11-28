@@ -449,7 +449,7 @@ drill passes; a clean local first-run cannot report false success.
 approval fail-closed, remote ACP/header handling, source rebuild reporting,
 imported repair semantics, schema guard, Git/provider/Auto-cap/New-Session
 preflights, empty-project recovery, and a scripted backup/restore drill are
-implemented. A clean `just release-preflight full` reported 4,831 Rust passed /
+implemented. A clean `just release-preflight full` reported 4,838 Rust passed /
 0 failed / 6 ignored, 544 app + 132 helper Swift tests passed, the backup drill
 and scale/fault harness passed, a universal ad-hoc DMG was built and verified,
 and release binaries built. Live DeepSeek validation on 2026-11-27 confirmed
